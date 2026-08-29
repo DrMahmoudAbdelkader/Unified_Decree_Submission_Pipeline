@@ -1,0 +1,70 @@
+# .github/workflows/decree-status-sync.yml
+# ============================================================================
+# Runs once a day (Cairo time), no edge function involved — this is a
+# scheduled job, not something the module triggers. It re-checks every
+# open (non-final) submitted request and updates decree_request_attempts
+# / decree_request_cases from what it finds on SMC.
+#
+# CHANGED FROM THE EARLIER VERSION: the second step that ran
+# request_status_sync.py has been removed. That file was never actually
+# supplied in any session, and per its own referenced behavior it only
+# ever wrote to a separate reporting table (decree_request_status_daily_
+# export) — it never updated attempt_status/case_status, so it wasn't
+# doing the "auto-update status" job Phase 3 actually needs. That job is
+# now implemented directly inside decree_status_and_letters_sync.py (see
+# its own docstring for exactly what it does and does not yet cover).
+#
+# If/when you want the separate daily reporting export back, resend the
+# real request_status_sync.py and I'll add it back as its own step —
+# it's independent of status-correction, so nothing here blocks that.
+#
+# Required repository secrets:
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME_2, SMC_PASSWORD_2   (recommended — a dedicated secondary
+#                                      SMC account for this sync, so it
+#                                      never shares a login session with a
+#                                      concurrent submission run. Falls
+#                                      back to SMC_USERNAME/SMC_PASSWORD
+#                                      if these aren't set.)
+#   SMC_USERNAME, SMC_PASSWORD       (fallback if no secondary account)
+#   SMC_SENDING_SITE                 (optional — defaults to "102233",
+#                                      the facility id seen in the HAR
+#                                      capture this was built against;
+#                                      confirm it's your real facility id)
+# ============================================================================
+
+name: Decree Status & Letters Sync
+
+on:
+  schedule:
+    # 20:00 UTC = 22:00 Cairo (Africa/Cairo, UTC+2, no DST) — after the
+    # SMC site's own daily processing window; adjust if that changes.
+    - cron: "0 20 * * *"
+  workflow_dispatch: {}   # manual "run now" button in the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run status & admin-letter sync (Phase 3)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SMC_SENDING_SITE: ${{ secrets.SMC_SENDING_SITE }}
+        run: python decree_status_and_letters_sync.py
