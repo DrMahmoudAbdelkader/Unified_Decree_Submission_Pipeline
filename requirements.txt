@@ -1,0 +1,20 @@
+# requirements.txt
+# Derived directly from the imports actually present in:
+#   Unified_Decree_Submission_Pipeline.py, medical_report_overlay.py,
+#   patient_pdf_website_fallback.py, patient_pdf_dms_archive_fallback.py,
+#   decree_submission_service.py, decree_status_and_letters_sync.py,
+#   supabase_client.py
+# Pin versions loosely — tighten once you've run this in Actions once and
+# confirmed nothing upstream broke compatibility.
+
+requests>=2.31
+beautifulsoup4>=4.12
+PyPDF2>=3.0
+Pillow>=10.0
+reportlab>=4.0
+openpyxl>=3.1
+PyMuPDF>=1.23        # imported as `fitz`
+pdfkit>=1.0           # requires the system wkhtmltopdf binary (installed
+                       # separately in the workflow's apt-get step)
+arabic-reshaper>=3.0
+python-bidi>=0.4
