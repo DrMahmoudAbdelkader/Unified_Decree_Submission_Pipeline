@@ -135,6 +135,7 @@ def log_event(case_id: int, attempt_id: Optional[int], event_type: str, details:
     sb.insert(EVENTS_TABLE, {
         "case_id": case_id, "attempt_id": attempt_id,
         "event_type": event_type, "details": details,
+        "created_by": "9b8fa9a6-0567-4a93-8e21-d0f8bc098394"
     })
 
 
