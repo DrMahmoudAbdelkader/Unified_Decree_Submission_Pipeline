@@ -43,15 +43,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      # fonts-hosny-amiri (Amiri) is confirmed via fc-list + fontTools cmap
-      # inspection to cover BOTH Arabic and Latin glyphs in one file — the
-      # exact requirement the pipeline's own font comment called out. No
-      # font upload/hosting needed at all.
-      - name: Install system dependencies (wkhtmltopdf, Amiri font)
+      # FIXED BUG: `apt-get install wkhtmltopdf` on Ubuntu pulls the
+      # UNPATCHED-Qt build from the distro repos — a deprecated build
+      # wkhtmltopdf's own maintainers warn against, with known-broken
+      # cookie/session handling. That's why every rendered "MDT print page"
+      # came back as the logged-out landing page no matter how many times
+      # the script re-logged in: it's not a flaky auth issue, the unpatched
+      # renderer structurally can't carry an authenticated session.
+      # Installing the official statically-linked, patched-Qt .deb instead
+      # (same one the local Windows install effectively uses) fixes this.
+      - name: Install system dependencies (patched-Qt wkhtmltopdf, Amiri font)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            wkhtmltopdf fonts-hosny-amiri libgl1
+            fonts-hosny-amiri libgl1 xfonts-75dpi fontconfig \
+            libjpeg-turbo8 libxrender1 libxext6 libjpeg8
+          wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+          sudo dpkg -i wkhtmltox_0.12.6.1-2.jammy_amd64.deb || sudo apt-get install -f -y
+          wkhtmltopdf --version  # must print "(with patched qt)" — fail loudly here, not deep in a render step
+          wkhtmltopdf --version | grep -q "with patched qt"
 
       - name: Install Python dependencies
         run: pip install --no-cache-dir -r requirements.txt
@@ -69,6 +79,11 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
+          # the official .deb installs to /usr/local/bin, NOT /usr/bin
+          # (decree_common.py's default) — must be set explicitly or the
+          # script falls back to /usr/bin/wkhtmltopdf, which apt may still
+          # have installed as a dependency-resolution side effect.
+          WKHTMLTOPDF_PATH: /usr/local/bin/wkhtmltopdf
         run: python decree_submission_prepare.py
 
       - name: Upload run artifacts (logs, debug dumps, if any)

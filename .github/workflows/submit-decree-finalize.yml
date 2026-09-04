@@ -31,11 +31,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies (wkhtmltopdf, Amiri font)
+      # See submit-decree-prepare.yml for why this replaces the plain
+      # `apt-get install wkhtmltopdf` — unpatched Qt build, broken session
+      # handling, silently signs the logged-out page instead of the MDT form.
+      - name: Install system dependencies (patched-Qt wkhtmltopdf, Amiri font)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            wkhtmltopdf fonts-hosny-amiri libgl1
+            fonts-hosny-amiri libgl1 xfonts-75dpi fontconfig \
+            libjpeg-turbo8 libxrender1 libxext6 libjpeg8
+          wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+          sudo dpkg -i wkhtmltox_0.12.6.1-2.jammy_amd64.deb || sudo apt-get install -f -y
+          wkhtmltopdf --version
+          wkhtmltopdf --version | grep -q "with patched qt"
 
       - name: Install Python dependencies
         run: pip install --no-cache-dir -r requirements.txt
@@ -53,6 +61,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
+          WKHTMLTOPDF_PATH: /usr/local/bin/wkhtmltopdf
         run: python decree_submission_finalize.py
 
       - name: Upload run artifacts (logs, debug dumps, if any)
