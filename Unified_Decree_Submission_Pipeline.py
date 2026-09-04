@@ -500,7 +500,7 @@ _SUPPLIED_TUMOR_TABLE = [
     ("sinus_cancer",                   "Paranasal Sinus Cancer",                   "سرطان بالجيوب الانفيه",              "C31.9"),
     ("laryngeal_cancer",               "Laryngeal Cancer",                         "سرطان بالحنجره",                     "C32.9"),
     ("head_neck_cancer",               "Head and Neck Cancer",                     "سرطان بالرأس والرقبه",               "C76.0"),
-    ("breast_cancer_c509",             "Breast Cancer",                            "سرطان الثدي",                        "C50.9"),
+    ("breast_cancer_AB45.6",             "Breast Cancer",                            "سرطان الثدي",                        "AB45.6"),
     ("lung_cancer",                    "Lung Cancer",                              "سرطان الرئة",                        "C34.9"),
     ("bladder_cancer",                 "Bladder Cancer",                           "سرطان المثانه البوليه",              "C67.9"),
     ("kidney_cancer",                  "Kidney Cancer",                            "سرطان الكلي",                        "C64.9"),
@@ -541,10 +541,10 @@ del _cid, _elabel, _arname, _dcode
 # "colorectal cancer" still resolves to the original C20 entry. Verify
 # this split matches what you actually want before relying on it.
 #
-# NOTE on "breast_cancer_c509": your table also lists سرطان الثدي / C50.9
+# NOTE on "breast_cancer_c509": your table also lists سرطان الثدي / AB45.6
 # as its own row, distinct from the primary "breast_cancer" entry (blank
 # Column C default, diag AB45.6, which keeps the template's own baked-in
-# wording). This C50.9 entry is treated as a generic (non-default,
+# wording). This AB45.6 entry is treated as a generic (non-default,
 # masked + generic-phrase) type like everything else in the table, NOT
 # as an alias for the default breast case - so it will NOT reuse the
 # template's baked sentence, it gets the generic "A patient of سرطان
@@ -590,10 +590,10 @@ del _cid, _elabel, _arname, _dcode
 # "colorectal cancer" still resolves to the original C20 entry. Verify
 # this split matches what you actually want before relying on it.
 #
-# NOTE on "breast_cancer_c509": your table also lists سرطان الثدي / C50.9
+# NOTE on "breast_cancer_c509": your table also lists سرطان الثدي / AB45.6
 # as its own row, distinct from the primary "breast_cancer" entry (blank
 # Column C default, diag AB45.6, which keeps the template's own baked-in
-# wording). This C50.9 entry is treated as a generic (non-default,
+# wording). This AB45.6 entry is treated as a generic (non-default,
 # masked + generic-phrase) type like everything else in the table, NOT
 # as an alias for the default breast case - so it will NOT reuse the
 # template's baked sentence, it gets the generic "A patient of سرطان
@@ -763,7 +763,7 @@ TUMOR_TYPE_ALIASES = {
 # above. That's exactly why breast cancer was using proc_id 10 instead of
 # 806: _add_generic_tumor_type("breast_cancer_c509", "Breast Cancer", ...)
 # auto-registers "breast cancer" (its english_label, lower-cased) as an
-# alias pointing at breast_cancer_c509 (diag C50.9, proc_id 10, generic
+# alias pointing at breast_cancer_c509 (diag AB45.6, proc_id 10, generic
 # phrasing) - and since that update ran AFTER the hand-curated dict above,
 # it silently clobbered the correct "breast cancer" -> "breast_cancer"
 # entry for every row where Column C literally said "Breast Cancer" (the
