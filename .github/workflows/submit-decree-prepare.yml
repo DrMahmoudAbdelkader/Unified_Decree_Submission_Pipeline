@@ -1,0 +1,82 @@
+# .github/workflows/submit-decree-prepare.yml
+# ============================================================================
+# Triggered by the Supabase Edge Function `submit-decree-requests` (phase=
+# "prepare") when a user clicks "إرسال" in the module's "الإرسال إلى SMC"
+# tab. Creates the MDT request and locates the patient document; if the
+# document is already in the permanent R2 cache (previously reviewed and
+# approved), this run continues straight through to a full submission. If
+# it's freshly extracted, this run stops and opens a review item instead.
+#
+# Required repository secrets:
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME, SMC_PASSWORD
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
+#   HMIS_USERNAME, HMIS_PASSWORD   (only if the CMIS archive fallback is
+#                                    reachable from a GitHub-hosted runner)
+#
+# One-time manual setup (not part of this workflow):
+#   Upload signatures/sig1.png..sig4.png, signatures/stamp.png, and
+#   medical_report_template.pdf to the Supabase Storage bucket
+#   "decree-assets" (private). See supabase_storage.py's docstring.
+# ============================================================================
+
+name: Submit Decree Requests (Prepare)
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_ids:
+        description: "Comma-separated decree_request_cases.id list, or blank for every READY_TO_SUBMIT case"
+        required: false
+        default: ""
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # fonts-hosny-amiri (Amiri) is confirmed via fc-list + fontTools cmap
+      # inspection to cover BOTH Arabic and Latin glyphs in one file — the
+      # exact requirement the pipeline's own font comment called out. No
+      # font upload/hosting needed at all.
+      - name: Install system dependencies (wkhtmltopdf, Amiri font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wkhtmltopdf fonts-hosny-amiri libgl1
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run prepare (MDT creation + document lookup)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
+          HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CASE_IDS: ${{ github.event.inputs.case_ids }}
+        run: python decree_submission_prepare.py
+
+      - name: Upload run artifacts (logs, debug dumps, if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decree-prepare-run-${{ github.run_id }}
+          path: |
+            /tmp/decree_merged/**
+          if-no-files-found: ignore
+          retention-days: 14

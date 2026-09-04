@@ -1,0 +1,66 @@
+# .github/workflows/submit-decree-finalize.yml
+# ============================================================================
+# Triggered by the Supabase Edge Function `submit-decree-requests` (phase=
+# "finalize") when a user clicks "موافقة ومتابعة" (Approve & Continue) in
+# the module, after reviewing a freshly-extracted patient document. Always
+# scoped to one specific case_id a human just approved — never runs in
+# bulk, unlike the prepare workflow.
+#
+# Required repository secrets: same as submit-decree-prepare.yml.
+# ============================================================================
+
+name: Submit Decree Requests (Finalize)
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_ids:
+        description: "Comma-separated decree_request_cases.id list — REQUIRED, this never runs in bulk"
+        required: true
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies (wkhtmltopdf, Amiri font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wkhtmltopdf fonts-hosny-amiri libgl1
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run finalize (sign + report + merge + upload)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
+          HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CASE_IDS: ${{ github.event.inputs.case_ids }}
+        run: python decree_submission_finalize.py
+
+      - name: Upload run artifacts (logs, debug dumps, if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decree-finalize-run-${{ github.run_id }}
+          path: |
+            /tmp/decree_merged/**
+          if-no-files-found: ignore
+          retention-days: 14
