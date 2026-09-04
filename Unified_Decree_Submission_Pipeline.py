@@ -442,6 +442,42 @@ _add_generic_tumor_type("neck_cancer", "Neck Cancer", "سرطان بالرقبه
 _add_generic_tumor_type("spreaded_tumor", "Spreaded Tumor", "ثانويات سرطانيه غير معلومه المصدر", "C80")
 _add_generic_tumor_type("arm_cancer", "Arm Cancer", "سرطان بالذراع", "AB38.6")
 
+# --- Batch 3: previously-missing app-module types, codes you supplied --
+_add_generic_tumor_type("prostate_cancer", "Prostate Cancer", "سرطان البروستاتا", "C61")
+_add_generic_tumor_type("lymphoma", "Lymphoma", "سرطان الغدد الليمفاوية", "C77",
+                         # "اورام ليمفاويه" is the exact cancer_type_group text the app
+                         # itself uses for this diag code (per All_Diag_Codes.xlsx /
+                         # the "امراض الدم" bucket) - added as an alias since alias
+                         # matching is exact-string, not fuzzy, and differs from the
+                         # arabic_name above.
+                         extra_aliases=["اورام ليمفاويه"])
+_add_generic_tumor_type("brain_cns", "Brain and Central Nervous System Cancer",
+                         "أورام المخ والجهاز العصبي المركزي", "U37.6")
+_add_generic_tumor_type("gynecological_cancer", "Gynecological Cancer", "أورام النساء", "C56")
+
+# Explicitly requested addition - diag_code C56 as supplied. Reuses the
+# SAME code as "gynecological_cancer" above (same intentional-code-reuse
+# pattern already used elsewhere in this file for pelvic_cancer /
+# abdominal_pelvic_cancer, both U55.5, and colon_cancer / colorectal_cancer
+# both being distinct-but-related codes) - Column C text alone decides
+# which of the two a row resolves to; they are independent, separately
+# selectable entries. speciality_code/proc_id left at the "9"/"10"
+# default per the note above _SUPPLIED_TUMOR_TABLE - update if this
+# needs its own committee/proc routing.
+_add_generic_tumor_type("ovarian_cancer", "Ovarian Cancer", "سرطان المبيض", "C56")
+
+# Explicitly requested addition - Thyroid Gland Tumor, diag_code C73 as
+# supplied. english_label is set to match the exact Column C spelling
+# seen in the run log ("thyroid Gland Tumor") - resolve_tumor_type()
+# lower-cases before matching, so the auto-derived alias
+# ("thyroid gland tumor") covers that spelling regardless of case.
+# A couple of likely spelling variants are added as extra_aliases up
+# front (same defensive pattern used for the other types above) rather
+# than waiting for another "Unrecognized tumor type" failure.
+_add_generic_tumor_type("thyroid_cancer", "Thyroid Gland Tumor", "سرطان الغدة الدرقية", "C73",
+                         extra_aliases=["thyroid cancer", "thyroid gland cancer",
+                                        "thyroidcancer", "thyroid tumor"])
+
 # --- The full list you supplied (code -> Arabic diagnosis name) --------
 # canonical_id, english_label, arabic_name, diag_code. english_label is
 # hand-written for natural phrasing inside "A patient of X for ..." -
@@ -514,6 +550,140 @@ del _cid, _elabel, _arname, _dcode
 # template's baked sentence, it gets the generic "A patient of سرطان
 # الثدي for ..." phrasing instead. Adjust if you intended otherwise.
 
+# --- Batch 4: added from All_Diag_Codes.xlsx (the app's full cancer-type /
+# diag-code export) - these 17 diag codes appeared in that file but had no
+# matching entry anywhere above yet. Same convention as every other batch:
+# speciality_code/proc_id default to "9"/"10" (unconfirmed per-organ
+# against SMC - override on a specific entry if it turns out to need its
+# own committee routing), arabic_name is copied VERBATIM from
+# All_Diag_Codes.xlsx (that's also the exact text the app's
+# cancer_type_group column uses, so it doubles as the alias for
+# JS-export Column C matching), english_label is hand-written since the
+# source file only supplied Arabic names.
+_ALL_DIAG_CODES_ADDITIONS = [
+    ("breast_suspected_initiative",       "Suspected Breast Cancer Under Diagnosis (Initiative)",              "اشتباه سرطان ثدي تحت التشخيص - مبادرة", "AB42.5"),
+    ("facial_tumor",                      "Facial Tumor",                                                      "اورام بالوجه",                          "C41.0"),
+    ("jaw_tumor",                         "Jaw Tumor",                                                          "اورام بالفك",                           "C41.1"),
+    ("chest_tumor",                       "Chest Tumor",                                                        "اورام بالصدر",                          "C39.9"),
+    ("malignant_bone_marrow_tumor",       "Malignant Bone Marrow Tumor",                                        "اورام خبيثة بالنخاع",                   "C72"),
+    ("anemia_suspected_tumor",            "Treatment-Resistant Iron-Deficiency Anemia with Suspected Tumor",   "انيميا نقص الحديد غير مستجيبه للعلاج واشتباة وجود اورام", "U82.9"),
+    ("ear_tumor",                         "Ear Tumor",                                                          "اورام بالاذن",                          "D14.0"),
+    ("leg_tumor",                         "Leg Tumor",                                                          "اورام بالساق",                          "C40.2"),
+    ("eye_tumor",                         "Eye Tumor",                                                          "اورام بالعين",                          "C69.9"),
+    ("gum_tumor",                         "Gum Tumor",                                                          "اورام باللثه",                          "C03.9"),
+    ("malignant_endocrine_gland_tumor",   "Malignant Endocrine Gland Tumor",                                    "اورام خبيثة بالغدد الصماء",             "C75"),
+    ("fibrous_sclerosis_brain_tumor",     "Fibrous Sclerosis with Brain Tumors",                                "تصلب تليفي مع اورام بالمخ",             "AB12.0"),
+    ("liver_cirrhosis_ascites_tumor",     "Liver Cirrhosis with Ascites and Liver Tumors",                      "تليف كبدي+استسقاء+اورام كبد",           "AA58.9"),
+    ("benign_bone_tumor",                 "Benign Bone Tumor",                                                  "اورام حميده بالعظام",                   "AA58.6"),
+    ("abdominal_lymph_node_tumor",        "Abdominal Lymph Node Tumor",                                         "اورام بالعقد الليمفاويه بالبطن",        "AB29.9"),
+    ("lung_cancer_early_detection",       "Early Lung Cancer Detection (Initiative)",                           "كشف مبكر اورام الرئه (مبادره)",         "AB51.7"),
+    ("prostate_cancer_early_detection",   "Early Prostate Cancer Detection (Initiative)",                       "كشف مبكر اورام بروستاتا (مبادره)",      "AB51.6"),
+]
+for _cid, _elabel, _arname, _dcode in _ALL_DIAG_CODES_ADDITIONS:
+    _add_generic_tumor_type(_cid, _elabel, _arname, _dcode)
+del _cid, _elabel, _arname, _dcode
+
+# NOTE on "colon_cancer" (C18.9) vs the pre-existing "colorectal_cancer"
+# (C20): these are two distinct ICD codes from your table (colon only vs
+# colon+rectum). Both are now registered as separate types. If Column C
+# says "colon cancer" it now resolves to the more specific C18.9 entry;
+# "colorectal cancer" still resolves to the original C20 entry. Verify
+# this split matches what you actually want before relying on it.
+#
+# NOTE on "breast_cancer_c509": your table also lists سرطان الثدي / C50.9
+# as its own row, distinct from the primary "breast_cancer" entry (blank
+# Column C default, diag AB45.6, which keeps the template's own baked-in
+# wording). This C50.9 entry is treated as a generic (non-default,
+# masked + generic-phrase) type like everything else in the table, NOT
+# as an alias for the default breast case - so it will NOT reuse the
+# template's baked sentence, it gets the generic "A patient of سرطان
+# الثدي for ..." phrasing instead. Adjust if you intended otherwise.
+
+# --- App-module naming compatibility --------------------------------
+# Your app's own TUMOR_TYPES module names the same diagnoses using
+# different text (mostly SCREAMING_SNAKE_CASE constant names, e.g.
+# "BONE_CANCER", "PARANASAL_SINUS_CANCER") than what's used above. Every
+# one of these that came with its own ICD-10 code in your module already
+# matches an existing entry above with THE SAME code, so no new diag
+# codes were needed - these are alias-only additions so Column C accepts
+# either naming and still resolves to the exact same canonical entry /
+# diag_code / speciality_code / proc_id as before.
+#
+# Two of your module's UNCODED entries also turned out to already be
+# covered above, just under more specific Arabic wording than your
+# module uses - added as aliases to the SAME existing canonical entry
+# and diag code (no code change): BLOOD_RELATED_TUMORS -> blood_tumor
+# (C95) and BLADDER_CANCER -> bladder_cancer (C67.9).
+#
+# PROSTATE_CANCER (C61), LYMPHOMA (C77), BRAIN_CNS (U37.6), and
+# GYNECOLOGICAL_CANCER (C56) were the previously-missing types - now
+# registered above in "Batch 3" with the codes you supplied.
+#
+# "bone_soft_tissue" was a typo on the module side; the corrected module
+# name "BONE_SOFT_TISSUE" is aliased below directly to the
+# existing "soft_tissue_sarcoma" entry (C49.9) - no separate combined
+# code was needed, per your correction.
+_APP_MODULE_ALIASES = {
+    # key (module constant name, both underscore and space forms are
+    # registered) -> canonical id already in TUMOR_TYPE_CONFIG.
+    "breast_cancer": "breast_cancer",
+    "blood_related_tumors": "blood_tumor",
+    "colorectal_cancer": "colorectal_cancer",
+    "lung_cancer": "lung_cancer",
+    "liver_cancer": "liver_cancer",
+    "bladder_cancer": "bladder_cancer",
+    "bone_cancer": "bone_cancer",
+    "soft_tissue_sarcoma": "soft_tissue_sarcoma",
+    "colon_cancer": "colon_cancer",
+    "rectal_cancer_with_colonic_stricture": "rectal_cancer_stricture",
+    "cervical_cancer": "cervical_cancer",
+    "clitoral_cancer": "clitoral_cancer",
+    "lip_cancer": "lip_cancer",
+    "pelvic_cancer": "pelvic_cancer",
+    "pharyngeal_cancer": "pharyngeal_cancer",
+    "nasal_cavity_cancer": "nasal_cavity_cancer",
+    "paranasal_sinus_cancer": "sinus_cancer",
+    "laryngeal_cancer": "laryngeal_cancer",
+    "head_and_neck_cancer": "head_neck_cancer",
+    "kidney_cancer": "kidney_cancer",
+    "esophageal_cancer": "esophageal_cancer",
+    "anal_cancer": "anal_cancer",
+    "bile_duct_cancer": "bile_duct_cancer",
+    "adrenal_gland_cancer": "adrenal_gland_cancer",
+    "pleural_mesothelioma": "pleural_mesothelioma",
+    "skin_cancer": "skin_cancer",
+    "tongue_cancer": "tongue_cancer",
+    "oral_cavity_cancer": "mouth_cancer",
+    "palate_cancer": "palate_cancer",
+    "salivary_gland_cancer": "salivary_gland_cancer",
+    "ureteral_cancer": "ureter_cancer",
+    "neuroblastoma": "neuroblastoma",
+    "hepatitis_c_with_suspected_hepatic_focal_lesion": "hepatitis_c_liver_focus",
+    "liver_cirrhosis_with_suspected_hepatic_focal_lesion": "liver_cirrhosis_diabetes_focus",
+    "plasma_cell_cancer": "plasma_cell_cancer",
+    "bladder_cancer_status_post_resection": "post_bladder_tumor_resection",
+    "cancer_requiring_blood_transfusion": "cancer_transfusion_need",
+    "mycosis_fungoides": "skin_cancer_mf",
+    "neural_cell_cancer": "neural_cell_cancer",
+    "jaw_tumor_status_post_resection_with_bone_deformity": "post_jaw_tumor_resection",
+    "recurrent_treatment_resistant_neuroendocrine_tumor": "neuroendocrine_recurrent",
+    # Corrected module name (was the typo "bone_soft_tissue") -> points
+    # to the existing Soft Tissue Sarcoma entry (C49.9), per your note.
+    "BONE_SOFT_TISSUE": "soft_tissue_sarcoma",
+    "prostate_cancer": "prostate_cancer",
+    "lymphoma": "lymphoma",
+    "brain_cns": "brain_cns",
+    "gynecological_cancer": "gynecological_cancer",
+}
+for _mod_key, _canon in _APP_MODULE_ALIASES.items():
+    # Register BOTH the raw underscore form ("bone_cancer") and a
+    # space-separated form ("bone cancer") - resolve_tumor_type() only
+    # lower-cases + collapses whitespace, it does NOT turn underscores
+    # into spaces, so both forms need their own explicit entry here.
+    _EXTRA_ALIASES.setdefault(_mod_key, _canon)
+    _EXTRA_ALIASES.setdefault(_mod_key.replace("_", " "), _canon)
+del _mod_key, _canon
+
 # Free-text values from Excel Col C -> canonical TUMOR_TYPE_CONFIG key.
 # Matching is case-insensitive with whitespace collapsed. Add more
 # aliases here as new spellings/types show up in your data. Arabic
@@ -545,6 +715,47 @@ TUMOR_TYPE_ALIASES = {
     "lungcancer": "lung_cancer",
     "livercancer": "liver_cancer",
     "soft tissue cancer": "soft_tissue_sarcoma",
+    # Added after checking against the real IDS.xlsx: these no-space /
+    # differently-punctuated spellings are exactly what Column C actually
+    # contains for these rows, and none of them were otherwise reachable:
+    # "coloncancer"/"cervicalcancer"/"prostatecancer"/"colorectalcancer"
+    # simply had no no-space alias registered (same missing-alias reason
+    # as lungcancer/livercancer above). "bonesofttissue" is a separate,
+    # worse bug fix: the existing "BONE_SOFT_TISSUE" / "BONE SOFT TISSUE"
+    # aliases (from _APP_MODULE_ALIASES) were registered in UPPERCASE,
+    # but resolve_tumor_type() lower-cases its lookup key before checking
+    # this dict - so those two aliases could never match ANY input,
+    # correctly spaced or not. Adding the lowercase, no-space form here
+    # (hand-curated dict always wins collisions - see the loop below)
+    # fixes it for good instead of just patching this one spelling.
+    "coloncancer": "colon_cancer",
+    "cervicalcancer": "cervical_cancer",
+    "prostatecancer": "prostate_cancer",
+    "colorectalcancer": "colorectal_cancer",
+    "bonesofttissue": "soft_tissue_sarcoma",
+    "bone_soft_tissue": "soft_tissue_sarcoma",
+    "bone soft tissue": "soft_tissue_sarcoma",
+    # Added after checking every distinct Column C value actually present
+    # in your real IDS.xlsx queue against resolve_tumor_type(): these were
+    # silently falling through to "Unrecognized tumor type" because only
+    # a spaced/underscored form was registered (via _APP_MODULE_ALIASES or
+    # the auto-derived english_label alias), never the plain no-space
+    # form your sheet actually types. Same missing-alias reason as
+    # lungcancer/livercancer/coloncancer above - not a new tumor type,
+    # just a missing spelling for one that already existed with a diag
+    # code (canonical id / diag code noted per line for verification):
+    "breastcancer": "breast_cancer",              # AB45.6
+    "bonecancer": "bone_cancer",                  # C40.9
+    "bloodrelatedtumors": "blood_tumor",           # C95
+    "bladdercancer": "bladder_cancer",             # C67.9
+    "kidneycancer": "kidney_cancer",               # C64.9
+    "plasmacellcancer": "plasma_cell_cancer",      # AB23.9
+    # "Brain Tumor" (the exact text used in your sheet) had NO alias at
+    # all pointing at the existing brain_cns entry (U37.6) - its own
+    # auto-derived alias only covers the full english_label "brain and
+    # central nervous system cancer". Assumed to mean the same thing;
+    # flag this specific mapping for a quick sanity check on your end.
+    "brain tumor": "brain_cns",                    # U37.6
 }
 
 # FIXED BUG: this used to be a blind TUMOR_TYPE_ALIASES.update(_EXTRA_ALIASES),
