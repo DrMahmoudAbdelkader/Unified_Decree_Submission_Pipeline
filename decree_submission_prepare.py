@@ -118,10 +118,25 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
 def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -> dict:
     case_id = case["id"]
 
-    pipeline_key = aliases.get(case["tumor_type"])
-    if not pipeline_key:
-        msg = (f"نوع الورم \"{case['tumor_type']}\" غير مربوط بعد بأنواع الأورام في السكربت. "
-               f"اطلب من أحد المسؤولين إضافته من إعدادات أنواع الأورام (جدول cancer_type_aliases).")
+    # Resolution order:
+    #   1. Supabase cancer_type_aliases table, if this case's exact
+    #      tumor_type text has a hand-added override row there (kept as an
+    #      escape hatch for one-off text your module produces that you'd
+    #      rather remap from the dashboard than by editing this script).
+    #   2. Otherwise, the raw tumor_type text itself, straight into
+    #      resolve_tumor_type() below — this is now the primary path, since
+    #      the decree-request module's Excel export writes plain diagnosis
+    #      text (e.g. "Breast Cancer") and TUMOR_TYPE_ALIASES in the
+    #      pipeline script already recognizes that text directly. The
+    #      Supabase table is no longer required for a case to go through.
+    pipeline_key = aliases.get(case["tumor_type"]) or case["tumor_type"]
+
+    canonical, tumor_cfg_base = resolve_tumor_type(pipeline_key)
+    if canonical is None:
+        msg = (f"لم يتم التعرف على نوع الورم \"{case['tumor_type']}\" لا في جدول "
+               f"cancer_type_aliases ولا في TUMOR_TYPE_ALIASES بالسكربت. "
+               f"أضف نوع الورم هذا في السكربت (Unified_Decree_Submission_Pipeline.py) "
+               f"أو أضف تحويلاً له في جدول cancer_type_aliases.")
         common.open_requirement(case_id, None, msg)
         return {"case_id": case_id, "status": "requirement_opened", "message": msg}
 
@@ -142,12 +157,6 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -
     national_id = common.get_national_id(case["patient_id"])
     if not national_id:
         msg = f"لم يتم العثور على بيانات المريض (id={case['patient_id']}) — لا يمكن تحديد الرقم القومي."
-        common.open_requirement(case_id, None, msg)
-        return {"case_id": case_id, "status": "requirement_opened", "message": msg}
-
-    canonical, tumor_cfg_base = resolve_tumor_type(pipeline_key)
-    if canonical is None:
-        msg = f"لم يتم التعرف على كود الورم \"{pipeline_key}\" في السكربت — راجع جدول cancer_type_aliases."
         common.open_requirement(case_id, None, msg)
         return {"case_id": case_id, "status": "requirement_opened", "message": msg}
 
