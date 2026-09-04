@@ -108,7 +108,18 @@ def fetch_and_configure_assets() -> Dict[str, str]:
 # =====================================================================
 
 def load_cancer_type_aliases() -> Dict[str, str]:
-    rows = sb.select(ALIASES_TABLE, select="module_cancer_code,pipeline_tumor_key", filters={"is_active": "is.true"})
+    """Optional override table: case tumor_type text -> pipeline_tumor_key.
+    No longer required for a case to process — resolve_tumor_type() in the
+    pipeline script now recognizes the module's raw diagnosis text (e.g.
+    "Breast Cancer") directly. If this table has been emptied or dropped,
+    that's fine: fall back to no overrides instead of crashing the whole
+    prepare run (same "one row's problem should not kill the batch"
+    principle as everything else in this module)."""
+    try:
+        rows = sb.select(ALIASES_TABLE, select="module_cancer_code,pipeline_tumor_key", filters={"is_active": "is.true"})
+    except Exception as e:
+        log.warning(f"cancer_type_aliases lookup skipped ({e}) — resolving tumor types from raw text only.")
+        return {}
     return {r["module_cancer_code"]: r["pipeline_tumor_key"] for r in rows}
 
 
