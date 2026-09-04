@@ -278,6 +278,8 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 
 # wkhtmltopdf binary - install once, then point this at it.
 WKHTMLTOPDF_PATH = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"
+# Maximum time allowed for one authenticated MDT render.
+RENDER_TIMEOUT_SECONDS = 90
 
 # Signature / stamp images.
 SIGNATURE_FILES = {
@@ -1353,20 +1355,53 @@ class SMCSession:
 # =====================================================================
 
 def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
-    config = pdfkit.configuration(wkhtmltopdf=WKHTMLTOPDF_PATH)
-    options = {
-        "cookie": session.cookie_list(),
-        "encoding": "UTF-8",
-        "quiet": "",
-        "page-size": "A4",
-        "margin-top": "5mm",
-        "margin-bottom": "5mm",
-        "margin-left": "5mm",
-        "margin-right": "5mm",
-        "no-outline": None,
-    }
+    """Render the authenticated MDT print page with explicit cookies.
+
+    wkhtmltopdf runs as a separate process and does not share the cookies from
+    requests.Session automatically. Each cookie must therefore be passed as
+    its own --cookie name value pair.
+    """
     url = session.print_prerequest_url(pre_request_id)
-    return pdfkit.from_url(url, False, configuration=config, options=options)
+
+    cmd = [WKHTMLTOPDF_PATH]
+
+    # Explicitly forward every cookie from the authenticated requests.Session.
+    for name, value in session.cookie_list():
+        cmd += ["--cookie", name, value]
+
+    cmd += [
+        "--encoding", "UTF-8",
+        "--quiet",
+        "--page-size", "A4",
+        "--margin-top", "5mm",
+        "--margin-bottom", "5mm",
+        "--margin-left", "5mm",
+        "--margin-right", "5mm",
+        "--no-outline",
+        url,
+        "-",  # write the rendered PDF to stdout
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=RENDER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"wkhtmltopdf timed out for pre_request_id={pre_request_id}"
+        ) from exc
+
+    if proc.returncode != 0 or not proc.stdout:
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "wkhtmltopdf failed: "
+            + (stderr_text or f"exit code {proc.returncode}")
+        )
+
+    return proc.stdout
 
 
 # =====================================================================
