@@ -290,10 +290,10 @@ SIGNATURE_FILES = {
     "stamp": r"C:\Users\drmah\Template_Signatures\stamp.png",
 }
 SIGNATURES = [
-    {"name": "Signature 1 - د/محمد كيلاني", "file_key": "sig1", "x": 85, "y": 400, "width": 120, "height": 50},
-    {"name": "Signature 2 - ندى حسن", "file_key": "sig2", "x": 84, "y": 380, "width": 120, "height": 50},
-    {"name": "Signature 3 - نرمين رمضان", "file_key": "sig3", "x": 81, "y": 365, "width": 120, "height": 50},
-    {"name": "Signature 4 - ساره (Social Worker)", "file_key": "sig4", "x": 370, "y": 505, "width": 120, "height": 50},
+    {"name": "Signature 1 - د/محمد كيلاني", "file_key": "sig1", "x": 85, "y": 407, "width": 120, "height": 50},
+    {"name": "Signature 2 - ندى حسن", "file_key": "sig2", "x": 84, "y": 387, "width": 120, "height": 50},
+    {"name": "Signature 3 - نرمين رمضان", "file_key": "sig3", "x": 81, "y": 370, "width": 120, "height": 50},
+    {"name": "Signature 4 - ساره (Social Worker)", "file_key": "sig4", "x": 370, "y": 515, "width": 120, "height": 50},
 ]
 STAMP = {"name": "Official Stamp - GRI-E", "file_key": "stamp", "x": 85, "y": 310, "width": 150, "height": 150}
 
