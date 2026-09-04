@@ -1,25 +1,21 @@
 """
 supabase_storage.py
 ==========================================================================
-Supabase Storage REST helper, for the things that actually fit there:
-  - "decree-assets" bucket (private): signature images, stamp image, the
-    medical report template PDF — small, static, rarely change.
-  - "decree-pending-review" bucket (private): freshly-extracted patient
-    documents awaiting human approval — small and TRANSIENT (deleted once
-    approved and promoted to the permanent R2 archive, or once rejected).
-    This is deliberately NOT where the 10 GB approved archive lives —
-    that's r2_client.py. Keeping the pending set small and short-lived
-    means Supabase Storage's free/cheap tier is never under real pressure.
+Supabase Storage REST helper — now scoped to ONLY the small, static,
+rarely-changing assets: signature images and the medical report template
+PDF, in a private "decree-assets" bucket. Patient documents (both the
+permanent archive and the pending-review staging area) live entirely in
+Cloudflare R2 now (see r2_client.py) — a single storage system for
+everything patient-document-related, under a `pending/` key prefix for
+not-yet-labeled files and no prefix for the permanent, labeled archive.
 
 Reads from environment:
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   - same ones supabase_client.py uses
 
 ONE-TIME SETUP (you do this once, manually, in the Supabase dashboard or CLI):
-    1. Create a private bucket named "decree-assets".
-       Upload: signatures/sig1.png, sig2.png, sig3.png, sig4.png, stamp.png
-               medical_report_template.pdf
-    2. Create a private bucket named "decree-pending-review" (starts empty —
-       decree_submission_prepare.py populates it).
+    Create a private bucket named "decree-assets" and upload:
+        signatures/sig1.png, sig2.png, sig3.png, sig4.png, stamp.png
+        medical_report_template.pdf
 """
 
 from __future__ import annotations
@@ -35,7 +31,6 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 
 ASSETS_BUCKET = "decree-assets"
-PENDING_REVIEW_BUCKET = "decree-pending-review"
 
 _TIMEOUT = 60
 
@@ -57,28 +52,6 @@ def download(bucket: str, object_path: str, local_path: str) -> bool:
     with open(local_path, "wb") as f:
         f.write(resp.content)
     return True
-
-
-def upload(bucket: str, object_path: str, local_path: str, content_type: str = "application/octet-stream") -> bool:
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{object_path}"
-    with open(local_path, "rb") as f:
-        resp = requests.post(
-            url,
-            headers={**_headers(), "Content-Type": content_type},
-            data=f.read(),
-            params={"upsert": "true"},
-            timeout=_TIMEOUT,
-        )
-    if resp.status_code not in (200, 201):
-        log.error(f"Storage upload failed ({resp.status_code}) for {bucket}/{object_path}: {resp.text[:200]}")
-        return False
-    return True
-
-
-def delete(bucket: str, object_path: str) -> bool:
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{object_path}"
-    resp = requests.delete(url, headers=_headers(), timeout=_TIMEOUT)
-    return resp.status_code in (200, 204)
 
 
 def fetch_signing_and_template_assets(local_dir: str) -> dict:
