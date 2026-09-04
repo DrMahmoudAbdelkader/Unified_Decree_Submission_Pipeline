@@ -1355,21 +1355,59 @@ class SMCSession:
 # =====================================================================
 
 def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
-    """Render the authenticated MDT print page with explicit cookies.
+    """Render the authenticated MDT print page to PDF.
 
-    wkhtmltopdf runs as a separate process and does not share the cookies from
-    requests.Session automatically. Each cookie must therefore be passed as
-    its own --cookie name value pair.
+    FIXED BUG (superseding the previous cookie-forwarding approach): having
+    wkhtmltopdf fetch the URL itself — even with every cookie manually
+    forwarded via --cookie, even with a patched-Qt build — proved
+    unreliable in this environment: sometimes it silently got the
+    logged-out landing page (exit 0, no error), and on retry it sometimes
+    hung indefinitely waiting on the network instead of failing. wkhtmltopdf
+    doing its own HTTP fetch means its own auth/cookie/header handling has
+    to exactly match the site's expectations, with no visibility into why
+    it doesn't.
+
+    The `requests.Session` used for every other call in this script is
+    already authenticated and has never had this problem. So: fetch the
+    print page's HTML ourselves with that trusted session, validate it's
+    actually the print form (not a login/landing page) BEFORE spending any
+    time on wkhtmltopdf, then hand wkhtmltopdf the HTML directly via stdin.
+    wkhtmltopdf then does no networking or auth of its own for the main
+    page at all — only for any referenced sub-resources (rare on a
+    server-rendered print page), which is a much smaller failure surface
+    than the whole page fetch.
     """
     url = session.print_prerequest_url(pre_request_id)
 
-    cmd = [WKHTMLTOPDF_PATH]
+    resp = session.s.get(url, timeout=30)
+    if resp.status_code != 200:
+        raise OSError(
+            f"Could not fetch MDT print page for pre_request_id={pre_request_id} "
+            f"(HTTP {resp.status_code}). Will re-login and retry."
+        )
 
-    # Explicitly forward every cookie from the authenticated requests.Session.
-    for name, value in session.cookie_list():
-        cmd += ["--cookie", name, value]
+    html = resp.text
+    looks_like_login_page = ("اسم المستخدم" in html and "كلمة السر" in html)
+    looks_like_print_form = ("طلب علاج" in html or "تقرير اللجنة الثلاثية" in html
+                              or str(pre_request_id) in html)
+    if looks_like_login_page or not looks_like_print_form:
+        raise OSError(
+            f"Fetched MDT print page for pre_request_id={pre_request_id} looks like the "
+            f"logged-out SMC landing/login page, not the actual print form — session was not "
+            f"authenticated for this request. Will re-login and retry."
+        )
 
-    cmd += [
+    # wkhtmltopdf is no longer fetching the page, so relative asset URLs
+    # (css/images referenced without a full domain) need an explicit base
+    # to still resolve correctly.
+    base_tag = f'<base href="{BASE_URL}/">'
+    if re.search(r"<head[^>]*>", html, re.I):
+        html = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, html, count=1, flags=re.I)
+    else:
+        html = base_tag + html
+
+    cmd = [
+        WKHTMLTOPDF_PATH,
         "--encoding", "UTF-8",
         "--quiet",
         "--page-size", "A4",
@@ -1378,20 +1416,23 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
         "--margin-left", "5mm",
         "--margin-right", "5mm",
         "--no-outline",
-        url,
-        "-",  # write the rendered PDF to stdout
+        "--load-error-handling", "ignore",
+        "--load-media-error-handling", "ignore",
+        "-", "-",  # "-" "-" = read HTML from stdin, write PDF to stdout
     ]
 
     try:
         proc = subprocess.run(
             cmd,
+            input=html.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=RENDER_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"wkhtmltopdf timed out for pre_request_id={pre_request_id}"
+        raise OSError(
+            f"wkhtmltopdf timed out rendering pre_request_id={pre_request_id} even from "
+            f"already-fetched local HTML (likely a hung external asset request) — will retry."
         ) from exc
 
     if proc.returncode != 0 or not proc.stdout:
@@ -1401,37 +1442,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
             + (stderr_text or f"exit code {proc.returncode}")
         )
 
-    # FIXED BUG: wkhtmltopdf runs as its own subprocess with cookies
-    # forwarded manually (see above) — it does NOT share session state with
-    # `requests.Session`, so if that cookie handoff is even slightly wrong
-    # (missing attribute, stale/rotated token, timing), the site silently
-    # serves its logged-out public landing page instead of the actual print
-    # form. wkhtmltopdf still exits 0 with a "successful" render either way,
-    # so nothing before this point ever notices — the login/landing page
-    # then gets signed and uploaded as if it were the real MDT form.
-    # Confirmed by comparing an actual bad run's output against a good one:
-    # the logged-out page contains the portal's login widget ("اسم
-    # المستخدم" / "كلمة السر") and none of the print form's own markers
-    # ("طلب علاج", "تقرير اللجنة الثلاثية"). Checking for that distinction
-    # here, and raising OSError (caught by call_with_reconnect's broad
-    # exception set) so the caller re-logs in and retries the whole render
-    # from scratch instead of silently signing the wrong page.
-    try:
-        rendered_doc = fitz.open(stream=proc.stdout, filetype="pdf")
-        rendered_text = rendered_doc[0].get_text()
-        rendered_doc.close()
-    except Exception as exc:
-        raise RuntimeError(f"Rendered MDT print page is not a readable PDF: {exc}")
-
-    looks_like_login_page = ("اسم المستخدم" in rendered_text and "كلمة السر" in rendered_text)
-    looks_like_print_form = ("طلب علاج" in rendered_text or "تقرير اللجنة الثلاثية" in rendered_text
-                              or str(pre_request_id) in rendered_text)
-    if looks_like_login_page or not looks_like_print_form:
-        raise OSError(
-            f"Rendered 'MDT print page' for pre_request_id={pre_request_id} looks like the "
-            f"logged-out SMC landing/login page, not the actual print form — the session was "
-            f"not authenticated for this wkhtmltopdf request. Will re-login and retry."
-        )
+    return proc.stdout
 
     return proc.stdout
 
