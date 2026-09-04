@@ -1397,10 +1397,26 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
             f"authenticated for this request. Will re-login and retry."
         )
 
-    # wkhtmltopdf is no longer fetching the page, so relative asset URLs
-    # (css/images referenced without a full domain) need an explicit base
-    # to still resolve correctly.
-    base_tag = f'<base href="{BASE_URL}/">'
+    # wkhtmltopdf is no longer fetching the MAIN page itself, but it still
+    # makes its own network requests for anything the page's HTML links to
+    # (stylesheet, images) — those sub-resource requests need the SAME
+    # authenticated cookies or they silently fail. FIXED BUG: the first
+    # version of this stdin approach dropped cookie forwarding entirely
+    # (only needed for the main-page fetch, which is now handled by
+    # `requests.Session` above) — so the linked CSS came back
+    # unauthenticated/redirected and got silently dropped by
+    # --load-error-handling ignore below, producing a technically-correct
+    # but completely unstyled page (fields overlapping, no layout) instead
+    # of an error. Forwarding cookies here re-authenticates those
+    # sub-resource requests without reintroducing the main-page risk.
+    cookie_args = []
+    for name, value in session.cookie_list():
+        cookie_args += ["--cookie", name, value]
+
+    # <base> must point at the ORIGINAL page URL (not just the site root)
+    # so the page's relative asset paths resolve exactly as they would
+    # during a real navigation to that URL.
+    base_tag = f'<base href="{url}">'
     if re.search(r"<head[^>]*>", html, re.I):
         html = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, html, count=1, flags=re.I)
     else:
@@ -1408,6 +1424,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
 
     cmd = [
         WKHTMLTOPDF_PATH,
+        *cookie_args,
         "--encoding", "UTF-8",
         "--quiet",
         "--page-size", "A4",
@@ -1416,8 +1433,6 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
         "--margin-left", "5mm",
         "--margin-right", "5mm",
         "--no-outline",
-        "--load-error-handling", "ignore",
-        "--load-media-error-handling", "ignore",
         "-", "-",  # "-" "-" = read HTML from stdin, write PDF to stdout
     ]
 
@@ -1443,9 +1458,6 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
         )
 
     return proc.stdout
-
-    return proc.stdout
-
 
 # =====================================================================
 # SIGNATURE / STAMP OVERLAY
