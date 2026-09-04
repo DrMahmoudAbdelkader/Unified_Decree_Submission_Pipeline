@@ -75,7 +75,18 @@ def configure_smc_credentials(username_env="SMC_USERNAME", password_env="SMC_PAS
     _pipeline_module.WKHTMLTOPDF_PATH = os.environ.get("WKHTMLTOPDF_PATH", "/usr/bin/wkhtmltopdf")
     _pipeline_module.PATIENT_DOCS_ROOT = os.environ.get("PATIENT_DOCS_ROOT", PATIENT_DOC_CACHE_DIR)
     _pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR = os.path.join(_pipeline_module.PATIENT_DOCS_ROOT, "UNDER_PROCESSED")
+    # FIXED BUG: Unified_Decree_Submission_Pipeline.FALLBACK_PATIENT_DOCS_DIR
+    # is a plain module-level string, computed ONCE at import time from the
+    # hardcoded D:\SMS\... Windows path (before this function ever runs).
+    # Re-pointing PATIENT_DOCS_UNDER_PROCESSED_DIR above does NOT change it,
+    # because it's a separate variable, not a live reference — so every
+    # website/CMIS-fallback download was still landing in that stale
+    # Windows-literal folder name on the Linux runner instead of anywhere
+    # this script (or R2) could find it. This is the actual cause of the
+    # "Downloaded to D:\SMS\..." log lines. Must be repointed explicitly.
+    _pipeline_module.FALLBACK_PATIENT_DOCS_DIR = _pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR
     os.makedirs(_pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR, exist_ok=True)
+    os.makedirs(_pipeline_module.PATIENT_DOCS_ROOT, exist_ok=True)
 
 
 def fetch_and_configure_assets() -> Dict[str, str]:

@@ -1401,6 +1401,38 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
             + (stderr_text or f"exit code {proc.returncode}")
         )
 
+    # FIXED BUG: wkhtmltopdf runs as its own subprocess with cookies
+    # forwarded manually (see above) — it does NOT share session state with
+    # `requests.Session`, so if that cookie handoff is even slightly wrong
+    # (missing attribute, stale/rotated token, timing), the site silently
+    # serves its logged-out public landing page instead of the actual print
+    # form. wkhtmltopdf still exits 0 with a "successful" render either way,
+    # so nothing before this point ever notices — the login/landing page
+    # then gets signed and uploaded as if it were the real MDT form.
+    # Confirmed by comparing an actual bad run's output against a good one:
+    # the logged-out page contains the portal's login widget ("اسم
+    # المستخدم" / "كلمة السر") and none of the print form's own markers
+    # ("طلب علاج", "تقرير اللجنة الثلاثية"). Checking for that distinction
+    # here, and raising OSError (caught by call_with_reconnect's broad
+    # exception set) so the caller re-logs in and retries the whole render
+    # from scratch instead of silently signing the wrong page.
+    try:
+        rendered_doc = fitz.open(stream=proc.stdout, filetype="pdf")
+        rendered_text = rendered_doc[0].get_text()
+        rendered_doc.close()
+    except Exception as exc:
+        raise RuntimeError(f"Rendered MDT print page is not a readable PDF: {exc}")
+
+    looks_like_login_page = ("اسم المستخدم" in rendered_text and "كلمة السر" in rendered_text)
+    looks_like_print_form = ("طلب علاج" in rendered_text or "تقرير اللجنة الثلاثية" in rendered_text
+                              or str(pre_request_id) in rendered_text)
+    if looks_like_login_page or not looks_like_print_form:
+        raise OSError(
+            f"Rendered 'MDT print page' for pre_request_id={pre_request_id} looks like the "
+            f"logged-out SMC landing/login page, not the actual print form — the session was "
+            f"not authenticated for this wkhtmltopdf request. Will re-login and retry."
+        )
+
     return proc.stdout
 
 

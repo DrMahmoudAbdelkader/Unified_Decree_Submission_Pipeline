@@ -39,7 +39,15 @@ log = logging.getLogger("r2_client")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_BUCKET_NAME = "cleaned-pdfs-files"
+# FIXED BUG: this was hardcoded to "cleaned-pdfs-files", silently ignoring
+# the R2_BUCKET_NAME secret set in the GitHub Actions workflow. Every R2
+# call was therefore targeting whatever this literal said, regardless of
+# what bucket was actually configured — a mismatch here fails HEAD/GET/PUT
+# silently (exists() just returns False, upload_pending() just returns
+# False) rather than raising, so nothing ever looked broken until you
+# checked R2 itself. Reads from the environment again, with this bucket
+# name kept only as the fallback default if the secret isn't set.
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "cleaned-pdfs-files")
 
 _client = None
 
