@@ -40,6 +40,16 @@ on:
         description: "Comma-separated decree_request_cases.id list, or blank for every READY_TO_SUBMIT case"
         required: false
         default: ""
+      debug_render_mdt_and_stop:
+        description: >-
+          DEBUG: creates the MDT for ONE case (case_ids must be exactly
+          one id), renders it, uploads the raw + signed PDFs as this
+          run's own artifact, and stops — no report/merge/upload happens
+          and the case is left as READY_TO_SUBMIT. Use this to check a
+          font/layout fix before letting a run submit for real.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   prepare:
@@ -91,6 +101,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
+          DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python decree_submission_prepare.py
 
       - name: Upload run artifacts (logs, debug dumps, if any)
@@ -102,3 +113,20 @@ jobs:
             /tmp/decree_merged/**
           if-no-files-found: ignore
           retention-days: 14
+
+      # Only populated when debug_render_mdt_and_stop is true (see
+      # decree_submission_prepare.debug_dump_mdt_and_stop) — a SEPARATE
+      # artifact, on purpose, from the one above, so a real run's merged
+      # submission PDFs and a debug run's isolated MDT renders never mix
+      # in the same download. Short retention since this is meant to be
+      # inspected once and thrown away — delete it yourself from this
+      # run's page whenever you're done with it, no need to wait.
+      - name: Upload MDT debug render (only if debug_render_mdt_and_stop was on)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decree-mdt-debug-${{ github.run_id }}
+          path: |
+            /tmp/decree_mdt_debug/**
+          if-no-files-found: ignore
+          retention-days: 5
