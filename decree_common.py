@@ -114,6 +114,30 @@ def _install_mdt_form_font() -> None:
             subprocess.run(["fc-cache", "-f", font_dir], check=False,
                             capture_output=True)
             log.info(f"Installed MDT-form font(s) into {font_dir}: {list(paths.values())}")
+            # Hand the real local paths straight to render_print_page_to_pdf()
+            # so it can inject an explicit @font-face itself (see that
+            # function's comment) instead of relying on fontconfig to have
+            # matched the file's internal name-table family against
+            # whatever family the SMC page's CSS actually asks for.
+            _pipeline_module.MDT_FORM_FONT_PATHS = paths
+            # One-shot diagnostic so a future run's log says definitively
+            # whether the font that landed on disk is actually named
+            # "Tahoma" (or whatever family the page wants) as far as
+            # fontconfig is concerned - if it isn't, that's exactly why a
+            # plain fc-cache install (no @font-face override) would still
+            # silently fall back, with nothing in the log to show why.
+            fc_check = subprocess.run(
+                ["fc-list", ":", "family"], check=False,
+                capture_output=True, text=True,
+            )
+            log.info(f"fc-list after install (fontconfig's view of available families):\n"
+                     f"{fc_check.stdout}")
+        else:
+            log.warning(
+                "fetch_mdt_form_font() returned no paths - MDT_FORM_FONT_PATHS stays "
+                "empty, render_print_page_to_pdf() will fall back to fontconfig "
+                "substitution and log a warning when it does."
+            )
     except Exception as exc:
         # Never let a font-install hiccup take down the whole run - the
         # MDT form still renders, just with a fallback font.

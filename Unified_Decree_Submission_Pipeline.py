@@ -285,6 +285,13 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
 
+# Populated at runtime by decree_common._install_mdt_form_font() with the
+# local paths of the font downloaded from Supabase Storage (fonts/mdt_form_font.ttf
+# / mdt_form_font_bold.ttf). Left empty until then; render_print_page_to_pdf()
+# checks this dict itself rather than trusting OS-level fontconfig substitution
+# to have matched the family name correctly.
+MDT_FORM_FONT_PATHS: Dict[str, str] = {}
+
 # Signature / stamp images.
 SIGNATURE_FILES = {
     "sig1": r"C:\Users\drmah\Template_Signatures\mdt1.png",
@@ -1431,6 +1438,69 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         f"Chromium landed on the logged-out SMC page for "
                         f"pre_request_id={pre_request_id} — session expired "
                         f"between fetch and render. Will re-login and retry."
+                    )
+
+                # --- Belt-and-suspenders on top of decree_common's OS-level
+                # fc-cache install: don't trust fontconfig's NAME MATCHING to
+                # have mapped the downloaded file onto whatever family the
+                # page's CSS asks for. Instead, read the family name the page
+                # ITSELF resolves to at runtime, then hand Chromium an
+                # explicit @font-face for that exact name pointing straight
+                # at the real local font bytes. This is what actually
+                # decides whether the CI form matches the local one — if
+                # MDT_FORM_FONT_PATHS is empty, nothing below fires and we
+                # fall back to the old fontconfig-substitution behavior
+                # (log line makes that visible instead of silent).
+                try:
+                    regular_path = MDT_FORM_FONT_PATHS.get("regular")
+                    if regular_path and os.path.exists(regular_path):
+                        computed_family = page.evaluate(
+                            "() => { const el = document.querySelector('body'); "
+                            "return el ? getComputedStyle(el).fontFamily : ''; }"
+                        ) or ""
+                        family_name = (
+                            computed_family.split(",")[0].strip().strip('"').strip("'")
+                            or "Tahoma"
+                        )
+
+                        import base64
+                        with open(regular_path, "rb") as f:
+                            regular_b64 = base64.b64encode(f.read()).decode("ascii")
+                        bold_face_css = ""
+                        bold_path = MDT_FORM_FONT_PATHS.get("bold")
+                        if bold_path and os.path.exists(bold_path):
+                            with open(bold_path, "rb") as f:
+                                bold_b64 = base64.b64encode(f.read()).decode("ascii")
+                            bold_face_css = (
+                                f"@font-face {{ font-family: '{family_name}'; "
+                                f"src: url(data:font/ttf;base64,{bold_b64}) format('truetype'); "
+                                f"font-weight: bold; font-display: block; }}"
+                            )
+                        page.add_style_tag(content=(
+                            f"@font-face {{ font-family: '{family_name}'; "
+                            f"src: url(data:font/ttf;base64,{regular_b64}) format('truetype'); "
+                            f"font-weight: normal; font-display: block; }}"
+                            f"{bold_face_css}"
+                            f"* {{ font-family: '{family_name}' !important; }}"
+                        ))
+                        log.info(
+                            f"Injected explicit @font-face for '{family_name}' from "
+                            f"{regular_path} — bypasses fontconfig name matching entirely."
+                        )
+                    else:
+                        log.warning(
+                            "MDT_FORM_FONT_PATHS has no usable 'regular' font file for this "
+                            "render — falling back to fontconfig substitution (this is almost "
+                            "certainly why the layout won't match local: either the font wasn't "
+                            "uploaded to decree-assets/fonts/mdt_form_font.ttf in Supabase "
+                            "Storage, or the download of it failed earlier in this run — check "
+                            "the 'Could not install MDT-form font' / 'No MDT-form font found' "
+                            "warnings above in this same log)."
+                        )
+                except Exception as font_exc:
+                    log.warning(
+                        f"@font-face injection failed ({font_exc}) — continuing with "
+                        f"fontconfig fallback."
                     )
 
                 # Use the site's OWN print stylesheet - the same one applied
