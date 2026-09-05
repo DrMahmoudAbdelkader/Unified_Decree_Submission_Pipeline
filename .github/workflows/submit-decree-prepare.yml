@@ -43,28 +43,54 @@ jobs:
         with:
           python-version: "3.11"
 
-      # FIXED BUG: `apt-get install wkhtmltopdf` on Ubuntu pulls the
-      # UNPATCHED-Qt build from the distro repos — a deprecated build
-      # wkhtmltopdf's own maintainers warn against, with known-broken
-      # cookie/session handling. That's why every rendered "MDT print page"
-      # came back as the logged-out landing page no matter how many times
-      # the script re-logged in: it's not a flaky auth issue, the unpatched
-      # renderer structurally can't carry an authenticated session.
-      # Installing the official statically-linked, patched-Qt .deb instead
-      # (same one the local Windows install effectively uses) fixes this.
-      - name: Install system dependencies (patched-Qt wkhtmltopdf, Amiri font)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            fonts-hosny-amiri libgl1 xfonts-75dpi fontconfig \
-            libjpeg-turbo8 libxrender1 libxext6 libjpeg8
-          wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-          sudo dpkg -i wkhtmltox_0.12.6.1-2.jammy_amd64.deb || sudo apt-get install -f -y
-          wkhtmltopdf --version  # must print "(with patched qt)" — fail loudly here, not deep in a render step
-          wkhtmltopdf --version | grep -q "with patched qt"
-
+      # SUPERSEDES the old wkhtmltopdf install: wkhtmltopdf's own frozen
+      # WebKit engine (not just its cookie handling) was producing a
+      # disrupted/disoriented MDT form compared to a manual browser print -
+      # see render_print_page_to_pdf()'s docstring. A real, current
+      # Chromium via Playwright renders the page's actual @media print
+      # stylesheet and paints CSS backgrounds by default, matching a
+      # manual print far more closely.
       - name: Install Python dependencies
         run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Install Playwright's Chromium
+        run: playwright install --with-deps chromium
+
+      # fonts-hosny-amiri stays - it's what medical_report_overlay.py uses
+      # to draw the SEPARATE medical-report PDF (already calibrated, not
+      # the thing that was broken). The MDT FORM itself is server-rendered
+      # HTML styled by the SMC site's OWN CSS, which almost certainly asks
+      # for Tahoma (see medical_report_overlay.py's own note on this) -
+      # Amiri is a different typeface and won't satisfy that request, so
+      # without Tahoma actually installed, Chromium/fontconfig falls back
+      # to a wider generic sans (DejaVu/Liberation), which is what caused
+      # the extra line-wraps and the reversed date split you saw in the
+      # CI-rendered form vs. the local one.
+      #
+      # Tahoma ships with Windows and Microsoft's redistribution terms
+      # don't clearly permit committing it into a public repo, so it's
+      # installed here from a base64'd repo secret instead - set
+      # MDT_FORM_FONT_TTF_BASE64 (and _BOLD) to `certutil -encode` (or
+      # `[Convert]::ToBase64String(...)` in PowerShell) of your own local
+      # C:\Windows\Fonts\tahoma.ttf / tahomabd.ttf, with the header/footer
+      # lines certutil adds stripped out. Confirm first (locally, logged
+      # into the SMC print page, via DevTools' computed font-family) that
+      # Tahoma really is what the page asks for.
+      - name: Install matching MDT-form font from secret
+        env:
+          MDT_FORM_FONT_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_TTF_BASE64 }}
+          MDT_FORM_FONT_BOLD_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_BOLD_TTF_BASE64 }}
+        run: |
+          if [ -n "$MDT_FORM_FONT_TTF_BASE64" ]; then
+            sudo mkdir -p /usr/share/fonts/truetype/mdt-form
+            echo "$MDT_FORM_FONT_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form.ttf > /dev/null
+            if [ -n "$MDT_FORM_FONT_BOLD_TTF_BASE64" ]; then
+              echo "$MDT_FORM_FONT_BOLD_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form-bold.ttf > /dev/null
+            fi
+            sudo fc-cache -f -v
+          else
+            echo "::warning::MDT_FORM_FONT_TTF_BASE64 secret not set - the rendered MDT form will use a fallback font and may not match the local layout."
+          fi
 
       - name: Run prepare (MDT creation + document lookup)
         env:
@@ -79,11 +105,6 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
-          # the official .deb installs to /usr/local/bin, NOT /usr/bin
-          # (decree_common.py's default) — must be set explicitly or the
-          # script falls back to /usr/bin/wkhtmltopdf, which apt may still
-          # have installed as a dependency-resolution side effect.
-          WKHTMLTOPDF_PATH: /usr/local/bin/wkhtmltopdf
         run: python decree_submission_prepare.py
 
       - name: Upload run artifacts (logs, debug dumps, if any)

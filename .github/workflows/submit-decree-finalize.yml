@@ -31,22 +31,37 @@ jobs:
         with:
           python-version: "3.11"
 
-      # See submit-decree-prepare.yml for why this replaces the plain
-      # `apt-get install wkhtmltopdf` — unpatched Qt build, broken session
-      # handling, silently signs the logged-out page instead of the MDT form.
-      - name: Install system dependencies (patched-Qt wkhtmltopdf, Amiri font)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            fonts-hosny-amiri libgl1 xfonts-75dpi fontconfig \
-            libjpeg-turbo8 libxrender1 libxext6 libjpeg8
-          wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-          sudo dpkg -i wkhtmltox_0.12.6.1-2.jammy_amd64.deb || sudo apt-get install -f -y
-          wkhtmltopdf --version
-          wkhtmltopdf --version | grep -q "with patched qt"
-
+      # SUPERSEDES the old wkhtmltopdf install - see
+      # render_print_page_to_pdf()'s docstring and submit-decree-prepare.yml
+      # for why: wkhtmltopdf's frozen WebKit engine (not just cookie
+      # handling) was the actual source of the disrupted/disoriented MDT
+      # form, so this step now installs a real Chromium via Playwright.
       - name: Install Python dependencies
         run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Install Playwright's Chromium
+        run: playwright install --with-deps chromium
+
+      # fonts-hosny-amiri stays for medical_report_overlay.py's SEPARATE
+      # report PDF (already calibrated). The MDT form itself is styled by
+      # the SMC site's own CSS, which almost certainly asks for Tahoma -
+      # see submit-decree-prepare.yml's font-install step for the full
+      # explanation and how to set these secrets.
+      - name: Install matching MDT-form font from secret
+        env:
+          MDT_FORM_FONT_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_TTF_BASE64 }}
+          MDT_FORM_FONT_BOLD_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_BOLD_TTF_BASE64 }}
+        run: |
+          if [ -n "$MDT_FORM_FONT_TTF_BASE64" ]; then
+            sudo mkdir -p /usr/share/fonts/truetype/mdt-form
+            echo "$MDT_FORM_FONT_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form.ttf > /dev/null
+            if [ -n "$MDT_FORM_FONT_BOLD_TTF_BASE64" ]; then
+              echo "$MDT_FORM_FONT_BOLD_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form-bold.ttf > /dev/null
+            fi
+            sudo fc-cache -f -v
+          else
+            echo "::warning::MDT_FORM_FONT_TTF_BASE64 secret not set - the rendered MDT form will use a fallback font and may not match the local layout."
+          fi
 
       - name: Run finalize (sign + report + merge + upload)
         env:
@@ -61,7 +76,6 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
-          WKHTMLTOPDF_PATH: /usr/local/bin/wkhtmltopdf
         run: python decree_submission_finalize.py
 
       - name: Upload run artifacts (logs, debug dumps, if any)
