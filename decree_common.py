@@ -91,14 +91,43 @@ def configure_smc_credentials(username_env="SMC_USERNAME", password_env="SMC_PAS
     os.makedirs(_pipeline_module.PATIENT_DOCS_ROOT, exist_ok=True)
 
 
+def _install_mdt_form_font() -> None:
+    """Downloads the MDT-form font (see supabase_storage.fetch_mdt_form_font)
+    into a USER-level font directory and refreshes fontconfig's cache -
+    deliberately ~/.local/share/fonts, not /usr/share/fonts, so this needs
+    no sudo on the GitHub-hosted runner. fontconfig searches user font
+    dirs by default, so Chromium (via Playwright) picks it up the same as
+    a system-wide install would. Non-fatal on failure - see
+    fetch_mdt_form_font()'s own docstring for why."""
+    font_dir = os.path.expanduser("~/.local/share/fonts")
+    try:
+        paths = supabase_storage.fetch_mdt_form_font(font_dir)
+        if paths:
+            import subprocess
+            subprocess.run(["fc-cache", "-f", font_dir], check=False,
+                            capture_output=True)
+            log.info(f"Installed MDT-form font(s) into {font_dir}: {list(paths.values())}")
+    except Exception as exc:
+        # Never let a font-install hiccup take down the whole run - the
+        # MDT form still renders, just with a fallback font.
+        log.warning(f"Could not install MDT-form font ({exc}) - continuing with fallback font.")
+
+
 def fetch_and_configure_assets() -> Dict[str, str]:
     """Downloads signatures + medical report template from Supabase
     Storage, and points every hardcoded local-PC path in the pipeline
     (SIGNATURE_FILES, medical_report_overlay's template/font paths) at
     the downloaded/apt-installed equivalents. Raises RuntimeError with a
     specific message if anything required is missing — never lets a
-    downstream FileNotFoundError surface unexplained."""
+    downstream FileNotFoundError surface unexplained.
+
+    Also installs the MDT-form font (separate from the medical-report's
+    Amiri font below - see _install_mdt_form_font()) so the Chromium
+    render in render_print_page_to_pdf() has the same font the SMC page's
+    CSS actually asks for, instead of falling back to a wider generic
+    sans and reflowing the form's fixed-width fields."""
     assets = supabase_storage.fetch_signing_and_template_assets(ASSETS_DIR)
+    _install_mdt_form_font()
 
     _pipeline_module.SIGNATURE_FILES = {
         "sig1": assets["sig1"], "sig2": assets["sig2"], "sig3": assets["sig3"],
