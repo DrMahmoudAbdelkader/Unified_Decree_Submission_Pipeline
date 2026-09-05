@@ -16,6 +16,14 @@ ONE-TIME SETUP (you do this once, manually, in the Supabase dashboard or CLI):
     Create a private bucket named "decree-assets" and upload:
         signatures/sig1.png, sig2.png, sig3.png, sig4.png, stamp.png
         medical_report_template.pdf
+        fonts/mdt_form_font.ttf, fonts/mdt_form_font_bold.ttf
+            (your own local C:\Windows\Fonts\tahoma.ttf / tahomabd.ttf,
+            or whatever the SMC print page's CSS actually specifies —
+            confirm via DevTools' computed font-family on that page.
+            NOT redistributed by this repo: GitHub Actions secrets cap
+            out at 64 KB, far smaller than a real font file, and a public
+            repo isn't an appropriate place for it anyway - Supabase
+            Storage's private bucket has neither problem.)
 """
 
 from __future__ import annotations
@@ -82,5 +90,41 @@ def fetch_signing_and_template_assets(local_dir: str) -> dict:
         raise RuntimeError(
             f"Missing required asset(s) in Supabase Storage bucket '{ASSETS_BUCKET}': {missing}. "
             f"Upload them once via the Supabase dashboard before running this workflow."
+        )
+    return paths
+
+
+def fetch_mdt_form_font(local_dir: str) -> dict:
+    """Downloads the font the SMC print page's own CSS actually asks for
+    (almost certainly Tahoma - see medical_report_overlay.py's note),
+    installed into a private Storage bucket rather than committed to this
+    public repo or stuffed into a GitHub Actions secret (both of which
+    either republish a font of unclear redistribution rights, or simply
+    don't fit - Actions secrets cap out at 64 KB, well under a real font
+    file's size).
+
+    Deliberately non-fatal if these objects aren't uploaded yet: the MDT
+    form still renders without this (falling back to whatever generic
+    sans-serif fontconfig picks on the runner), it just won't match the
+    local layout as closely. Returns {} with a logged warning in that
+    case rather than raising, so a first deploy before you've uploaded
+    the font doesn't hard-fail every run.
+    """
+    os.makedirs(local_dir, exist_ok=True)
+    wanted = {
+        "regular": "fonts/mdt_form_font.ttf",
+        "bold": "fonts/mdt_form_font_bold.ttf",
+    }
+    paths = {}
+    for key, object_path in wanted.items():
+        local_path = os.path.join(local_dir, os.path.basename(object_path))
+        if download(ASSETS_BUCKET, object_path, local_path):
+            paths[key] = local_path
+    if "regular" not in paths:
+        log.warning(
+            f"No MDT-form font found at '{ASSETS_BUCKET}/fonts/mdt_form_font.ttf' - "
+            f"the rendered MDT form will use a fallback font and may not match the "
+            f"local layout. Upload your local Tahoma (or whatever the print page's "
+            f"CSS specifies) there once to fix this."
         )
     return paths
