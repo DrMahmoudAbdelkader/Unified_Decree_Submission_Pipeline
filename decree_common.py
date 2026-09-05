@@ -51,6 +51,13 @@ MERGED_PDF_DIR = "/tmp/decree_merged"
 PATIENT_DOC_CACHE_DIR = "/tmp/patient_docs"
 ASSETS_DIR = "/tmp/decree_assets"
 
+# DEBUG_RENDER_MDT_AND_STOP=1 output lives here (see
+# decree_submission_prepare.debug_dump_mdt_and_stop) — a SEPARATE
+# directory from MERGED_PDF_DIR on purpose, so the debug artifact upload
+# step in the workflow can't accidentally pick up a real merged
+# submission PDF, and vice versa.
+DEBUG_MDT_DIR = "/tmp/decree_mdt_debug"
+
 # Confirmed via `fc-list` + fontTools cmap inspection against the exact
 # fonts-hosny-amiri package installed in the workflow: Amiri-Regular/Bold
 # cover BOTH Arabic and Latin glyphs in one file — the same requirement

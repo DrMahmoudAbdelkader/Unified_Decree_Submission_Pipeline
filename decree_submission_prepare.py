@@ -50,7 +50,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import decree_common as common
 from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, stage_create_mdt, \
-    locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id
+    locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id, \
+    render_print_page_to_pdf, apply_signatures_and_stamp
 import supabase_client as sb
 import r2_client
 
@@ -72,6 +73,85 @@ def make_r2_aware_finder(national_id: str):
     def _find(patient_id: str) -> Optional[str]:
         return r2_client.download_if_exists(patient_id, common.PATIENT_DOC_CACHE_DIR)
     return _find
+
+
+def debug_mode_on() -> bool:
+    return os.environ.get("DEBUG_RENDER_MDT_AND_STOP", "").strip() in ("1", "true", "True")
+
+
+def debug_dump_mdt_and_stop(session: SMCSession, case_id: int, attempt_id: int,
+                             pre_request_id: str, national_id: str) -> dict:
+    """DEBUG_RENDER_MDT_AND_STOP=1 path.
+
+    Renders the print page for the MDT that stage_create_mdt() just
+    created and STOPS — no locate_patient_document_pdf, no medical
+    report, no merge, no upload. The point is to isolate exactly the
+    piece that's been unreliable (the HTML->PDF render on the
+    GitHub-hosted runner) from every other stage, so you can inspect it
+    on its own before trusting the pipeline to go on and actually submit.
+
+    Writes TWO files so a bad render can be told apart from a bad
+    signature overlay:
+      *_00_raw_render.pdf    - straight out of render_print_page_to_pdf(),
+                                 no signatures/stamp - this is the one
+                                 that shows whether the font/layout fix
+                                 actually worked.
+      *_01_signed.pdf        - the same render with apply_signatures_and_stamp()
+                                 applied, i.e. exactly what would have been
+                                 merged with the medical report + patient
+                                 document and uploaded, had this not been
+                                 a debug run.
+
+    Both land in decree_common.DEBUG_MDT_DIR, which the workflow uploads
+    as its OWN separate run artifact - download it from the Actions run
+    page, open both PDFs, compare against a known-good MDT PDF, then
+    delete the artifact from the run page once you're done with it.
+
+    Deliberately does NOT call open_requirement() or update
+    case_status/attempt_status - the case is left exactly as
+    READY_TO_SUBMIT, so a normal (non-debug) run afterwards reprocesses
+    it as if this debug run never happened. This DOES still create a
+    real, new MDT on the SMC server (stage_create_mdt already ran for
+    real before this function is even called) - that's unavoidable,
+    since the print page this function renders only exists right after
+    a genuine creation.
+    """
+    os.makedirs(common.DEBUG_MDT_DIR, exist_ok=True)
+
+    log.info(f"[DEBUG_RENDER_MDT_AND_STOP] Rendering MDT print page for pre_request_id={pre_request_id} …")
+    raw_bytes = call_with_reconnect(session, "MDT render (debug)", render_print_page_to_pdf,
+                                     session, pre_request_id, broad=True)
+    raw_path = os.path.join(common.DEBUG_MDT_DIR, f"{national_id}_{pre_request_id}_00_raw_render.pdf")
+    with open(raw_path, "wb") as f:
+        f.write(raw_bytes)
+
+    signed_bytes = apply_signatures_and_stamp(raw_bytes)
+    signed_path = os.path.join(common.DEBUG_MDT_DIR, f"{national_id}_{pre_request_id}_01_signed.pdf")
+    with open(signed_path, "wb") as f:
+        f.write(signed_bytes)
+
+    log.info(f"[DEBUG_RENDER_MDT_AND_STOP] Wrote {raw_path}")
+    log.info(f"[DEBUG_RENDER_MDT_AND_STOP] Wrote {signed_path}")
+
+    common.log_event(case_id, attempt_id, "debug_mdt_render_stop",
+                      {"pre_request_id": pre_request_id, "raw_path": raw_path, "signed_path": signed_path})
+
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        with open(step_summary, "a", encoding="utf-8") as f:
+            f.write(
+                "## DEBUG_RENDER_MDT_AND_STOP\n"
+                f"- pre_request_id: **{pre_request_id}**\n"
+                "- Stopped after Stage 1 (MDT creation) + Stage 2 (render only) — "
+                "no report, merge, or upload happened.\n"
+                "- The two PDFs are in this run's **decree-mdt-debug-<run id>** artifact below — "
+                "download it, open both, and compare against a known-good MDT PDF.\n"
+                "- This case's status was left as READY_TO_SUBMIT — run the workflow again "
+                "without the debug flag to submit it for real once the render looks right.\n"
+            )
+
+    return {"case_id": case_id, "status": "debug_stopped", "pre_request_id": pre_request_id,
+            "raw_path": raw_path, "signed_path": signed_path}
 
 
 def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre_request_id: str, full_name: str,
@@ -191,6 +271,9 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -
     pre_request_id = mdt_out["pre_request_id"]
     full_name = mdt_out["full_name"]
 
+    if debug_mode_on():
+        return debug_dump_mdt_and_stop(session, case_id, attempt_id, pre_request_id, national_id)
+
     id_pdf_path, doc_source, newly_extracted = locate_patient_document_pdf(
         session, national_id, find_local_fn=make_r2_aware_finder(national_id),
     )
@@ -230,6 +313,23 @@ def main():
     aliases = common.load_cancer_type_aliases()
     case_ids = parse_case_ids(os.environ.get("CASE_IDS", ""))
 
+    if debug_mode_on():
+        # Safety guard: DEBUG_RENDER_MDT_AND_STOP still creates a REAL new
+        # MDT on the SMC server per case it touches (see
+        # debug_dump_mdt_and_stop's docstring). Refuse to run it across a
+        # whole batch of READY_TO_SUBMIT cases by accident — this flag is
+        # for isolating the render step on ONE known case, not a normal
+        # run. Require the caller to pass exactly one CASE_IDS value.
+        if len(case_ids) != 1:
+            raise SystemExit(
+                "DEBUG_RENDER_MDT_AND_STOP=1 requires exactly one case id in CASE_IDS "
+                f"(got {case_ids or 'none'}) — it still creates a real MDT on the SMC server "
+                "for every case it touches, so don't run it against a whole batch."
+            )
+        log.warning("DEBUG_RENDER_MDT_AND_STOP is ON — will create a real MDT for case "
+                    f"{case_ids[0]}, render it, write both PDFs to {common.DEBUG_MDT_DIR}, "
+                    "and stop there (no report/merge/upload).")
+
     filters = {"case_status": "eq.READY_TO_SUBMIT"}
     if case_ids:
         filters["id"] = f"in.({','.join(str(i) for i in case_ids)})"
@@ -242,6 +342,7 @@ def main():
         "submitted": sum(1 for r in results if r["status"] == "submitted"),
         "pending_review": sum(1 for r in results if r["status"] == "pending_review"),
         "requirement_opened": sum(1 for r in results if r["status"] == "requirement_opened"),
+        "debug_stopped": sum(1 for r in results if r["status"] == "debug_stopped"),
         "results": results,
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -251,9 +352,11 @@ def main():
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"## Decree prepare run\n- Submitted: **{summary['submitted']}**\n"
                     f"- Pending review: **{summary['pending_review']}**\n"
-                    f"- Needs attention: **{summary['requirement_opened']}**\n")
+                    f"- Needs attention: **{summary['requirement_opened']}**\n"
+                    f"- Debug-stopped (render only): **{summary['debug_stopped']}**\n")
 
-    if summary["total"] > 0 and summary["submitted"] == 0 and summary["pending_review"] == 0:
+    if summary["total"] > 0 and summary["submitted"] == 0 and summary["pending_review"] == 0 \
+            and summary["debug_stopped"] == 0:
         sys.exit(1)
 
 
