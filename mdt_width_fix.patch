@@ -1,0 +1,122 @@
+diff --git a/Unified_Decree_Submission_Pipeline.py b/Unified_Decree_Submission_Pipeline.py
+index 6006cf7..15e6ae9 100644
+--- a/Unified_Decree_Submission_Pipeline.py
++++ b/Unified_Decree_Submission_Pipeline.py
+@@ -285,6 +285,13 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
+ # Maximum time allowed for one authenticated MDT render.
+ RENDER_TIMEOUT_SECONDS = 90
+ 
++# Populated at runtime by decree_common._install_mdt_form_font() with the
++# local paths of the font downloaded from Supabase Storage (fonts/mdt_form_font.ttf
++# / mdt_form_font_bold.ttf). Left empty until then; render_print_page_to_pdf()
++# checks this dict itself rather than trusting OS-level fontconfig substitution
++# to have matched the family name correctly.
++MDT_FORM_FONT_PATHS: Dict[str, str] = {}
++
+ # Signature / stamp images.
+ SIGNATURE_FILES = {
+     "sig1": r"C:\Users\drmah\Template_Signatures\mdt1.png",
+@@ -1433,15 +1440,66 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
+                         f"between fetch and render. Will re-login and retry."
+                     )
+ 
++                # --- Font: NOTHING to do here anymore. fc-list in this
++                # run's own log already proves 'Tahoma' is correctly
++                # installed and visible to fontconfig (decree_common's
++                # fc-cache install worked). The @font-face injection that
++                # used to sit here was a mistake — it sampled
++                # document.body's computed font (legitimately "Times New
++                # Roman", the page's generic default, not what the MDT
++                # table itself asks for) and force-applied that name to
++                # EVERY element via `* { ... !important }`, overriding
++                # cells that were already correctly rendering in real
++                # Tahoma through plain fontconfig substitution. That's
++                # what produced the worse, more reflowed result — not a
++                # remaining font problem. Removed; trust the OS-level
++                # install, which is confirmed working.
++
++                # --- PAGE WIDTH: this is the more likely actual cause of
++                # the persistent reflow/wrap (split dates, different
++                # layout) even with the font now correct. page.pdf() with
++                # format="A4" constrains layout to A4's printable width
++                # (~718px after 5mm margins). If the SMC print page's
++                # table is natively wider than that — a fixed desktop-
++                # width layout, which is common for older ASP.NET
++                # printable views — Chromium reflows/wraps it to fit,
++                # which looks exactly like "dates splitting" and "whole
++                # format different". Measure the page's real content
++                # width and size the PDF page to match it instead of
++                # forcing A4, so nothing has to reflow.
++                try:
++                    content_width_px = page.evaluate(
++                        "() => Math.max(document.documentElement.scrollWidth, "
++                        "document.body ? document.body.scrollWidth : 0)"
++                    )
++                except Exception:
++                    content_width_px = None
++                log.info(f"MDT print page measured content width: {content_width_px}px")
++
+                 # Use the site's OWN print stylesheet - the same one applied
+                 # when you print this page manually from a browser.
+                 page.emulate_media(media="print")
+ 
+-                pdf_bytes = page.pdf(
+-                    format="A4",
++                pdf_kwargs = dict(
+                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
+                     print_background=True,
+                 )
++                if content_width_px and content_width_px > 900:
++                    # 96 CSS px/in -> convert to inches for page.pdf()'s width/
++                    # height args, with a little slack so nothing clips at
++                    # the edge.
++                    width_in = (content_width_px + 40) / 96
++                    log.info(
++                        f"MDT print page content is {content_width_px}px wide — "
++                        f"sizing the PDF page to {width_in:.2f}in instead of forcing "
++                        f"A4, so the table doesn't get reflowed to fit a narrower page."
++                    )
++                    pdf_kwargs["width"] = f"{width_in:.2f}in"
++                    pdf_kwargs["height"] = "16in"  # generous; content defines actual length
++                else:
++                    pdf_kwargs["format"] = "A4"
++
++                pdf_bytes = page.pdf(**pdf_kwargs)
+             finally:
+                 browser.close()
+     except PWTimeoutError as exc:
+diff --git a/decree_common.py b/decree_common.py
+index c517697..024e2c0 100644
+--- a/decree_common.py
++++ b/decree_common.py
+@@ -114,6 +114,30 @@ def _install_mdt_form_font() -> None:
+             subprocess.run(["fc-cache", "-f", font_dir], check=False,
+                             capture_output=True)
+             log.info(f"Installed MDT-form font(s) into {font_dir}: {list(paths.values())}")
++            # Hand the real local paths straight to render_print_page_to_pdf()
++            # so it can inject an explicit @font-face itself (see that
++            # function's comment) instead of relying on fontconfig to have
++            # matched the file's internal name-table family against
++            # whatever family the SMC page's CSS actually asks for.
++            _pipeline_module.MDT_FORM_FONT_PATHS = paths
++            # One-shot diagnostic so a future run's log says definitively
++            # whether the font that landed on disk is actually named
++            # "Tahoma" (or whatever family the page wants) as far as
++            # fontconfig is concerned - if it isn't, that's exactly why a
++            # plain fc-cache install (no @font-face override) would still
++            # silently fall back, with nothing in the log to show why.
++            fc_check = subprocess.run(
++                ["fc-list", ":", "family"], check=False,
++                capture_output=True, text=True,
++            )
++            log.info(f"fc-list after install (fontconfig's view of available families):\n"
++                     f"{fc_check.stdout}")
++        else:
++            log.warning(
++                "fetch_mdt_form_font() returned no paths - MDT_FORM_FONT_PATHS stays "
++                "empty, render_print_page_to_pdf() will fall back to fontconfig "
++                "substitution and log a warning when it does."
++            )
+     except Exception as exc:
+         # Never let a font-install hiccup take down the whole run - the
+         # MDT form still renders, just with a fallback font.

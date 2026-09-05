@@ -1440,78 +1440,66 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         f"between fetch and render. Will re-login and retry."
                     )
 
-                # --- Belt-and-suspenders on top of decree_common's OS-level
-                # fc-cache install: don't trust fontconfig's NAME MATCHING to
-                # have mapped the downloaded file onto whatever family the
-                # page's CSS asks for. Instead, read the family name the page
-                # ITSELF resolves to at runtime, then hand Chromium an
-                # explicit @font-face for that exact name pointing straight
-                # at the real local font bytes. This is what actually
-                # decides whether the CI form matches the local one — if
-                # MDT_FORM_FONT_PATHS is empty, nothing below fires and we
-                # fall back to the old fontconfig-substitution behavior
-                # (log line makes that visible instead of silent).
-                try:
-                    regular_path = MDT_FORM_FONT_PATHS.get("regular")
-                    if regular_path and os.path.exists(regular_path):
-                        computed_family = page.evaluate(
-                            "() => { const el = document.querySelector('body'); "
-                            "return el ? getComputedStyle(el).fontFamily : ''; }"
-                        ) or ""
-                        family_name = (
-                            computed_family.split(",")[0].strip().strip('"').strip("'")
-                            or "Tahoma"
-                        )
+                # --- Font: NOTHING to do here anymore. fc-list in this
+                # run's own log already proves 'Tahoma' is correctly
+                # installed and visible to fontconfig (decree_common's
+                # fc-cache install worked). The @font-face injection that
+                # used to sit here was a mistake — it sampled
+                # document.body's computed font (legitimately "Times New
+                # Roman", the page's generic default, not what the MDT
+                # table itself asks for) and force-applied that name to
+                # EVERY element via `* { ... !important }`, overriding
+                # cells that were already correctly rendering in real
+                # Tahoma through plain fontconfig substitution. That's
+                # what produced the worse, more reflowed result — not a
+                # remaining font problem. Removed; trust the OS-level
+                # install, which is confirmed working.
 
-                        import base64
-                        with open(regular_path, "rb") as f:
-                            regular_b64 = base64.b64encode(f.read()).decode("ascii")
-                        bold_face_css = ""
-                        bold_path = MDT_FORM_FONT_PATHS.get("bold")
-                        if bold_path and os.path.exists(bold_path):
-                            with open(bold_path, "rb") as f:
-                                bold_b64 = base64.b64encode(f.read()).decode("ascii")
-                            bold_face_css = (
-                                f"@font-face {{ font-family: '{family_name}'; "
-                                f"src: url(data:font/ttf;base64,{bold_b64}) format('truetype'); "
-                                f"font-weight: bold; font-display: block; }}"
-                            )
-                        page.add_style_tag(content=(
-                            f"@font-face {{ font-family: '{family_name}'; "
-                            f"src: url(data:font/ttf;base64,{regular_b64}) format('truetype'); "
-                            f"font-weight: normal; font-display: block; }}"
-                            f"{bold_face_css}"
-                            f"* {{ font-family: '{family_name}' !important; }}"
-                        ))
-                        log.info(
-                            f"Injected explicit @font-face for '{family_name}' from "
-                            f"{regular_path} — bypasses fontconfig name matching entirely."
-                        )
-                    else:
-                        log.warning(
-                            "MDT_FORM_FONT_PATHS has no usable 'regular' font file for this "
-                            "render — falling back to fontconfig substitution (this is almost "
-                            "certainly why the layout won't match local: either the font wasn't "
-                            "uploaded to decree-assets/fonts/mdt_form_font.ttf in Supabase "
-                            "Storage, or the download of it failed earlier in this run — check "
-                            "the 'Could not install MDT-form font' / 'No MDT-form font found' "
-                            "warnings above in this same log)."
-                        )
-                except Exception as font_exc:
-                    log.warning(
-                        f"@font-face injection failed ({font_exc}) — continuing with "
-                        f"fontconfig fallback."
+                # --- PAGE WIDTH: this is the more likely actual cause of
+                # the persistent reflow/wrap (split dates, different
+                # layout) even with the font now correct. page.pdf() with
+                # format="A4" constrains layout to A4's printable width
+                # (~718px after 5mm margins). If the SMC print page's
+                # table is natively wider than that — a fixed desktop-
+                # width layout, which is common for older ASP.NET
+                # printable views — Chromium reflows/wraps it to fit,
+                # which looks exactly like "dates splitting" and "whole
+                # format different". Measure the page's real content
+                # width and size the PDF page to match it instead of
+                # forcing A4, so nothing has to reflow.
+                try:
+                    content_width_px = page.evaluate(
+                        "() => Math.max(document.documentElement.scrollWidth, "
+                        "document.body ? document.body.scrollWidth : 0)"
                     )
+                except Exception:
+                    content_width_px = None
+                log.info(f"MDT print page measured content width: {content_width_px}px")
 
                 # Use the site's OWN print stylesheet - the same one applied
                 # when you print this page manually from a browser.
                 page.emulate_media(media="print")
 
-                pdf_bytes = page.pdf(
-                    format="A4",
+                pdf_kwargs = dict(
                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
                     print_background=True,
                 )
+                if content_width_px and content_width_px > 900:
+                    # 96 CSS px/in -> convert to inches for page.pdf()'s width/
+                    # height args, with a little slack so nothing clips at
+                    # the edge.
+                    width_in = (content_width_px + 40) / 96
+                    log.info(
+                        f"MDT print page content is {content_width_px}px wide — "
+                        f"sizing the PDF page to {width_in:.2f}in instead of forcing "
+                        f"A4, so the table doesn't get reflowed to fit a narrower page."
+                    )
+                    pdf_kwargs["width"] = f"{width_in:.2f}in"
+                    pdf_kwargs["height"] = "16in"  # generous; content defines actual length
+                else:
+                    pdf_kwargs["format"] = "A4"
+
+                pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
                 browser.close()
     except PWTimeoutError as exc:
