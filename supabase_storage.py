@@ -121,10 +121,20 @@ def fetch_mdt_form_font(local_dir: str) -> dict:
         if download(ASSETS_BUCKET, object_path, local_path):
             paths[key] = local_path
     if "regular" not in paths:
-        log.warning(
+        msg = (
             f"No MDT-form font found at '{ASSETS_BUCKET}/fonts/mdt_form_font.ttf' - "
             f"the rendered MDT form will use a fallback font and may not match the "
             f"local layout. Upload your local Tahoma (or whatever the print page's "
             f"CSS specifies) there once to fix this."
         )
+        log.warning(msg)
+        # Also emit a GitHub Actions error annotation - this is the single
+        # most likely reason a CI-rendered MDT form still looks wrong even
+        # after every other fix is correctly deployed (the font upload is a
+        # manual, one-time step nothing here can do for you), and a plain
+        # log line buried in a long run's output is too easy to miss. This
+        # puts a red annotation directly on the workflow run's summary page.
+        # A no-op outside GitHub Actions (GITHUB_ACTIONS unset).
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error::{msg}")
     return paths
