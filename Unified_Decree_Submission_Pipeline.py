@@ -147,8 +147,10 @@ HOW TO RUN
 ==========================================================================
 1. Install requirements once (same as the two scripts this replaces):
        pip install requests beautifulsoup4 openpyxl PyPDF2 pillow reportlab
-       pip install pymupdf pdfkit arabic-reshaper python-bidi
-   Also install wkhtmltopdf (see WKHTMLTOPDF_PATH note below). Word/COM
+       pip install pymupdf playwright arabic-reshaper python-bidi
+   Then, once: playwright install chromium
+   (the MDT print page is rendered with a real headless Chromium via
+   Playwright, not wkhtmltopdf - see render_print_page_to_pdf().) Word/COM
    is NOT required - the medical report is built directly as a PDF by
    medical_report_overlay.py (see that file's header for one-time setup).
 
@@ -215,7 +217,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 import fitz  # PyMuPDF
-import pdfkit
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 # NOTE: no docx2pdf / win32com / Word dependency at all anymore. Medical
 # report generation is handled by medical_report_overlay.py, imported
 # further below, which draws text directly onto a pre-exported PDF.
@@ -276,8 +279,9 @@ LAUNCH_DOC_LABELER_AUTOMATICALLY = True
 # one-time setup) - that PDF path is MEDICAL_REPORT_TEMPLATE_PDF there.
 MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_template.docx")
 
-# wkhtmltopdf binary - install once, then point this at it.
-WKHTMLTOPDF_PATH = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"
+# (WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
+#  Chromium; see render_print_page_to_pdf(). Run "playwright install
+#  chromium" once after "pip install playwright".)
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
 
@@ -938,8 +942,8 @@ NETWORK_EXCEPTIONS = (
     requests.exceptions.ChunkedEncodingError,
 )
 
-# wkhtmltopdf runs as a subprocess outside `requests`, so its own
-# transient network failures surface as OSError / pdfkit errors instead.
+# Chromium (via Playwright) runs out-of-process, so its own transient
+# network failures surface as OSError instead.
 BROAD_NETWORK_EXCEPTIONS = NETWORK_EXCEPTIONS + (OSError,)
 
 
@@ -1351,31 +1355,39 @@ class SMCSession:
 
 
 # =====================================================================
-# HTML -> PDF  (wkhtmltopdf via pdfkit)
+# HTML -> PDF  (Chromium via Playwright)
 # =====================================================================
 
 def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
     """Render the authenticated MDT print page to PDF.
 
-    FIXED BUG (superseding the previous cookie-forwarding approach): having
-    wkhtmltopdf fetch the URL itself — even with every cookie manually
-    forwarded via --cookie, even with a patched-Qt build — proved
-    unreliable in this environment: sometimes it silently got the
-    logged-out landing page (exit 0, no error), and on retry it sometimes
-    hung indefinitely waiting on the network instead of failing. wkhtmltopdf
-    doing its own HTTP fetch means its own auth/cookie/header handling has
-    to exactly match the site's expectations, with no visibility into why
-    it doesn't.
+    REPLACED wkhtmltopdf WITH A REAL CHROMIUM BROWSER (Playwright).
+    wkhtmltopdf's rendering engine — not the cookie/auth plumbing — is the
+    actual source of the disrupted/disoriented layout on the GitHub-hosted
+    runner vs. the local machine:
 
-    The `requests.Session` used for every other call in this script is
-    already authenticated and has never had this problem. So: fetch the
-    print page's HTML ourselves with that trusted session, validate it's
-    actually the print form (not a login/landing page) BEFORE spending any
-    time on wkhtmltopdf, then hand wkhtmltopdf the HTML directly via stdin.
-    wkhtmltopdf then does no networking or auth of its own for the main
-    page at all — only for any referenced sub-resources (rare on a
-    server-rendered print page), which is a much smaller failure surface
-    than the whole page fetch.
+      1. MISSING PRINT-MEDIA EMULATION. wkhtmltopdf renders the page's
+         SCREEN stylesheet by default. If the SMC print page ships a
+         distinct `@media print` stylesheet (typical for a "printable
+         form" page — exactly what a browser applies on a manual print),
+         that mismatch alone diverges from a manual print regardless of
+         cookies/HTML handling.
+      2. STALE RENDERING ENGINE. wkhtmltopdf embeds a long-frozen WebKit
+         build with weaker CSS/RTL-shaping support than a current browser.
+      3. BACKGROUND GRAPHICS OFF BY DEFAULT. Shaded headers/borders drawn
+         via CSS backgrounds can silently vanish unless explicitly enabled.
+
+    NOTE - THIS ALONE DOES NOT FIX FONT SUBSTITUTION. Whatever font-family
+    the SMC page's own CSS requests (almost certainly Tahoma, per this
+    project's own note in medical_report_overlay.py) still has to actually
+    be installed on the runner for Chromium — same as it would for
+    wkhtmltopdf — to use it instead of falling back to a wider generic
+    sans (DejaVu/Liberation), which is what produced the extra line-wraps
+    and the reversed date split in the CI-rendered form. See the
+    workflow's font-install step: this needs the SAME real font file the
+    local Windows machine has (Tahoma), not the Amiri font already
+    installed for the medical-report overlay - Amiri is a different
+    typeface and isn't what the SMC page's CSS asks for.
     """
     url = session.print_prerequest_url(pre_request_id)
 
@@ -1397,67 +1409,52 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
             f"authenticated for this request. Will re-login and retry."
         )
 
-    # wkhtmltopdf is no longer fetching the MAIN page itself, but it still
-    # makes its own network requests for anything the page's HTML links to
-    # (stylesheet, images) — those sub-resource requests need the SAME
-    # authenticated cookies or they silently fail. FIXED BUG: the first
-    # version of this stdin approach dropped cookie forwarding entirely
-    # (only needed for the main-page fetch, which is now handled by
-    # `requests.Session` above) — so the linked CSS came back
-    # unauthenticated/redirected and got silently dropped by
-    # --load-error-handling ignore below, producing a technically-correct
-    # but completely unstyled page (fields overlapping, no layout) instead
-    # of an error. Forwarding cookies here re-authenticates those
-    # sub-resource requests without reintroducing the main-page risk.
-    cookie_args = []
-    for name, value in session.cookie_list():
-        cookie_args += ["--cookie", name, value]
-
-    # <base> must point at the ORIGINAL page URL (not just the site root)
-    # so the page's relative asset paths resolve exactly as they would
-    # during a real navigation to that URL.
-    base_tag = f'<base href="{url}">'
-    if re.search(r"<head[^>]*>", html, re.I):
-        html = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, html, count=1, flags=re.I)
-    else:
-        html = base_tag + html
-
-    cmd = [
-        WKHTMLTOPDF_PATH,
-        *cookie_args,
-        "--encoding", "UTF-8",
-        "--quiet",
-        "--page-size", "A4",
-        "--margin-top", "5mm",
-        "--margin-bottom", "5mm",
-        "--margin-left", "5mm",
-        "--margin-right", "5mm",
-        "--no-outline",
-        "-", "-",  # "-" "-" = read HTML from stdin, write PDF to stdout
+    cookie_domain = urlparse(BASE_URL).hostname
+    playwright_cookies = [
+        {"name": name, "value": value, "domain": cookie_domain, "path": "/"}
+        for name, value in session.cookie_list()
     ]
 
     try:
-        proc = subprocess.run(
-            cmd,
-            input=html.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=RENDER_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                context = browser.new_context()
+                context.add_cookies(playwright_cookies)
+                page = context.new_page()
+                page.goto(url, wait_until="networkidle",
+                           timeout=RENDER_TIMEOUT_SECONDS * 1000)
+
+                rendered_html = page.content()
+                if ("اسم المستخدم" in rendered_html and "كلمة السر" in rendered_html):
+                    raise OSError(
+                        f"Chromium landed on the logged-out SMC page for "
+                        f"pre_request_id={pre_request_id} — session expired "
+                        f"between fetch and render. Will re-login and retry."
+                    )
+
+                # Use the site's OWN print stylesheet - the same one applied
+                # when you print this page manually from a browser.
+                page.emulate_media(media="print")
+
+                pdf_bytes = page.pdf(
+                    format="A4",
+                    margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
+                    print_background=True,
+                )
+            finally:
+                browser.close()
+    except PWTimeoutError as exc:
         raise OSError(
-            f"wkhtmltopdf timed out rendering pre_request_id={pre_request_id} even from "
-            f"already-fetched local HTML (likely a hung external asset request) — will retry."
+            f"Chromium timed out rendering pre_request_id={pre_request_id} "
+            f"(likely a hung asset request) — will retry."
         ) from exc
+    except OSError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Chromium render failed: {exc}") from exc
 
-    if proc.returncode != 0 or not proc.stdout:
-        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            "wkhtmltopdf failed: "
-            + (stderr_text or f"exit code {proc.returncode}")
-        )
-
-    return proc.stdout
+    return pdf_bytes
 
 # =====================================================================
 # SIGNATURE / STAMP OVERLAY
@@ -2555,8 +2552,7 @@ def main():
             "Export medical_report_template.docx to PDF once (Word -> Save As PDF) "
             "and point MEDICAL_REPORT_TEMPLATE_PDF (in medical_report_overlay.py) at it."
         )
-    if not os.path.exists(WKHTMLTOPDF_PATH):
-        sys.exit(f"wkhtmltopdf not found at: {WKHTMLTOPDF_PATH} — install it and update WKHTMLTOPDF_PATH.")
+
     if not os.path.isdir(PATIENT_DOCS_ROOT):
         sys.exit(f"Patient documents folder not found: {PATIENT_DOCS_ROOT}")
 

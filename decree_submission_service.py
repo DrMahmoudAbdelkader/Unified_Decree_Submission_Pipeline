@@ -116,7 +116,8 @@ if os.environ.get("SMC_USERNAME"):
 if os.environ.get("SMC_PASSWORD"):
     _pipeline_module.PASSWORD = os.environ["SMC_PASSWORD"]
 
-_pipeline_module.WKHTMLTOPDF_PATH = os.environ.get("WKHTMLTOPDF_PATH", "/usr/bin/wkhtmltopdf")
+# WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
+# Chromium, not a wkhtmltopdf binary.
 _pipeline_module.PATIENT_DOCS_ROOT = os.environ.get("PATIENT_DOCS_ROOT", "/tmp/patient_docs")
 _pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR = os.path.join(_pipeline_module.PATIENT_DOCS_ROOT, "UNDER_PROCESSED")
 os.makedirs(_pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR, exist_ok=True)

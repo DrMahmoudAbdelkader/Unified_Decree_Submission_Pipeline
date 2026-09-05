@@ -72,7 +72,9 @@ def configure_smc_credentials(username_env="SMC_USERNAME", password_env="SMC_PAS
         _pipeline_module.USERNAME = username
     if password:
         _pipeline_module.PASSWORD = password
-    _pipeline_module.WKHTMLTOPDF_PATH = os.environ.get("WKHTMLTOPDF_PATH", "/usr/bin/wkhtmltopdf")
+    # WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
+    # Chromium (installed by the workflow's "playwright install" step),
+    # not a wkhtmltopdf binary.
     _pipeline_module.PATIENT_DOCS_ROOT = os.environ.get("PATIENT_DOCS_ROOT", PATIENT_DOC_CACHE_DIR)
     _pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR = os.path.join(_pipeline_module.PATIENT_DOCS_ROOT, "UNDER_PROCESSED")
     # FIXED BUG: Unified_Decree_Submission_Pipeline.FALLBACK_PATIENT_DOCS_DIR
