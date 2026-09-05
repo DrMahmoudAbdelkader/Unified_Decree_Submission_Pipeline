@@ -7,6 +7,18 @@
 # bulk, unlike the prepare workflow.
 #
 # Required repository secrets: same as submit-decree-prepare.yml.
+#
+# NOTE: the MDT-form font (Tahoma, or whatever the SMC print page's CSS
+# actually specifies) is NOT installed via a GitHub Actions secret here.
+# A GitHub secret caps out at 64 KB — far smaller than a real .ttf file —
+# so that approach never worked. The font now lives in the private
+# Supabase Storage "decree-assets" bucket (fonts/mdt_form_font.ttf and
+# fonts/mdt_form_font_bold.ttf) and is downloaded at runtime by
+# decree_common.fetch_and_configure_assets() -> supabase_storage.
+# fetch_mdt_form_font(), then installed into a user-writable font dir and
+# registered with fontconfig from Python — no sudo, no workflow step
+# needed. Upload the font to that bucket path once; see
+# supabase_storage.py's docstring for the one-time setup.
 # ============================================================================
 
 name: Submit Decree Requests (Finalize)
@@ -43,25 +55,13 @@ jobs:
         run: playwright install --with-deps chromium
 
       # fonts-hosny-amiri stays for medical_report_overlay.py's SEPARATE
-      # report PDF (already calibrated). The MDT form itself is styled by
-      # the SMC site's own CSS, which almost certainly asks for Tahoma -
-      # see submit-decree-prepare.yml's font-install step for the full
-      # explanation and how to set these secrets.
-      - name: Install matching MDT-form font from secret
-        env:
-          MDT_FORM_FONT_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_TTF_BASE64 }}
-          MDT_FORM_FONT_BOLD_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_BOLD_TTF_BASE64 }}
-        run: |
-          if [ -n "$MDT_FORM_FONT_TTF_BASE64" ]; then
-            sudo mkdir -p /usr/share/fonts/truetype/mdt-form
-            echo "$MDT_FORM_FONT_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form.ttf > /dev/null
-            if [ -n "$MDT_FORM_FONT_BOLD_TTF_BASE64" ]; then
-              echo "$MDT_FORM_FONT_BOLD_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form-bold.ttf > /dev/null
-            fi
-            sudo fc-cache -f -v
-          else
-            echo "::warning::MDT_FORM_FONT_TTF_BASE64 secret not set - the rendered MDT form will use a fallback font and may not match the local layout."
-          fi
+      # report PDF (already calibrated). The MDT form's own font (Tahoma
+      # or whatever the SMC print page's CSS asks for) is fetched from
+      # Supabase Storage and installed at runtime by
+      # fetch_and_configure_assets() in the Python step below — no
+      # separate workflow step needed.
+      - name: Install Amiri font (medical report PDF)
+        run: sudo apt-get update && sudo apt-get install -y fonts-hosny-amiri
 
       - name: Run finalize (sign + report + merge + upload)
         env:

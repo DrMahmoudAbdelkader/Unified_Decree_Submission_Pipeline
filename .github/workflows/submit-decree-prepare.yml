@@ -15,9 +15,20 @@
 #                                    reachable from a GitHub-hosted runner)
 #
 # One-time manual setup (not part of this workflow):
-#   Upload signatures/sig1.png..sig4.png, signatures/stamp.png, and
-#   medical_report_template.pdf to the Supabase Storage bucket
+#   Upload signatures/sig1.png..sig4.png, signatures/stamp.png,
+#   medical_report_template.pdf, and fonts/mdt_form_font.ttf +
+#   fonts/mdt_form_font_bold.ttf to the Supabase Storage bucket
 #   "decree-assets" (private). See supabase_storage.py's docstring.
+#
+# NOTE: the MDT-form font is deliberately NOT installed via a GitHub
+# Actions secret. A GitHub secret caps out at 64 KB — far smaller than a
+# real .ttf file — so the previous "install font from base64 secret" step
+# could never actually work (that's why you saw the "secret not set"
+# warning even after trying to set it). The font now lives in the private
+# Supabase Storage "decree-assets" bucket and is downloaded + registered
+# with fontconfig at runtime by decree_common.fetch_and_configure_assets()
+# -> supabase_storage.fetch_mdt_form_font(), inside the Python run step
+# below. No sudo, no separate workflow step, nothing to base64-encode.
 # ============================================================================
 
 name: Submit Decree Requests (Prepare)
@@ -60,37 +71,12 @@ jobs:
       # to draw the SEPARATE medical-report PDF (already calibrated, not
       # the thing that was broken). The MDT FORM itself is server-rendered
       # HTML styled by the SMC site's OWN CSS, which almost certainly asks
-      # for Tahoma (see medical_report_overlay.py's own note on this) -
-      # Amiri is a different typeface and won't satisfy that request, so
-      # without Tahoma actually installed, Chromium/fontconfig falls back
-      # to a wider generic sans (DejaVu/Liberation), which is what caused
-      # the extra line-wraps and the reversed date split you saw in the
-      # CI-rendered form vs. the local one.
-      #
-      # Tahoma ships with Windows and Microsoft's redistribution terms
-      # don't clearly permit committing it into a public repo, so it's
-      # installed here from a base64'd repo secret instead - set
-      # MDT_FORM_FONT_TTF_BASE64 (and _BOLD) to `certutil -encode` (or
-      # `[Convert]::ToBase64String(...)` in PowerShell) of your own local
-      # C:\Windows\Fonts\tahoma.ttf / tahomabd.ttf, with the header/footer
-      # lines certutil adds stripped out. Confirm first (locally, logged
-      # into the SMC print page, via DevTools' computed font-family) that
-      # Tahoma really is what the page asks for.
-      - name: Install matching MDT-form font from secret
-        env:
-          MDT_FORM_FONT_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_TTF_BASE64 }}
-          MDT_FORM_FONT_BOLD_TTF_BASE64: ${{ secrets.MDT_FORM_FONT_BOLD_TTF_BASE64 }}
-        run: |
-          if [ -n "$MDT_FORM_FONT_TTF_BASE64" ]; then
-            sudo mkdir -p /usr/share/fonts/truetype/mdt-form
-            echo "$MDT_FORM_FONT_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form.ttf > /dev/null
-            if [ -n "$MDT_FORM_FONT_BOLD_TTF_BASE64" ]; then
-              echo "$MDT_FORM_FONT_BOLD_TTF_BASE64" | base64 -d | sudo tee /usr/share/fonts/truetype/mdt-form/mdt-form-bold.ttf > /dev/null
-            fi
-            sudo fc-cache -f -v
-          else
-            echo "::warning::MDT_FORM_FONT_TTF_BASE64 secret not set - the rendered MDT form will use a fallback font and may not match the local layout."
-          fi
+      # for Tahoma. That font is fetched from Supabase Storage and
+      # installed at runtime by fetch_and_configure_assets() in the Python
+      # step below — see supabase_storage.py's fetch_mdt_form_font() for
+      # the one-time upload instructions.
+      - name: Install Amiri font (medical report PDF)
+        run: sudo apt-get update && sudo apt-get install -y fonts-hosny-amiri
 
       - name: Run prepare (MDT creation + document lookup)
         env:
