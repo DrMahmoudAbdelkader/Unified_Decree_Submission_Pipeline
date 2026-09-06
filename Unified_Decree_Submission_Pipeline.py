@@ -1544,34 +1544,47 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             parent = parent.parentElement;
                         }
 
-                        // E. nowrap only on date VALUE cells.
-                        // The date rows contain a label cell (long Arabic field
-                        // name) and a value cell (the actual date string like
-                        // "2024-01-15"). We identify the label cell by matching
-                        // the field-name regex, then apply nowrap to every OTHER
-                        // cell in that row (the value cell(s) only).
-                        const dateFieldRe =
-                            /تاريخ تسجيل الإستمارة|العمر\\s*\\(تاريخ الميلاد\\)/;
+                        // E. nowrap on date VALUE cells only.
+                        //
+                        // The form has two date rows:
+                        //   - "تاريخ تسجيل الإستمارة" (form registration date)
+                        //   - "العمر (تاريخ الميلاد)"  (age / birthdate)
+                        // Each row has a label cell and a value cell. We must
+                        // apply nowrap ONLY to the value cell, not the label.
+                        //
+                        // Strategy: match on partial substrings that are robust
+                        // to font/encoding variation in innerText extraction.
+                        // A cell is a LABEL cell if it contains any of these
+                        // Arabic substrings. Every other cell in the same row
+                        // is a VALUE cell and gets nowrap.
+                        const dateLabelSubstrings = [
+                            '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
+                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
+                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0627\u0633\u062a\u0645\u0627\u0631\u0629',
+                            '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
+                            '\u0627\u0644\u0639\u0645\u0631',
+                        ];
+                        const isLabelCell = cell => {
+                            const t = normalize(cell.innerText);
+                            return dateLabelSubstrings.some(s => t.includes(s));
+                        };
+                        const protectValueCell = cell => {
+                            set(cell, 'white-space', 'nowrap');
+                            set(cell, 'word-break', 'normal');
+                            set(cell, 'overflow-wrap', 'normal');
+                            for (const d of cell.querySelectorAll('*')) {
+                                set(d, 'white-space', 'nowrap');
+                                set(d, 'word-break', 'normal');
+                            }
+                        };
                         let nowrapCount = 0;
                         for (const row of root.querySelectorAll('tr')) {
                             const cells = [...row.querySelectorAll('td, th')];
                             if (cells.length < 2) continue;
-                            const hasDateField = cells.some(
-                                c => dateFieldRe.test(normalize(c.innerText))
-                            );
-                            if (!hasDateField) continue;
+                            if (!cells.some(isLabelCell)) continue;
                             for (const cell of cells) {
-                                // Skip the label cell itself.
-                                if (dateFieldRe.test(normalize(cell.innerText)))
-                                    continue;
-                                // This is the value cell — protect it.
-                                set(cell, 'white-space', 'nowrap');
-                                set(cell, 'word-break', 'normal');
-                                set(cell, 'overflow-wrap', 'normal');
-                                for (const d of cell.querySelectorAll('*')) {
-                                    set(d, 'white-space', 'nowrap');
-                                    set(d, 'word-break', 'normal');
-                                }
+                                if (isLabelCell(cell)) continue;
+                                protectValueCell(cell);
                                 nowrapCount++;
                             }
                         }
@@ -1728,16 +1741,42 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         return None
     committee_labels = unique_rows[:3]
 
-    declaration_labels = [e for e in entries if is_signature(e) and
-                          header_y - 145 <= e["y1"] < header_y]
-    if len(declaration_labels) < 2:
-        declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
-    if not declaration_labels:
+    # sig4 = the declaration/patient signature, which sits in a row ABOVE
+    # the committee heading. That row contains exactly two التوقيع labels
+    # side by side (one on the right, one on the left of the form).
+    # sig4 must go under the RIGHT-HAND one (largest x0 in PyMuPDF coords,
+    # which map left=0 → right=page_width regardless of RTL text direction).
+    #
+    # Algorithm:
+    #   1. Collect all التوقيع labels strictly above the heading (y1 < header_y).
+    #   2. Group into visual rows (labels whose y0 values are within 8px).
+    #   3. Pick the row whose y0 is closest to header_y (nearest row above it).
+    #   4. Within that row, pick the label with the largest x0 (rightmost).
+    above_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    if not above_labels:
         return None
-    # PDF coordinates increase from left to right. The visually right-hand
-    # declaration label therefore has the larger x coordinate; use the
-    # nearest label to the right side of the declaration row explicitly.
-    declaration = max(declaration_labels, key=lambda e: e["x0"])
+
+    # Group by visual row.
+    above_labels_sorted = sorted(above_labels, key=lambda e: e["y0"])
+    row_groups: List[List[Dict]] = []
+    for e in above_labels_sorted:
+        if not row_groups or abs(e["y0"] - row_groups[-1][0]["y0"]) > 8:
+            row_groups.append([e])
+        else:
+            row_groups[-1].append(e)
+
+    # Row closest to the committee heading = largest mean y0.
+    nearest_row = max(row_groups, key=lambda grp: sum(e["y0"] for e in grp) / len(grp))
+
+    # Rightmost label in that row = largest x0.
+    declaration = max(nearest_row, key=lambda e: e["x0"])
+    log.info(f"sig4 anchor: x0={declaration['x0']:.1f} y0={declaration['y0']:.1f} "
+             f"(row had {len(nearest_row)} label(s), picked rightmost)")
+    if len(nearest_row) < 2:
+        log.warning("sig4: expected 2 التوقيع labels in declaration row but found "
+                    f"{len(nearest_row)} — sig4 may be misplaced; check the output PDF.")
+    if not above_labels:
+        return None
 
     gap = 3.0
 
