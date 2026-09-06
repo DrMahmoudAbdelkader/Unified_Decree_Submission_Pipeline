@@ -282,10 +282,11 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 # (WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
 #  Chromium; see render_print_page_to_pdf(). Run "playwright install
 #  chromium" once after "pip install playwright".)
-# NOTE: the old MDT_FORM_CONTENT_WIDTH_PX / forced-table-width hack has been
-# removed. render_print_page_to_pdf() now measures the page's real rendered
-# width in print media and computes a fit-to-page `scale` for page.pdf()
-# instead of resizing the DOM - see the comment block there for why.
+# Width of the actual MDT form block, not the PDF paper canvas.
+# The supplied local reference's visible form block is approximately 600 CSS
+# px in Chromium's 96-DPI CSS coordinate system.  Keeping this below the full
+# A4 content width preserves the reference's balanced outer margins.
+MDT_FORM_CONTENT_WIDTH_PX = 575
 
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
@@ -1460,64 +1461,157 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # --- PAGE SIZE: the previous `box-sizing: border-box` fix
-                # closed the left-edge overflow correctly, but it did so by
-                # shrinking `.page`'s usable CONTENT width (border-box means
-                # the declared 210mm now has to include padding, so content
-                # drops to ~202mm). Several inner cells use hardcoded
-                # absolute pixel widths tuned against the FULL 210mm
-                # content area (e.g. `width:820px !important`) - shrinking
-                # the container by even a few mm was enough to force extra
-                # wrapping, which is what pushed the form onto a second
-                # page again. That reflow also shifted where every label
-                # sits, which is what broke the signature anchors too.
+                # --- PAGE SIZE: measure the REAL rendered dimensions, but
+                # only after switching to print media — not before. This is
+                # the bug in the previous version of this fix: it measured
+                # scrollWidth in normal SCREEN layout, then emulated print
+                # media afterward, so the page.pdf() canvas was sized for a
+                # layout that no longer matched what actually rendered.
+                # Many of these older ASP.NET "print view" pages ship a
+                # genuinely different, narrower @media print stylesheet —
+                # switching media mode can reflow the whole page. Measuring
+                # in the wrong mode produces exactly what you saw: a
+                # narrower rendered form floating inside a canvas sized for
+                # the wider screen layout, with lines wrapping because the
+                # print-mode content doesn't actually fit the width we
+                # measured, which is also what pushed it onto a second page.
                 #
-                # The correct minimal fix touches only the ONE thing that's
-                # actually wrong - the padding - and leaves the declared
-                # content width untouched:
-                #
-                #   .page { width: 210mm; padding: 20mm; ... padding: 10px; }
-                #
-                # (padding is declared twice in the same rule; CSS keeps
-                # the LAST one, so the effective padding is 10px, not
-                # 20mm). With `@page { margin: 0 }` and a content width
-                # that's already the full 210mm, ANY positive padding on
-                # top of that guarantees overflow past the A4 edge -
-                # there's no room left for it. So padding must be exactly
-                # 0, not shrunk-and-rebalanced via border-box. Zeroing
-                # padding (while leaving box-sizing/content-box and the
-                # 210mm width alone) removes exactly the ~28px overflow,
-                # keeps the content area at the same 210mm the inner tables
-                # were already tuned against, and therefore shouldn't
-                # reflow anything else - no page-count change, no shifted
-                # label positions, no knock-on signature drift.
+                # Use the site's OWN print stylesheet FIRST - the same one
+                # applied when you print this page manually from a browser -
+                # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
 
+                # The portal's actual HTML defines .page as 210mm plus 10px
+                # padding, with the default content-box model.  That makes
+                # the white form wider than A4 and is the source of the
+                # apparent right blank area/left clipping in Chromium.  Use
+                # the real root and the real table structure; do not flatten
+                # every nested table to 100%.
+                layout_result = page.evaluate(
+                    """() => {
+                        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+                        const root = document.querySelector('.form-horizontal.page') || document.querySelector('.page');
+                        if (!root) return {changed: false, reason: 'mdt-page-root-not-found'};
+                        const before = root.getBoundingClientRect();
+                        const set = (el, name, value) => el.style.setProperty(name, value, 'important');
+
+                        // Fit exactly inside the A4 CSS page box. The site
+                        // has padding:10px and the default content-box model;
+                        // border-box prevents the padding from overflowing.
+                        set(root, 'box-sizing', 'border-box');
+                        set(root, 'width', '210mm');
+                        set(root, 'min-width', '0');
+                        set(root, 'max-width', '210mm');
+                        set(root, 'height', 'auto');
+                        set(root, 'min-height', '0');
+                        set(root, 'padding', '10px');
+                        set(root, 'margin-left', 'auto');
+                        set(root, 'margin-right', 'auto');
+                        set(root, 'margin-top', '0');
+                        set(root, 'margin-bottom', '0');
+                        set(root, 'direction', 'rtl');
+                        set(root, 'font-family', "'Hacen Tunisia', sans-serif");
+                        set(root, 'overflow', 'visible');
+
+                        // Keep the site's table/colspan geometry intact. Only
+                        // remove accidental overflow from the Bootstrap
+                        // wrappers; do not rewrite widths or table-layout.
+                        let parent = root.parentElement;
+                        let levels = 0;
+                        while (parent && parent !== document.body && levels++ < 4) {
+                            set(parent, 'overflow', 'visible');
+                            set(parent, 'max-width', 'none');
+                            parent = parent.parentElement;
+                        }
+
+                        let nowrapCells = 0;
+                        const dateRe = /تاريخ تسجيل الإستمارة|العمر\\s*\\(تاريخ الميلاد\\)/;
+                        const protect = cell => {
+                            set(cell, 'white-space', 'nowrap');
+                            set(cell, 'word-break', 'normal');
+                            set(cell, 'overflow-wrap', 'normal');
+                            set(cell, 'overflow', 'visible');
+                            for (const descendant of cell.querySelectorAll('*')) {
+                                set(descendant, 'white-space', 'nowrap');
+                                set(descendant, 'word-break', 'normal');
+                                set(descendant, 'overflow-wrap', 'normal');
+                            }
+                            nowrapCells++;
+                        };
+                        // Patient date rows: protect the complete value cell
+                        // and its spans, without making declaration paragraphs
+                        // globally nowrap.
+                        for (const row of root.querySelectorAll('tr')) {
+                            const rowText = normalize(row.innerText);
+                            if (dateRe.test(rowText)) {
+                                for (const cell of row.querySelectorAll('td, th'))
+                                    protect(cell);
+                            }
+                        }
+
+                        // The committee signature table is the first table in
+                        // the box whose rows contain both الوظيفة and التوقيع.
+                        const committeeBox = [...root.querySelectorAll('div')]
+                            .find(el => normalize(el.innerText).includes('تقرير اللجنة الثلاثية المتخصصة'));
+                        let committeeRows = 0;
+                        if (committeeBox) {
+                            const signatureTable = [...committeeBox.querySelectorAll('table')]
+                                .find(t => normalize(t.innerText).includes('التوقيع'));
+                            if (signatureTable) {
+                                for (const row of [...signatureTable.querySelectorAll('tr')].slice(0, 3)) {
+                                    const cells = row.querySelectorAll('td, th');
+                                    if (cells.length) protect(cells[cells.length - 1]);
+                                    committeeRows++;
+                                }
+                            }
+                        }
+
+                        const after = root.getBoundingClientRect();
+                        return {
+                            changed: true, committeeRows, nowrapCells,
+                            tag: root.tagName, id: root.id || '',
+                            before: {left: Math.round(before.left), width: Math.round(before.width)},
+                            after: {left: Math.round(after.left), right: Math.round(after.right),
+                                    width: Math.round(after.width), height: Math.round(after.height)},
+                            direction: getComputedStyle(root).direction
+                        };
+                    }""",
+                )
+                log.info(f"MDT targeted form layout result: {layout_result}")
+
                 try:
-                    box_fix = page.evaluate(
-                        """() => {
-                            const pageEl = document.querySelector('.page');
-                            if (!pageEl) return {applied: false, reason: 'page-element-not-found'};
-                            pageEl.style.setProperty('padding', '0', 'important');
-                            pageEl.style.setProperty('margin', '0 auto', 'important');
-                            const rect = pageEl.getBoundingClientRect();
-                            return {applied: true, width: Math.round(rect.width), height: Math.round(rect.height)};
-                        }"""
+                    dims = page.evaluate(
+                        "() => ({ "
+                        "w: Math.max(document.documentElement.scrollWidth, "
+                        "document.body ? document.body.scrollWidth : 0), "
+                        "h: Math.max(document.documentElement.scrollHeight, "
+                        "document.body ? document.body.scrollHeight : 0) "
+                        "})"
                     )
-                except Exception as exc:
-                    box_fix = {"applied": False, "reason": str(exc)}
+                    content_width_px = dims.get("w")
+                    content_height_px = dims.get("h")
+                except Exception:
+                    content_width_px = content_height_px = None
+                log.info(
+                    f"MDT print page measured content (in PRINT media, matching "
+                    f"what actually renders): {content_width_px}x{content_height_px}px"
+                )
 
-                log.info(f"MDT '.page' padding fix result: {box_fix}")
-                if not box_fix.get("applied"):
-                    log.warning(
-                        "Could not locate the '.page' element to apply the "
-                        "padding fix - rendering with the page's own layout "
-                        "as-is; the small left-edge clip may reappear if "
-                        "this form variant uses a different container class."
-                    )
-
+                # The reference MDT is an A4 PDF. Do not turn measured DOM
+                # dimensions into a giant custom paper canvas: that was the
+                # source of the 961.92 x 996 pt output and the useless second
+                # page. Measurements are diagnostics only; the form itself
+                # has already been widened above.
+                log.info(
+                    f"MDT render geometry after form widening: "
+                    f"{content_width_px}x{content_height_px}px; exporting on A4"
+                )
                 pdf_kwargs = dict(
                     format="A4",
+                    # The supplied HTML explicitly declares @page margin:0.
+                    # The previous 5mm Playwright margins reduced the
+                    # printable box while the .page remained 210mm wide,
+                    # producing the exact left clip/right blank symptom.
                     margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
                     print_background=True,
                     prefer_css_page_size=False,
@@ -1583,121 +1677,117 @@ def process_stamp(stamp_path: str) -> Image.Image:
     return final_img
 
 
+def _normalise_arabic_pdf_text(value: str) -> str:
+    """Normalize common PDF extraction variants without changing position data."""
+    value = value or ""
+    value = value.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    value = re.sub(r"[\u064B-\u065F\u0670]", "", value)
+    return re.sub(r"\s+", "", value)
+
+
 def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float]) -> Optional[Dict[str, Dict[str, float]]]:
     """Find signature anchors from the rendered MDT PDF's Arabic labels.
 
     PyMuPDF coordinates use a top-left origin. ReportLab uses a bottom-left
     origin, so the returned y values are converted before drawing. The three
     committee signatures are the first three ``التوقيع`` labels after the
-    ``تقرير اللجنة الثلاثية المتخصصة`` heading. The declaration signature
-    (sig4) belongs to the "الإخصائي الاجتماعي" (social worker) column of the
-    ``الإقرار`` section. If extraction is incomplete, return None so the
-    caller can use the legacy coordinates rather than place an image at a
-    dangerous guessed location.
-
-    Uses ``page.search_for()`` rather than ``page.get_text("words")``.
-    ``search_for`` returns one tight rectangle per literal occurrence of the
-    search phrase. ``get_text("words")`` instead tokenizes purely on
-    inter-character spacing gaps, and the declaration row has two
-    "التوقيع" cells sitting close together with no space between the end
-    of one cell's placeholder dashes and the start of the next cell's
-    label - which can fuse them into ONE oversized "word" spanning the
-    whole row. Every previous x0-based "pick the rightmost of these two"
-    comparison then only ever had that single, far-left-anchored candidate
-    to choose from, no matter which side the comparison said it preferred -
-    which is why sig4 kept landing on the left label even after the
-    left/right comparison logic itself was corrected. search_for's clean,
-    per-occurrence rectangles remove that failure mode entirely.
-
-    sig4's column is also identified by a unique anchor phrase
-    ("الإخصائي الاجتماعي") rather than by a left/right coordinate
-    assumption, so it can't get flipped again by any future change to
-    margins, table widths, or page geometry.
+    ``تقرير اللجنة الثلاثية المتخصصة`` heading. The declaration signature is
+    the right-most label before that heading. If extraction is incomplete,
+    return None so the caller can use the legacy coordinates rather than place
+    an image at a dangerous guessed location.
     """
     try:
         doc = fitz.open(stream=mdt_pdf_bytes, filetype="pdf")
         page = doc[0]
+        words = page.get_text("words")
         page_width = float(page.rect.width)
         page_height = float(page.rect.height)
-        sig_boxes = page.search_for("التوقيع")
-        heading_boxes = page.search_for("تقرير اللجنة الثلاثية المتخصصة")
-        anchor_boxes = page.search_for("الإخصائي الاجتماعي") or page.search_for("الاجتماعي")
         doc.close()
     except Exception as exc:
         log.warning(f"Automatic MDT signature detection unavailable: {exc}")
         return None
 
-    if not heading_boxes or not sig_boxes:
-        return None
-    header_y = min(b.y0 for b in heading_boxes)
+    entries = []
+    for word in words:
+        x0, y0, x1, y1, text = word[:5]
+        entries.append({"x0": float(x0), "y0": float(y0), "x1": float(x1),
+                        "y1": float(y1), "text": _normalise_arabic_pdf_text(text)})
 
-    committee_boxes = sorted(
-        [b for b in sig_boxes if header_y < b.y0 < header_y + 150],
-        key=lambda b: (round(b.y0), b.x0),
+    def is_signature(e):
+        return "توقيع" in e["text"]
+
+    def is_committee_heading(e):
+        return "تقريراللجنةالثلاثيةالمتخصصة" in e["text"] or (
+            "تقرير" in e["text"] and "اللجنة" in e["text"])
+
+    headings = [e for e in entries if is_committee_heading(e)]
+    if not headings:
+        # Some PDF text extractors split the heading into separate words.
+        heading_words = [e for e in entries if e["text"] in ("تقرير", "اللجنة", "الثلاثية", "المتخصصة")]
+        if heading_words:
+            headings = [{"y0": min(e["y0"] for e in heading_words),
+                         "y1": max(e["y1"] for e in heading_words)}]
+    if not headings:
+        return None
+
+    header_y = min(e["y0"] for e in headings)
+    committee_labels = sorted(
+        [e for e in entries if is_signature(e) and e["y0"] > header_y and e["y0"] < header_y + 150],
+        key=lambda e: (e["y0"], e["x0"]),
     )
     # A label can be extracted more than once by some PDF producers; keep one
     # anchor per visual row, ordered from top to bottom.
     unique_rows = []
-    for b in committee_boxes:
-        if not unique_rows or abs(b.y0 - unique_rows[-1].y0) > 4:
-            unique_rows.append(b)
+    for e in committee_labels:
+        if not unique_rows or abs(e["y0"] - unique_rows[-1]["y0"]) > 4:
+            unique_rows.append(e)
     if len(unique_rows) < 3:
         return None
-    committee_boxes = unique_rows[:3]
+    committee_labels = unique_rows[:3]
 
-    declaration_boxes = [b for b in sig_boxes if b.y1 < header_y]
-    if not declaration_boxes:
+    declaration_labels = [e for e in entries if is_signature(e) and
+                          header_y - 145 <= e["y1"] < header_y]
+    if len(declaration_labels) < 2:
+        declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    if not declaration_labels:
         return None
-
-    if anchor_boxes:
-        # Same column = roughly the same x-center as the unique header
-        # phrase directly above it. This ties sig4's placement to the
-        # actual named column instead of a left/right guess.
-        anchor_cx = sum((b.x0 + b.x1) / 2 for b in anchor_boxes) / len(anchor_boxes)
-        declaration_box = min(
-            declaration_boxes, key=lambda b: abs(((b.x0 + b.x1) / 2) - anchor_cx)
-        )
-        anchor_used = "الإخصائي الاجتماعي column"
-    else:
-        # Fallback only if that anchor phrase can't be found at all: page
-        # x increases left -> right regardless of text direction, so the
-        # visually right-hand label is the one with the larger x0.
-        declaration_box = max(declaration_boxes, key=lambda b: b.x0)
-        anchor_used = "x0 fallback (anchor phrase not found)"
+    # PDF coordinates increase from left to right. The visually right-hand
+    # declaration label therefore has the larger x coordinate; use the
+    # nearest label to the right side of the declaration row explicitly.
+    declaration = max(declaration_labels, key=lambda e: e["x0"])
 
     gap = 3.0
 
-    def image_box(box, key):
+    def image_box(label, key):
         width = float(sizes[key]["width"])
         height = float(sizes[key]["height"])
         # In the RTL form, the signature follows the label toward the left.
-        x = max(2.0, box.x0 - gap - width)
-        cy = (box.y0 + box.y1) / 2.0
+        x = max(2.0, label["x0"] - gap - width)
+        cy = (label["y0"] + label["y1"]) / 2.0
         y = page_height - cy - height / 2.0
         return {"x": min(x, page_width - width - 2.0), "y": max(2.0, y),
                 "width": width, "height": height}
 
     result = {
-        "sig1": image_box(committee_boxes[0], "sig1"),
-        "sig2": image_box(committee_boxes[1], "sig2"),
-        "sig3": image_box(committee_boxes[2], "sig3"),
-        "sig4": image_box(declaration_box, "sig4"),
+        "sig1": image_box(committee_labels[0], "sig1"),
+        "sig2": image_box(committee_labels[1], "sig2"),
+        "sig3": image_box(committee_labels[2], "sig3"),
+        "sig4": image_box(declaration, "sig4"),
     }
     # Stamp centered over the three committee signatures, as on the local
     # cleaned form. Its vertical position follows the detected rows.
     stamp_w = float(sizes["stamp"]["width"])
     stamp_h = float(sizes["stamp"]["height"])
     centers_x = [result[k]["x"] + result[k]["width"] / 2 for k in ("sig1", "sig2", "sig3")]
-    centers_y = [page_height - ((b.y0 + b.y1) / 2) for b in committee_boxes]
+    centers_y = [page_height - ((e["y0"] + e["y1"]) / 2) for e in committee_labels]
     result["stamp"] = {
         "x": max(2.0, min(page_width - stamp_w - 2.0, sum(centers_x) / 3 - stamp_w / 2)),
         "y": max(2.0, min(page_height - stamp_h - 2.0, sum(centers_y) / 3 - stamp_h / 2)),
         "width": stamp_w, "height": stamp_h,
     }
     log.info("Automatic MDT signature anchors detected from PDF text coordinates: "
-             f"committee={[round(b.y0, 1) for b in committee_boxes]}, "
-             f"declaration_y={round(declaration_box.y0, 1)}, "
-             f"declaration_anchor={anchor_used}")
+             f"committee={[round(e['y0'], 1) for e in committee_labels]}, "
+             f"declaration_y={round(declaration['y0'], 1)}")
     return result
 
 
