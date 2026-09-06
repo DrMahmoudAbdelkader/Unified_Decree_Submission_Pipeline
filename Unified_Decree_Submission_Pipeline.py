@@ -1479,51 +1479,95 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
 
-                # page.pdf(width=...) enlarges only the paper canvas. It does
-                # not enlarge a narrow table/container inside that canvas.
-                # Widen the largest plausible MDT form container after print
-                # CSS is active and before measuring the rendered dimensions.
-                widen_result = page.evaluate(
+                # page.pdf(width=...) enlarges only the paper canvas.  The
+                # previous fix guessed at the largest 560-630px wrapper and
+                # then widened it, which left the old RTL offset in place and
+                # clipped the left edge.  Detect the actual MDT table from its
+                # printed labels, center it, and propagate its width through
+                # nested tables as a fallback when no native PDF is available.
+                layout_result = page.evaluate(
                     """(targetWidth) => {
-                        const candidates = [];
-                        for (const el of document.querySelectorAll('body *')) {
-                            const tag = el.tagName.toLowerCase();
-                            if (!['table', 'form', 'main', 'section', 'article', 'div'].includes(tag)) continue;
+                        const visible = el => {
                             const r = el.getBoundingClientRect();
                             const cs = getComputedStyle(el);
-                            if (r.width < 560 || r.width > 630 || r.height < 120) continue;
-                            if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                            candidates.push({el, width: r.width, area: r.width * r.height});
-                        }
-                        if (!candidates.length) return {changed: false, candidates: 0};
-                        candidates.sort((a, b) => b.area - a.area);
-                        const chosen = candidates[0].el;
-                        const before = chosen.getBoundingClientRect().width;
-                        const css = `width:${targetWidth}px !important;` +
-                                    `min-width:${targetWidth}px !important;` +
-                                    `max-width:${targetWidth}px !important;` +
-                                    `box-sizing:border-box !important;`;
-                        chosen.style.cssText += ';' + css;
-                        if (chosen.hasAttribute('width')) chosen.setAttribute('width', String(targetWidth));
-                        let parent = chosen.parentElement;
+                            return r.width > 0 && r.height > 0 &&
+                                   cs.display !== 'none' && cs.visibility !== 'hidden';
+                        };
+                        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+                        const markerRe = /طلب علاج|تقرير اللجنة الثلاثية|التشخيص اإلكلينيكي|التشخيص الإكلينيكي|إسم المريض|اسم المريض/;
+                        const candidates = [...document.querySelectorAll('table')]
+                            .filter(visible)
+                            .map(el => ({el, text: normalize(el.innerText), r: el.getBoundingClientRect()}))
+                            .filter(x => markerRe.test(x.text) && x.r.height > 250)
+                            .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+                        const rootInfo = candidates[0];
+                        if (!rootInfo) return {changed: false, reason: 'mdt-root-table-not-found', candidates: 0};
+                        const root = rootInfo.el;
+                        const before = root.getBoundingClientRect();
+                        const px = `${targetWidth}px`;
+                        const set = (el, name, value) => el.style.setProperty(name, value, 'important');
+
+                        for (const [name, value] of [
+                            ['width', px], ['min-width', px], ['max-width', px],
+                            ['box-sizing', 'border-box'], ['margin-left', 'auto'],
+                            ['margin-right', 'auto'], ['left', 'auto'], ['right', 'auto'],
+                            ['transform', 'none'], ['overflow', 'visible'],
+                            ['position', 'relative']
+                        ]) set(root, name, value);
+                        root.removeAttribute('width');
+
+                        let parent = root.parentElement;
                         let levels = 0;
-                        while (parent && parent !== document.body && levels < 4) {
-                            const pr = parent.getBoundingClientRect();
-                            if (pr.width >= 560 && pr.width <= 630) {
-                                parent.style.cssText += ';' + css;
-                                if (parent.hasAttribute('width')) parent.setAttribute('width', String(targetWidth));
-                            }
+                        while (parent && parent !== document.body && levels++ < 5) {
+                            set(parent, 'overflow', 'visible');
+                            set(parent, 'max-width', 'none');
+                            set(parent, 'margin-left', 'auto');
+                            set(parent, 'margin-right', 'auto');
+                            set(parent, 'left', 'auto');
+                            set(parent, 'right', 'auto');
+                            set(parent, 'transform', 'none');
+                            parent.removeAttribute('width');
                             parent = parent.parentElement;
-                            levels++;
                         }
-                        const after = chosen.getBoundingClientRect().width;
-                        return {changed: after > before + 1, candidates: candidates.length,
-                                before: Math.round(before), after: Math.round(after),
-                                tag: chosen.tagName, id: chosen.id || ''};
+
+                        let nestedTables = 0;
+                        for (const table of root.querySelectorAll('table')) {
+                            set(table, 'width', '100%');
+                            set(table, 'min-width', '0');
+                            set(table, 'max-width', 'none');
+                            set(table, 'table-layout', 'auto');
+                            set(table, 'box-sizing', 'border-box');
+                            table.removeAttribute('width');
+                            nestedTables++;
+                        }
+
+                        let nowrapCells = 0;
+                        const nowrapRe = /تاريخ|التوقيع|الوظيفة|اللجنة|\\d{1,4}[-\\/]\\d{1,2}|[٠-٩]{1,4}[-\\/][٠-٩]{1,2}/;
+                        const dashRe = /-{5,}|_{5,}|ـ{5,}/;
+                        for (const cell of root.querySelectorAll('td, th')) {
+                            const text = normalize(cell.innerText);
+                            if (nowrapRe.test(text) || dashRe.test(text)) {
+                                set(cell, 'white-space', 'nowrap');
+                                set(cell, 'word-break', 'keep-all');
+                                set(cell, 'overflow', 'visible');
+                                nowrapCells++;
+                            }
+                        }
+
+                        const after = root.getBoundingClientRect();
+                        return {
+                            changed: true, candidates: candidates.length,
+                            nestedTables, nowrapCells,
+                            tag: root.tagName, id: root.id || '',
+                            before: {left: Math.round(before.left), width: Math.round(before.width)},
+                            after: {left: Math.round(after.left), right: Math.round(after.right),
+                                    width: Math.round(after.width), height: Math.round(after.height)},
+                            direction: getComputedStyle(root).direction
+                        };
                     }""",
                     MDT_FORM_CONTENT_WIDTH_PX,
                 )
-                log.info(f"MDT actual form-container widening result: {widen_result}")
+                log.info(f"MDT targeted form layout result: {layout_result}")
 
                 try:
                     dims = page.evaluate(
@@ -1557,7 +1601,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
                     print_background=True,
                     prefer_css_page_size=False,
-                    scale=0.90,
+                    scale=1.0,
                 )
                 pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
