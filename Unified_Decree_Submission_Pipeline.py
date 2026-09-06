@@ -1551,19 +1551,15 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
 
                         // E. Date rows: prevent date values from splitting.
                         //
-                        // Root cause confirmed from logs: font IS Hacen Tunisia
-                        // (fontFamily: '"Hacen Tunisia"') so font metrics are
-                        // correct. The date still splits because the HTML table
-                        // sets an explicit pixel width on the value <td> that
-                        // is too narrow for the date string. nowrap alone does
-                        // not override an explicit width — the cell clips/wraps
-                        // at the fixed width boundary.
-                        //
-                        // Fix: remove the explicit width from the value cell
-                        // AND set min-width:160px + nowrap. Also set
-                        // overflow:visible so the content is never clipped.
-                        // Label cell gets max-width:55% + white-space:normal
-                        // so it keeps wrapping and doesn't expand the row.
+                        // Root cause (confirmed from logs): scrollHeight stays
+                        // 1207px across runs, proving the JS runs but the date
+                        // still splits. The form tables use table-layout:fixed
+                        // with widths on <col> elements. Removing width from
+                        // <td> has no effect under fixed layout. Fix: switch
+                        // the parent table to table-layout:auto and clear all
+                        // <col> widths so the browser recalculates column
+                        // widths from content, then set nowrap+min-width on
+                        // the value cell.
                         const dateLabelSubstrings = [
                             '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
                             '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
@@ -1571,34 +1567,37 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
                             '\u0627\u0644\u0639\u0645\u0631 (',
                         ];
-                        const isDateRow = row => {{
-                            const t = normalize(row.innerText);
-                            return dateLabelSubstrings.some(s => t.includes(s));
-                        }};
-                        const isLabelCell = cell => {{
-                            const t = normalize(cell.innerText);
-                            return dateLabelSubstrings.some(s => t.includes(s));
-                        }};
+                        const isDateRow = row => dateLabelSubstrings.some(
+                            s => normalize(row.innerText).includes(s)
+                        );
+                        const isLabelCell = cell => dateLabelSubstrings.some(
+                            s => normalize(cell.innerText).includes(s)
+                        );
                         let nowrapCount = 0;
                         for (const row of root.querySelectorAll('tr')) {{
                             if (!isDateRow(row)) continue;
                             const cells = [...row.querySelectorAll('td, th')];
                             if (cells.length < 2) continue;
+                            // Switch parent table to auto layout and clear
+                            // all <col> fixed widths.
+                            const tbl = row.closest('table');
+                            if (tbl) {{
+                                set(tbl, 'table-layout', 'auto');
+                                for (const col of tbl.querySelectorAll('col'))
+                                    set(col, 'width', 'auto');
+                            }}
                             for (const cell of cells) {{
                                 if (isLabelCell(cell)) {{
-                                    set(cell, 'max-width', '55%');
                                     set(cell, 'white-space', 'normal');
-                                }} else {{
-                                    // Remove any explicit width the HTML sets
-                                    // on this cell — that is what causes the
-                                    // date to wrap despite nowrap being set.
-                                    cell.style.removeProperty('width');
                                     set(cell, 'width', 'auto');
-                                    set(cell, 'min-width', '160px');
+                                    set(cell, 'max-width', '60%');
+                                }} else {{
                                     set(cell, 'white-space', 'nowrap');
                                     set(cell, 'word-break', 'normal');
                                     set(cell, 'overflow-wrap', 'normal');
                                     set(cell, 'overflow', 'visible');
+                                    set(cell, 'width', 'auto');
+                                    set(cell, 'min-width', '160px');
                                     for (const d of cell.querySelectorAll('*')) {{
                                         set(d, 'white-space', 'nowrap');
                                         set(d, 'word-break', 'normal');
@@ -1856,24 +1855,24 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
                 "width": width, "height": height}
 
     def image_box_right_of_declaration(label, key):
-        """sig4: blank space is to the RIGHT of the right-hand التوقيع
-        label, between label.x1 and the right page edge.
-        Centre the image in that gap; if too narrow, place flush-right."""
+        """sig4: PyMuPDF merges both التوقيع labels into one entry.
+        From logs: x0=35.2, x1=511.1, page_width=595.9.
+        Gap to right edge = 76.8pt < image width 120pt, so image
+        CANNOT go to the right of x1. Place it in the right half of
+        the entry span (between midpoint and x1), centred there.
+        This puts sig4 to the LEFT of the right التوقيع word."""
         width = float(sizes[key]["width"])
         height = float(sizes[key]["height"])
-        right_edge = page_width - 4.0
-        gap_start = label["x1"] + gap
-        available = right_edge - gap_start
-        if available >= width:
-            x = gap_start + (available - width) / 2.0
-        else:
-            x = max(gap_start, right_edge - width)
+        midpoint = (label["x0"] + label["x1"]) / 2.0
+        centre_x = (midpoint + label["x1"]) / 2.0
+        x = centre_x - width / 2.0
+        x = max(midpoint + 2.0, min(x, label["x1"] - width - 2.0))
         cy = (label["y0"] + label["y1"]) / 2.0
         y = page_height - cy - height / 2.0
         log.info(f"  {key}: x={x:.1f} y={y:.1f} "
-                 f"(right of label x1={label['x1']:.1f}, "
-                 f"right_edge={right_edge:.1f}, available={available:.1f}pt, "
-                 f"width={width:.1f}pt)")
+                 f"(right-half of merged entry: x0={label['x0']:.1f} "
+                 f"x1={label['x1']:.1f} midpoint={midpoint:.1f} "
+                 f"centre_x={centre_x:.1f} width={width:.1f})")
         return {"x": max(2.0, min(x, page_width - width - 2.0)), "y": max(2.0, y),
                 "width": width, "height": height}
 
