@@ -1460,54 +1460,37 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # --- PAGE SIZE: the earlier "measure content width, then
-                # compute a fit-to-page scale" approach was itself the bug
-                # that produced this regression. `scale` in page.pdf()
-                # shrinks the WHOLE rendered page uniformly, anchored at
-                # the physical top-left corner of the paper - it does not
-                # re-center anything. The measurement used
-                # `Math.max(rect.width, doc.scrollWidth, body.scrollWidth)`,
-                # and scrollWidth/scrollHeight reflect the widest/tallest
-                # thing ANYWHERE on the page, not just the form - a single
-                # stray floated header div, an unconstrained image, or a
-                # hidden watermark element elsewhere in the markup is
-                # enough to balloon that number far past the form's real
-                # size. That drove the computed scale down toward the 0.5
-                # floor, and a page shrunk to roughly half size and pinned
-                # to the top-left corner is exactly "a thin sliver near the
-                # top, mostly blank" - what you're seeing now.
+                # --- PAGE SIZE: the previous `box-sizing: border-box` fix
+                # closed the left-edge overflow correctly, but it did so by
+                # shrinking `.page`'s usable CONTENT width (border-box means
+                # the declared 210mm now has to include padding, so content
+                # drops to ~202mm). Several inner cells use hardcoded
+                # absolute pixel widths tuned against the FULL 210mm
+                # content area (e.g. `width:820px !important`) - shrinking
+                # the container by even a few mm was enough to force extra
+                # wrapping, which is what pushed the form onto a second
+                # page again. That reflow also shifted where every label
+                # sits, which is what broke the signature anchors too.
                 #
-                # Digging into *why* the original (smaller, ~30-40px)
-                # clipping existed in the first place turned up the actual
-                # root cause, and it does not need measuring or scaling at
-                # all. The site's own stylesheet declares:
+                # The correct minimal fix touches only the ONE thing that's
+                # actually wrong - the padding - and leaves the declared
+                # content width untouched:
                 #
-                #   .page {
-                #       width: 210mm;
-                #       padding: 20mm;
-                #       margin: 10mm auto;
-                #       ...
-                #       padding: 10px;   <- 'padding' declared AGAIN later
-                #   }                        in the SAME rule
+                #   .page { width: 210mm; padding: 20mm; ... padding: 10px; }
                 #
-                # CSS keeps the LAST declaration when a property repeats in
-                # one rule, so `.page`'s real padding is 10px, not 20mm.
-                # The div's own inline style also carries `margin:0 auto`,
-                # which (inline always beats external CSS) overrides the
-                # stylesheet's `margin:10mm auto` entirely. So the actual
-                # rendered box is content(210mm) + padding(~10px each side,
-                # content-box adds this ON TOP of the 210mm) sitting on a
-                # 210mm-wide A4 canvas with 0 margin - an overflow of only
-                # ~7.5mm (~28px), which lines up almost exactly with the
-                # "30-40px cut on the left" originally reported.
-                #
-                # The fix is one CSS property: force `.page` onto
-                # `box-sizing: border-box`. That makes its ALREADY-DECLARED
-                # `width: 210mm` mean the box's TOTAL width including
-                # padding, instead of adding padding on top of it - so the
-                # box becomes exactly 210mm wide with zero overflow, no
-                # scale factor needed, and no risk of a runaway shrink from
-                # an unrelated wide element elsewhere on the page.
+                # (padding is declared twice in the same rule; CSS keeps
+                # the LAST one, so the effective padding is 10px, not
+                # 20mm). With `@page { margin: 0 }` and a content width
+                # that's already the full 210mm, ANY positive padding on
+                # top of that guarantees overflow past the A4 edge -
+                # there's no room left for it. So padding must be exactly
+                # 0, not shrunk-and-rebalanced via border-box. Zeroing
+                # padding (while leaving box-sizing/content-box and the
+                # 210mm width alone) removes exactly the ~28px overflow,
+                # keeps the content area at the same 210mm the inner tables
+                # were already tuned against, and therefore shouldn't
+                # reflow anything else - no page-count change, no shifted
+                # label positions, no knock-on signature drift.
                 page.emulate_media(media="print")
 
                 try:
@@ -1515,7 +1498,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         """() => {
                             const pageEl = document.querySelector('.page');
                             if (!pageEl) return {applied: false, reason: 'page-element-not-found'};
-                            pageEl.style.setProperty('box-sizing', 'border-box', 'important');
+                            pageEl.style.setProperty('padding', '0', 'important');
                             pageEl.style.setProperty('margin', '0 auto', 'important');
                             const rect = pageEl.getBoundingClientRect();
                             return {applied: true, width: Math.round(rect.width), height: Math.round(rect.height)};
@@ -1524,13 +1507,13 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 except Exception as exc:
                     box_fix = {"applied": False, "reason": str(exc)}
 
-                log.info(f"MDT '.page' box-sizing fix result: {box_fix}")
+                log.info(f"MDT '.page' padding fix result: {box_fix}")
                 if not box_fix.get("applied"):
                     log.warning(
                         "Could not locate the '.page' element to apply the "
-                        "border-box fix - rendering with the page's own "
-                        "layout as-is; the small left-edge clip may reappear "
-                        "if this form variant uses a different container class."
+                        "padding fix - rendering with the page's own layout "
+                        "as-is; the small left-edge clip may reappear if "
+                        "this form variant uses a different container class."
                     )
 
                 pdf_kwargs = dict(
