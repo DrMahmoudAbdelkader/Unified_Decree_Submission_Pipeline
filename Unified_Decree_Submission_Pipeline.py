@@ -282,11 +282,10 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 # (WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
 #  Chromium; see render_print_page_to_pdf(). Run "playwright install
 #  chromium" once after "pip install playwright".)
-# Width of the actual MDT form block, not the PDF paper canvas.
-# The supplied local reference's visible form block is approximately 600 CSS
-# px in Chromium's 96-DPI CSS coordinate system.  Keeping this below the full
-# A4 content width preserves the reference's balanced outer margins.
-MDT_FORM_CONTENT_WIDTH_PX = 575
+# NOTE: the old MDT_FORM_CONTENT_WIDTH_PX / forced-table-width hack has been
+# removed. render_print_page_to_pdf() now measures the page's real rendered
+# width in print media and computes a fit-to-page `scale` for page.pdf()
+# instead of resizing the DOM - see the comment block there for why.
 
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
@@ -1461,181 +1460,104 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # --- PAGE SIZE: measure the REAL rendered dimensions, but
-                # only after switching to print media — not before. This is
-                # the bug in the previous version of this fix: it measured
-                # scrollWidth in normal SCREEN layout, then emulated print
-                # media afterward, so the page.pdf() canvas was sized for a
-                # layout that no longer matched what actually rendered.
-                # Many of these older ASP.NET "print view" pages ship a
-                # genuinely different, narrower @media print stylesheet —
-                # switching media mode can reflow the whole page. Measuring
-                # in the wrong mode produces exactly what you saw: a
-                # narrower rendered form floating inside a canvas sized for
-                # the wider screen layout, with lines wrapping because the
-                # print-mode content doesn't actually fit the width we
-                # measured, which is also what pushed it onto a second page.
+                # --- PAGE SIZE: the SMC print page already ships its own
+                # print sizing — `.page { width:210mm; padding:20mm;
+                # margin:10mm auto; }` plus `@page { size:A4; margin:0; }`
+                # (see the page's own markup/CSS). That box's *total*
+                # rendered width is 210mm + 2*20mm padding + 2*10mm margin
+                # = 270mm — wider than the 210mm A4 sheet it's supposed to
+                # sit on. A real browser's manual "Print" dialog silently
+                # compensates for this with its default "Scale: Fit to
+                # page" behaviour, which is why printing the page by hand
+                # (or via Chrome's print-to-PDF UI) produces the clean,
+                # single-page, uncut reference forms. Playwright's
+                # page.pdf() does NOT auto-fit like that — it lays out the
+                # CSS literally at 96dpi and either clips or leaves
+                # whitespace depending on `scale`/`margin`.
                 #
-                # Use the site's OWN print stylesheet FIRST - the same one
-                # applied when you print this page manually from a browser -
-                # then measure against what's actually on screen now.
+                # All the earlier attempts (forcing a guessed table width
+                # via JS, then compensating with an arbitrary scale=0.90)
+                # were fighting the page's own layout instead of measuring
+                # it, which is exactly what produced the three symptoms
+                # reported: a clipped left edge (RTL overflow spills
+                # physically left), a blank strip on the right, and date
+                # cells wrapping (because the JS forced the table narrower
+                # than its natural, correctly-tuned column widths).
+                #
+                # The robust fix is to NOT touch the DOM at all and instead
+                # replicate the browser's own "fit to page" math: measure
+                # the page's real rendered width in print media, then set
+                # page.pdf()'s `scale` so that width maps exactly onto the
+                # A4 printable width. This adapts automatically to any
+                # variation in margins/padding/scaling the site's markup
+                # introduces per print, rather than hardcoding a guess.
                 page.emulate_media(media="print")
 
-                # page.pdf(width=...) enlarges only the paper canvas.  The
-                # previous fix guessed at the largest 560-630px wrapper and
-                # then widened it, which left the old RTL offset in place and
-                # clipped the left edge.  Detect the actual MDT table from its
-                # printed labels, center it, and propagate its width through
-                # nested tables as a fallback when no native PDF is available.
-                layout_result = page.evaluate(
-                    """(targetWidth) => {
-                        const visible = el => {
-                            const r = el.getBoundingClientRect();
-                            const cs = getComputedStyle(el);
-                            return r.width > 0 && r.height > 0 &&
-                                   cs.display !== 'none' && cs.visibility !== 'hidden';
-                        };
-                        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
-                        const markerRe = /طلب علاج|تقرير اللجنة الثلاثية|التشخيص اإلكلينيكي|التشخيص الإكلينيكي|إسم المريض|اسم المريض/;
-                        const candidates = [...document.querySelectorAll('table')]
-                            .filter(visible)
-                            .map(el => ({el, text: normalize(el.innerText), r: el.getBoundingClientRect()}))
-                            .filter(x => markerRe.test(x.text) && x.r.height > 250)
-                            .sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
-                        const rootInfo = candidates[0];
-                        if (!rootInfo) return {changed: false, reason: 'mdt-root-table-not-found', candidates: 0};
-                        const root = rootInfo.el;
-                        const before = root.getBoundingClientRect();
-                        const px = `${targetWidth}px`;
-                        const set = (el, name, value) => el.style.setProperty(name, value, 'important');
-
-                        for (const [name, value] of [
-                            ['width', px], ['min-width', px], ['max-width', px],
-                            ['box-sizing', 'border-box'], ['margin-left', 'auto'],
-                            ['margin-right', 'auto'], ['left', 'auto'], ['right', 'auto'],
-                            ['transform', 'none'], ['overflow', 'visible'],
-                            ['position', 'static'], ['display', 'table'],
-                            ['float', 'none']
-                        ]) set(root, name, value);
-                        root.removeAttribute('width');
-
-                        let parent = root.parentElement;
-                        let levels = 0;
-                        while (parent && parent !== document.body && levels++ < 5) {
-                            set(parent, 'overflow', 'visible');
-                            set(parent, 'max-width', 'none');
-                            set(parent, 'margin-left', 'auto');
-                            set(parent, 'margin-right', 'auto');
-                            set(parent, 'left', 'auto');
-                            set(parent, 'right', 'auto');
-                            set(parent, 'transform', 'none');
-                            set(parent, 'text-align', 'center');
-                            parent.removeAttribute('width');
-                            parent = parent.parentElement;
-                        }
-
-                        let nestedTables = 0;
-                        for (const table of root.querySelectorAll('table')) {
-                            set(table, 'width', '100%');
-                            set(table, 'min-width', '0');
-                            set(table, 'max-width', 'none');
-                            set(table, 'table-layout', 'auto');
-                            set(table, 'box-sizing', 'border-box');
-                            set(table, 'margin-left', 'auto');
-                            set(table, 'margin-right', 'auto');
-                            table.removeAttribute('width');
-                            nestedTables++;
-                        }
-
-                        let nowrapCells = 0;
-                        const nowrapRe = /تاريخ|التوقيع|الوظيفة|اللجنة|\\d{1,4}[-\\/]\\d{1,2}|[٠-٩]{1,4}[-\\/][٠-٩]{1,2}/;
-                        const dashRe = /-{5,}|_{5,}|ـ{5,}/;
-                        const protect = cell => {
-                            set(cell, 'white-space', 'nowrap');
-                            set(cell, 'word-break', 'normal');
-                            set(cell, 'overflow-wrap', 'normal');
-                            set(cell, 'overflow', 'visible');
-                            for (const descendant of cell.querySelectorAll('*')) {
-                                set(descendant, 'white-space', 'nowrap');
-                                set(descendant, 'word-break', 'normal');
-                                set(descendant, 'overflow-wrap', 'normal');
-                            }
-                            nowrapCells++;
-                        };
-                        for (const row of root.querySelectorAll('tr')) {
-                            const rowText = normalize(row.innerText);
-                            // Dates and dashed signature rows are often split
-                            // across several sibling cells. Protect the whole
-                            // row rather than only the cell containing the
-                            // Arabic label.
-                            if (nowrapRe.test(rowText) || dashRe.test(rowText)) {
-                                for (const cell of row.querySelectorAll('td, th')) {
-                                    protect(cell);
-                                    set(cell, 'min-width', 'max-content');
-                                    set(cell, 'width', 'auto');
-                                }
-                            }
-                        }
-                        for (const cell of root.querySelectorAll('td, th')) {
-                            const text = normalize(cell.innerText);
-                            if (nowrapRe.test(text) || dashRe.test(text)) {
-                                protect(cell);
-                            }
-                        }
-
-                        const after = root.getBoundingClientRect();
-                        return {
-                            changed: true, candidates: candidates.length,
-                            nestedTables, nowrapCells,
-                            tag: root.tagName, id: root.id || '',
-                            before: {left: Math.round(before.left), width: Math.round(before.width)},
-                            after: {left: Math.round(after.left), right: Math.round(after.right),
-                                    width: Math.round(after.width), height: Math.round(after.height)},
-                            direction: getComputedStyle(root).direction
-                        };
-                    }""",
-                    MDT_FORM_CONTENT_WIDTH_PX,
-                )
-                log.info(f"MDT targeted form layout result: {layout_result}")
-
                 try:
-                    dims = page.evaluate(
-                        "() => ({ "
-                        "w: Math.max(document.documentElement.scrollWidth, "
-                        "document.body ? document.body.scrollWidth : 0), "
-                        "h: Math.max(document.documentElement.scrollHeight, "
-                        "document.body ? document.body.scrollHeight : 0) "
-                        "})"
+                    metrics = page.evaluate(
+                        """() => {
+                            const doc = document.documentElement;
+                            const body = document.body;
+                            // The outer '.page' div is the actual print
+                            // canvas the site's own CSS sizes for A4; fall
+                            // back to documentElement/body if it isn't
+                            // found (defensive only - no DOM mutation).
+                            const pageEl = document.querySelector('.page') || body;
+                            const rect = pageEl.getBoundingClientRect();
+                            return {
+                                contentWidth: Math.max(
+                                    rect.width,
+                                    doc.scrollWidth,
+                                    body ? body.scrollWidth : 0
+                                ),
+                                contentHeight: Math.max(
+                                    rect.height,
+                                    doc.scrollHeight,
+                                    body ? body.scrollHeight : 0
+                                ),
+                            };
+                        }"""
                     )
-                    content_width_px = dims.get("w")
-                    content_height_px = dims.get("h")
+                    content_width_px = metrics.get("contentWidth")
+                    content_height_px = metrics.get("contentHeight")
                 except Exception:
                     content_width_px = content_height_px = None
+
                 log.info(
                     f"MDT print page measured content (in PRINT media, matching "
                     f"what actually renders): {content_width_px}x{content_height_px}px"
                 )
 
-                # The reference MDT is an A4 PDF. Do not turn measured DOM
-                # dimensions into a giant custom paper canvas: that was the
-                # source of the 961.92 x 996 pt output and the useless second
-                # page. Measurements are diagnostics only; the form itself
-                # has already been widened above.
+                # A4 at 96 CSS px/inch: 8.27in wide -> ~793.7px. Use 0mm
+                # margins in page.pdf() to match the page's own
+                # `@page { margin: 0 }` exactly - the site's `.page` div
+                # supplies its own 20mm padding, adding PDF-level margins
+                # on top of that is what previously pushed the form onto a
+                # second page.
+                A4_WIDTH_PX = 793.7
+                MIN_SCALE, MAX_SCALE = 0.5, 1.0
+                if content_width_px and content_width_px > 0:
+                    fit_scale = A4_WIDTH_PX / content_width_px
+                    fit_scale = max(MIN_SCALE, min(MAX_SCALE, fit_scale))
+                else:
+                    # No usable measurement - render at 1:1 rather than
+                    # guessing a shrink factor; this only degrades to the
+                    # old clipping behaviour if the page failed to load
+                    # properly, which is already surfaced by other checks
+                    # above (login-page / missing-marker detection).
+                    fit_scale = 1.0
+
                 log.info(
-                    f"MDT render geometry after form widening: "
-                    f"{content_width_px}x{content_height_px}px; exporting on A4"
+                    f"MDT render fit-to-page scale computed as {fit_scale:.4f} "
+                    f"(content {content_width_px}px -> A4 printable {A4_WIDTH_PX}px)"
                 )
+
                 pdf_kwargs = dict(
                     format="A4",
-                    margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
+                    margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
                     print_background=True,
                     prefer_css_page_size=False,
-                    # The widened HTML form is slightly taller than the
-                    # browser's printable A4 content box.  Keep the same
-                    # compact factor that previously kept the complete form
-                    # on one page; this scales the finished layout uniformly
-                    # and does not change its internal RTL geometry.
-                    scale=0.90,
+                    scale=fit_scale,
                 )
                 pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
