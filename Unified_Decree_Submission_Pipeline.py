@@ -1461,161 +1461,176 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # --- PAGE SIZE: measure the REAL rendered dimensions, but
-                # only after switching to print media — not before. This is
-                # the bug in the previous version of this fix: it measured
-                # scrollWidth in normal SCREEN layout, then emulated print
-                # media afterward, so the page.pdf() canvas was sized for a
-                # layout that no longer matched what actually rendered.
-                # Many of these older ASP.NET "print view" pages ship a
-                # genuinely different, narrower @media print stylesheet —
-                # switching media mode can reflow the whole page. Measuring
-                # in the wrong mode produces exactly what you saw: a
-                # narrower rendered form floating inside a canvas sized for
-                # the wider screen layout, with lines wrapping because the
-                # print-mode content doesn't actually fit the width we
-                # measured, which is also what pushed it onto a second page.
+                # ----------------------------------------------------------------
+                # FONT-AGNOSTIC LAYOUT FIX
                 #
-                # Use the site's OWN print stylesheet FIRST - the same one
-                # applied when you print this page manually from a browser -
-                # then measure against what's actually on screen now.
+                # The runner installs Amiri (fonts-hosny-amiri) which has wider
+                # character metrics than the page's requested 'Hacen Tunisia'.
+                # This causes date values to wrap even with nowrap on the td,
+                # because the column is too narrow for Amiri's wider glyphs.
+                #
+                # Strategy:
+                #   A. White background on body/html, zero body margin.
+                #   B. Remove .page margin + min-height only. Leave all other
+                #      .page properties (width:210mm, padding:10px) untouched.
+                #   C. Clear Bootstrap wrapper overflow/max-width clipping.
+                #   D. Inject @font-face for the installed font so Chromium
+                #      uses it consistently (avoids silent fallback to a
+                #      different font with different metrics mid-render).
+                #   E. Date VALUE cells: nowrap + explicit min-width large
+                #      enough to hold a date string in any Arabic font.
+                #      Label cells are identified by Arabic substring match
+                #      (robust to hamza normalisation variants).
+                #   F. scale=0.97 in page.pdf() as final safety net.
+                # ----------------------------------------------------------------
                 page.emulate_media(media="print")
 
-                # The portal's actual HTML defines .page as 210mm plus 10px
-                # padding, with the default content-box model.  That makes
-                # the white form wider than A4 and is the source of the
-                # apparent right blank area/left clipping in Chromium.  Use
-                # the real root and the real table structure; do not flatten
-                # every nested table to 100%.
+                # Build the @font-face injection string from whatever font
+                # file is actually installed on this runner. MDT_FORM_FONT_PATHS
+                # is populated by decree_common._install_mdt_form_font() when
+                # running in CI; empty dict when running locally (font already
+                # present via OS). When empty, skip injection and trust the OS.
+                font_face_css = ""
+                _font_paths = MDT_FORM_FONT_PATHS  # module-level dict
+                if _font_paths.get("regular"):
+                    _fp = _font_paths["regular"].replace("\\", "/")
+                    font_face_css += (
+                        f"@font-face {{font-family:'Hacen Tunisia';"
+                        f"src:url('file://{_fp}') format('truetype');"
+                        f"font-weight:normal;font-style:normal;}}"
+                    )
+                if _font_paths.get("bold"):
+                    _fp = _font_paths["bold"].replace("\\", "/")
+                    font_face_css += (
+                        f"@font-face {{font-family:'Hacen Tunisia';"
+                        f"src:url('file://{_fp}') format('truetype');"
+                        f"font-weight:bold;font-style:normal;}}"
+                    )
+
                 layout_result = page.evaluate(
-                    """() => {
-                        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
-                        const root = document.querySelector('.form-horizontal.page') || document.querySelector('.page');
-                        if (!root) return {changed: false, reason: 'mdt-page-root-not-found'};
-                        const before = root.getBoundingClientRect();
-                        const set = (el, name, value) => el.style.setProperty(name, value, 'important');
+                    f"""() => {{
+                        const set = (el, prop, val) =>
+                            el.style.setProperty(prop, val, 'important');
+                        const normalize = s =>
+                            (s || '').replace(/\\s+/g, ' ').trim();
 
-                        // Fit exactly inside the A4 CSS page box. The site
-                        // has padding:10px and the default content-box model;
-                        // border-box prevents the padding from overflowing.
-                        set(root, 'box-sizing', 'border-box');
-                        set(root, 'width', '210mm');
-                        set(root, 'min-width', '0');
-                        set(root, 'max-width', '210mm');
-                        set(root, 'height', 'auto');
+                        // A. White background, zero body margin.
+                        set(document.documentElement, 'background-color', 'white');
+                        set(document.body, 'background-color', 'white');
+                        set(document.body, 'margin', '0');
+                        set(document.body, 'padding', '0');
+
+                        // D. Inject @font-face so Chromium uses the installed
+                        // font consistently under its real family name.
+                        const fontFaceCSS = {repr(font_face_css)};
+                        if (fontFaceCSS) {{
+                            const style = document.createElement('style');
+                            style.textContent = fontFaceCSS;
+                            document.head.appendChild(style);
+                        }}
+
+                        // B. Find .page, remove margin + min-height only.
+                        const root = document.querySelector('.form-horizontal.page')
+                                  || document.querySelector('.page');
+                        if (!root) return {{ok: false, reason: 'page-root-not-found'}};
+                        set(root, 'margin', '0');
                         set(root, 'min-height', '0');
-                        set(root, 'padding', '10px');
-                        set(root, 'margin-left', 'auto');
-                        set(root, 'margin-right', 'auto');
-                        set(root, 'margin-top', '0');
-                        set(root, 'margin-bottom', '0');
-                        set(root, 'direction', 'rtl');
-                        set(root, 'font-family', "'Hacen Tunisia', sans-serif");
-                        set(root, 'overflow', 'visible');
+                        set(root, 'height', 'auto');
 
-                        // Keep the site's table/colspan geometry intact. Only
-                        // remove accidental overflow from the Bootstrap
-                        // wrappers; do not rewrite widths or table-layout.
+                        // C. Remove Bootstrap wrapper overflow/max-width.
                         let parent = root.parentElement;
                         let levels = 0;
-                        while (parent && parent !== document.body && levels++ < 4) {
+                        while (parent && parent !== document.body && levels++ < 8) {{
                             set(parent, 'overflow', 'visible');
                             set(parent, 'max-width', 'none');
+                            set(parent, 'width', 'auto');
+                            set(parent, 'margin', '0');
+                            set(parent, 'padding', '0');
                             parent = parent.parentElement;
-                        }
+                        }}
 
-                        let nowrapCells = 0;
-                        const dateRe = /تاريخ تسجيل الإستمارة|العمر\\s*\\(تاريخ الميلاد\\)/;
-                        const protect = cell => {
-                            set(cell, 'white-space', 'nowrap');
-                            set(cell, 'word-break', 'normal');
-                            set(cell, 'overflow-wrap', 'normal');
-                            set(cell, 'overflow', 'visible');
-                            for (const descendant of cell.querySelectorAll('*')) {
-                                set(descendant, 'white-space', 'nowrap');
-                                set(descendant, 'word-break', 'normal');
-                                set(descendant, 'overflow-wrap', 'normal');
-                            }
-                            nowrapCells++;
-                        };
-                        // Patient date rows: protect the complete value cell
-                        // and its spans, without making declaration paragraphs
-                        // globally nowrap.
-                        for (const row of root.querySelectorAll('tr')) {
-                            const rowText = normalize(row.innerText);
-                            if (dateRe.test(rowText)) {
-                                for (const cell of row.querySelectorAll('td, th'))
-                                    protect(cell);
-                            }
-                        }
+                        // E. nowrap + min-width on date VALUE cells only.
+                        // Label cells identified by Arabic substring match
+                        // (covers both hamza variants: الإستمارة / الاستمارة).
+                        const dateLabelSubstrings = [
+                            '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
+                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
+                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0627\u0633\u062a\u0645\u0627\u0631\u0629',
+                            '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
+                            '\u0627\u0644\u0639\u0645\u0631',
+                        ];
+                        const isLabelCell = cell => {{
+                            const t = normalize(cell.innerText);
+                            return dateLabelSubstrings.some(s => t.includes(s));
+                        }};
+                        let nowrapCount = 0;
+                        for (const row of root.querySelectorAll('tr')) {{
+                            const cells = [...row.querySelectorAll('td, th')];
+                            if (cells.length < 2) continue;
+                            if (!cells.some(isLabelCell)) continue;
+                            for (const cell of cells) {{
+                                if (isLabelCell(cell)) continue;
+                                // Value cell: nowrap + min-width for any font.
+                                // A date like "2024-01-15" is ~10 chars;
+                                // 120px is enough for any Arabic font at 16px.
+                                set(cell, 'white-space', 'nowrap');
+                                set(cell, 'word-break', 'normal');
+                                set(cell, 'overflow-wrap', 'normal');
+                                set(cell, 'min-width', '120px');
+                                for (const d of cell.querySelectorAll('*')) {{
+                                    set(d, 'white-space', 'nowrap');
+                                    set(d, 'word-break', 'normal');
+                                }}
+                                nowrapCount++;
+                            }}
+                        }}
 
-                        // The committee signature table is the first table in
-                        // the box whose rows contain both الوظيفة and التوقيع.
-                        const committeeBox = [...root.querySelectorAll('div')]
-                            .find(el => normalize(el.innerText).includes('تقرير اللجنة الثلاثية المتخصصة'));
-                        let committeeRows = 0;
-                        if (committeeBox) {
-                            const signatureTable = [...committeeBox.querySelectorAll('table')]
-                                .find(t => normalize(t.innerText).includes('التوقيع'));
-                            if (signatureTable) {
-                                for (const row of [...signatureTable.querySelectorAll('tr')].slice(0, 3)) {
-                                    const cells = row.querySelectorAll('td, th');
-                                    if (cells.length) protect(cells[cells.length - 1]);
-                                    committeeRows++;
-                                }
-                            }
-                        }
-
-                        const after = root.getBoundingClientRect();
-                        return {
-                            changed: true, committeeRows, nowrapCells,
-                            tag: root.tagName, id: root.id || '',
-                            before: {left: Math.round(before.left), width: Math.round(before.width)},
-                            after: {left: Math.round(after.left), right: Math.round(after.right),
-                                    width: Math.round(after.width), height: Math.round(after.height)},
-                            direction: getComputedStyle(root).direction
-                        };
-                    }""",
+                        const r = root.getBoundingClientRect();
+                        // Measure full document scroll height so we can
+                        // compute the exact scale to fit one A4 page.
+                        const scrollH = Math.max(
+                            document.documentElement.scrollHeight,
+                            document.body ? document.body.scrollHeight : 0
+                        );
+                        return {{
+                            ok: true,
+                            nowrapCount,
+                            fontInjected: !!fontFaceCSS,
+                            formWidth:  Math.round(r.width),
+                            formHeight: Math.round(r.height),
+                            scrollHeight: Math.round(scrollH),
+                            direction:  getComputedStyle(root).direction,
+                            fontFamily: getComputedStyle(root).fontFamily,
+                        }};
+                    }}""",
                 )
-                log.info(f"MDT targeted form layout result: {layout_result}")
+                log.info(f"MDT layout fixup result: {layout_result}")
 
-                try:
-                    dims = page.evaluate(
-                        "() => ({ "
-                        "w: Math.max(document.documentElement.scrollWidth, "
-                        "document.body ? document.body.scrollWidth : 0), "
-                        "h: Math.max(document.documentElement.scrollHeight, "
-                        "document.body ? document.body.scrollHeight : 0) "
-                        "})"
-                    )
-                    content_width_px = dims.get("w")
-                    content_height_px = dims.get("h")
-                except Exception:
-                    content_width_px = content_height_px = None
-                log.info(
-                    f"MDT print page measured content (in PRINT media, matching "
-                    f"what actually renders): {content_width_px}x{content_height_px}px"
-                )
+                # Compute exact scale to fit rendered content on one A4 page.
+                # A4 at 96 CSS px/inch = 297mm = 1122.52px tall.
+                # We measure scrollHeight (full document height in px after
+                # all JS manipulations) and scale down just enough to fit.
+                # This is font-agnostic: works whether Chromium uses Amiri,
+                # Hacen Tunisia, or any other font with different metrics.
+                A4_HEIGHT_PX = 1122.0
+                scroll_h = (layout_result or {}).get("scrollHeight")
+                if scroll_h and scroll_h > A4_HEIGHT_PX:
+                    computed_scale = round(A4_HEIGHT_PX / scroll_h, 4)
+                    computed_scale = max(0.70, computed_scale)  # safety floor
+                    log.info(f"MDT scrollHeight={scroll_h}px > A4 {A4_HEIGHT_PX}px: "
+                             f"auto-scaling to {computed_scale} to fit one page.")
+                else:
+                    computed_scale = 1.0
+                    log.info(f"MDT scrollHeight={scroll_h}px fits within A4 "
+                             f"{A4_HEIGHT_PX}px: scale=1.0.")
 
-                # The reference MDT is an A4 PDF. Do not turn measured DOM
-                # dimensions into a giant custom paper canvas: that was the
-                # source of the 961.92 x 996 pt output and the useless second
-                # page. Measurements are diagnostics only; the form itself
-                # has already been widened above.
-                log.info(
-                    f"MDT render geometry after form widening: "
-                    f"{content_width_px}x{content_height_px}px; exporting on A4"
-                )
                 pdf_kwargs = dict(
                     format="A4",
-                    # The supplied HTML explicitly declares @page margin:0.
-                    # The previous 5mm Playwright margins reduced the
-                    # printable box while the .page remained 210mm wide,
-                    # producing the exact left clip/right blank symptom.
-                    margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
+                    margin={"top": "0mm", "bottom": "0mm",
+                            "left": "0mm", "right": "0mm"},
                     print_background=True,
                     prefer_css_page_size=False,
-                    scale=1.0,
+                    scale=computed_scale,
                 )
                 pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
@@ -1713,6 +1728,13 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         entries.append({"x0": float(x0), "y0": float(y0), "x1": float(x1),
                         "y1": float(y1), "text": _normalise_arabic_pdf_text(text)})
 
+    # Dump ALL توقيع entries to the log so sig placement can be diagnosed
+    # from the run log alone, without needing to upload a PDF to the repo.
+    log.info(f"PDF page: {page_width:.1f} x {page_height:.1f} pt")
+    for e in sorted((e for e in entries if "توقيع" in e["text"]), key=lambda e: e["y0"]):
+        log.info(f"  توقيع entry: x0={e['x0']:.1f} x1={e['x1']:.1f} "
+                 f"y0={e['y0']:.1f} y1={e['y1']:.1f} text={e['text']!r}")
+
     def is_signature(e):
         return "توقيع" in e["text"]
 
@@ -1745,34 +1767,87 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         return None
     committee_labels = unique_rows[:3]
 
-    declaration_labels = [e for e in entries if is_signature(e) and
-                          header_y - 145 <= e["y1"] < header_y]
-    if len(declaration_labels) < 2:
-        declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
-    if not declaration_labels:
+    # sig4 = the declaration/patient signature.
+    # The form has a row ABOVE the committee heading that contains exactly
+    # two التوقيع labels side by side:
+    #   - RIGHT side (larger x0 in PyMuPDF physical coords) = where sig4 goes
+    #   - LEFT side  (smaller x0) = the other signatory
+    #
+    # Algorithm:
+    #   1. Collect all التوقيع labels strictly above the heading (y1 < header_y).
+    #   2. Group into visual rows (y0 within 8px of each other).
+    #   3. Take the row with the largest mean y0 (nearest row above the heading).
+    #   4. Within that row, take the label with the LARGEST x0 = rightmost
+    #      physically = right side of the RTL form = where sig4 belongs.
+    above_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    if not above_labels:
+        log.warning("sig4: no التوقيع labels found above the committee heading — "
+                    "falling back to configured coordinates.")
         return None
-    # PDF coordinates increase from left to right. The visually right-hand
-    # declaration label therefore has the larger x coordinate; use the
-    # nearest label to the right side of the declaration row explicitly.
-    declaration = max(declaration_labels, key=lambda e: e["x0"])
 
-    gap = 3.0
+    above_labels_sorted = sorted(above_labels, key=lambda e: e["y0"])
+    row_groups: List[List[Dict]] = []
+    for e in above_labels_sorted:
+        if not row_groups or abs(e["y0"] - row_groups[-1][0]["y0"]) > 8:
+            row_groups.append([e])
+        else:
+            row_groups[-1].append(e)
 
-    def image_box(label, key):
+    nearest_row = max(row_groups, key=lambda grp: sum(e["y0"] for e in grp) / len(grp))
+    log.info(f"Declaration row ({len(nearest_row)} label(s), nearest above heading y={header_y:.1f}):")
+    for e in sorted(nearest_row, key=lambda e: e["x0"]):
+        log.info(f"  x0={e['x0']:.1f} x1={e['x1']:.1f} y0={e['y0']:.1f}")
+
+    # RIGHT-hand label = largest x0 in physical coords = right side of RTL form.
+    # sig4 blank space is between this label's x1 and the right page edge.
+    declaration = max(nearest_row, key=lambda e: e["x0"])
+    log.info(f"sig4 anchor chosen: x0={declaration['x0']:.1f} x1={declaration['x1']:.1f} "
+             f"y0={declaration['y0']:.1f} page_width={page_width:.1f}")
+    if len(nearest_row) < 2:
+        log.warning(f"sig4: expected 2 التوقيع labels in declaration row but found "
+                    f"{len(nearest_row)} — sig4 may be misplaced.")
+
+    gap = 4.0
+
+    def image_box_left_of_label(label, key):
+        """sig1/2/3: blank space is LEFT of the التوقيع label (smaller x)."""
         width = float(sizes[key]["width"])
         height = float(sizes[key]["height"])
-        # In the RTL form, the signature follows the label toward the left.
         x = max(2.0, label["x0"] - gap - width)
         cy = (label["y0"] + label["y1"]) / 2.0
         y = page_height - cy - height / 2.0
+        log.info(f"  {key}: x={x:.1f} y={y:.1f} (left of label x0={label['x0']:.1f})")
         return {"x": min(x, page_width - width - 2.0), "y": max(2.0, y),
                 "width": width, "height": height}
 
+    def image_box_between_label_and_right_edge(label, key):
+        """sig4: blank space is between the right-hand التوقيع label and
+        the right page edge (larger x in physical coords).
+        Centre the image in that gap; if the gap is too narrow, place
+        flush against the right edge."""
+        width = float(sizes[key]["width"])
+        height = float(sizes[key]["height"])
+        right_edge = page_width - 4.0
+        gap_start = label["x1"] + gap
+        available = right_edge - gap_start
+        if available >= width:
+            x = gap_start + (available - width) / 2.0
+        else:
+            # Gap too narrow — place flush against right edge.
+            x = right_edge - width
+        cy = (label["y0"] + label["y1"]) / 2.0
+        y = page_height - cy - height / 2.0
+        log.info(f"  {key}: x={x:.1f} y={y:.1f} "
+                 f"(between label x1={label['x1']:.1f} and right_edge={right_edge:.1f}, "
+                 f"available={available:.1f}, width={width:.1f})")
+        return {"x": max(2.0, min(x, page_width - width - 2.0)), "y": max(2.0, y),
+                "width": width, "height": height}
+
     result = {
-        "sig1": image_box(committee_labels[0], "sig1"),
-        "sig2": image_box(committee_labels[1], "sig2"),
-        "sig3": image_box(committee_labels[2], "sig3"),
-        "sig4": image_box(declaration, "sig4"),
+        "sig1": image_box_left_of_label(committee_labels[0], "sig1"),
+        "sig2": image_box_left_of_label(committee_labels[1], "sig2"),
+        "sig3": image_box_left_of_label(committee_labels[2], "sig3"),
+        "sig4": image_box_between_label_and_right_edge(declaration, "sig4"),
     }
     # Stamp centered over the three committee signatures, as on the local
     # cleaned form. Its vertical position follows the detected rows.
