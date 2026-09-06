@@ -283,8 +283,10 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 #  Chromium; see render_print_page_to_pdf(). Run "playwright install
 #  chromium" once after "pip install playwright".)
 # Width of the actual MDT form block, not the PDF paper canvas.
-# The supplied local reference is approximately 650 CSS px wide.
-MDT_FORM_CONTENT_WIDTH_PX = 650
+# The supplied local reference's visible form block is approximately 600 CSS
+# px in Chromium's 96-DPI CSS coordinate system.  Keeping this below the full
+# A4 content width preserves the reference's balanced outer margins.
+MDT_FORM_CONTENT_WIDTH_PX = 600
 
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
@@ -1549,6 +1551,11 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             set(cell, 'word-break', 'normal');
                             set(cell, 'overflow-wrap', 'normal');
                             set(cell, 'overflow', 'visible');
+                            for (const descendant of cell.querySelectorAll('*')) {
+                                set(descendant, 'white-space', 'nowrap');
+                                set(descendant, 'word-break', 'normal');
+                                set(descendant, 'overflow-wrap', 'normal');
+                            }
                             nowrapCells++;
                         };
                         for (const row of root.querySelectorAll('tr')) {
@@ -1682,6 +1689,114 @@ def process_stamp(stamp_path: str) -> Image.Image:
     return final_img
 
 
+def _normalise_arabic_pdf_text(value: str) -> str:
+    """Normalize common PDF extraction variants without changing position data."""
+    value = value or ""
+    value = value.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    value = re.sub(r"[\u064B-\u065F\u0670]", "", value)
+    return re.sub(r"\s+", "", value)
+
+
+def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float]) -> Optional[Dict[str, Dict[str, float]]]:
+    """Find signature anchors from the rendered MDT PDF's Arabic labels.
+
+    PyMuPDF coordinates use a top-left origin. ReportLab uses a bottom-left
+    origin, so the returned y values are converted before drawing. The three
+    committee signatures are the first three ``التوقيع`` labels after the
+    ``تقرير اللجنة الثلاثية المتخصصة`` heading. The declaration signature is
+    the right-most label before that heading. If extraction is incomplete,
+    return None so the caller can use the legacy coordinates rather than place
+    an image at a dangerous guessed location.
+    """
+    try:
+        doc = fitz.open(stream=mdt_pdf_bytes, filetype="pdf")
+        page = doc[0]
+        words = page.get_text("words")
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+        doc.close()
+    except Exception as exc:
+        log.warning(f"Automatic MDT signature detection unavailable: {exc}")
+        return None
+
+    entries = []
+    for word in words:
+        x0, y0, x1, y1, text = word[:5]
+        entries.append({"x0": float(x0), "y0": float(y0), "x1": float(x1),
+                        "y1": float(y1), "text": _normalise_arabic_pdf_text(text)})
+
+    def is_signature(e):
+        return "توقيع" in e["text"]
+
+    def is_committee_heading(e):
+        return "تقريراللجنةالثلاثيةالمتخصصة" in e["text"] or (
+            "تقرير" in e["text"] and "اللجنة" in e["text"])
+
+    headings = [e for e in entries if is_committee_heading(e)]
+    if not headings:
+        # Some PDF text extractors split the heading into separate words.
+        heading_words = [e for e in entries if e["text"] in ("تقرير", "اللجنة", "الثلاثية", "المتخصصة")]
+        if heading_words:
+            headings = [{"y0": min(e["y0"] for e in heading_words),
+                         "y1": max(e["y1"] for e in heading_words)}]
+    if not headings:
+        return None
+
+    header_y = min(e["y0"] for e in headings)
+    committee_labels = sorted(
+        [e for e in entries if is_signature(e) and e["y0"] > header_y and e["y0"] < header_y + 150],
+        key=lambda e: (e["y0"], e["x0"]),
+    )
+    # A label can be extracted more than once by some PDF producers; keep one
+    # anchor per visual row, ordered from top to bottom.
+    unique_rows = []
+    for e in committee_labels:
+        if not unique_rows or abs(e["y0"] - unique_rows[-1]["y0"]) > 4:
+            unique_rows.append(e)
+    if len(unique_rows) < 3:
+        return None
+    committee_labels = unique_rows[:3]
+
+    declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    if not declaration_labels:
+        return None
+    declaration = max(declaration_labels, key=lambda e: e["x0"])
+
+    gap = 3.0
+
+    def image_box(label, key):
+        width = float(sizes[key]["width"])
+        height = float(sizes[key]["height"])
+        # In the RTL form, the signature follows the label toward the left.
+        x = max(2.0, label["x0"] - gap - width)
+        cy = (label["y0"] + label["y1"]) / 2.0
+        y = page_height - cy - height / 2.0
+        return {"x": min(x, page_width - width - 2.0), "y": max(2.0, y),
+                "width": width, "height": height}
+
+    result = {
+        "sig1": image_box(committee_labels[0], "sig1"),
+        "sig2": image_box(committee_labels[1], "sig2"),
+        "sig3": image_box(committee_labels[2], "sig3"),
+        "sig4": image_box(declaration, "sig4"),
+    }
+    # Stamp centered over the three committee signatures, as on the local
+    # cleaned form. Its vertical position follows the detected rows.
+    stamp_w = float(sizes["stamp"]["width"])
+    stamp_h = float(sizes["stamp"]["height"])
+    centers_x = [result[k]["x"] + result[k]["width"] / 2 for k in ("sig1", "sig2", "sig3")]
+    centers_y = [page_height - ((e["y0"] + e["y1"]) / 2) for e in committee_labels]
+    result["stamp"] = {
+        "x": max(2.0, min(page_width - stamp_w - 2.0, sum(centers_x) / 3 - stamp_w / 2)),
+        "y": max(2.0, min(page_height - stamp_h - 2.0, sum(centers_y) / 3 - stamp_h / 2)),
+        "width": stamp_w, "height": stamp_h,
+    }
+    log.info("Automatic MDT signature anchors detected from PDF text coordinates: "
+             f"committee={[round(e['y0'], 1) for e in committee_labels]}, "
+             f"declaration_y={round(declaration['y0'], 1)}")
+    return result
+
+
 def apply_signatures_and_stamp(mdt_pdf_bytes: bytes) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1702,13 +1817,27 @@ def apply_signatures_and_stamp(mdt_pdf_bytes: bytes) -> bytes:
         stamp_path = tmp / "stamp.png"
         stamp_img.save(stamp_path, "PNG")
 
+        sizes = {
+            **{cfg["file_key"]: {"width": cfg["width"], "height": cfg["height"]} for cfg in processed},
+            "stamp": {"width": STAMP["width"], "height": STAMP["height"]},
+        }
+        detected = _find_mdt_signature_positions(mdt_pdf_bytes, sizes)
+        if detected:
+            draw_positions = detected
+        else:
+            log.warning("Falling back to configured MDT signature coordinates; automatic anchors were incomplete.")
+            draw_positions = {cfg["file_key"]: {k: cfg[k] for k in ("x", "y", "width", "height")} for cfg in processed}
+            draw_positions["stamp"] = {k: STAMP[k] for k in ("x", "y", "width", "height")}
+
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=A4)
         for sig in processed:
-            can.drawImage(sig["processed_path"], sig["x"], sig["y"], width=sig["width"],
-                           height=sig["height"], mask="auto", preserveAspectRatio=True, anchor="sw")
-        can.drawImage(str(stamp_path), STAMP["x"], STAMP["y"], width=STAMP["width"],
-                       height=STAMP["height"], mask="auto", preserveAspectRatio=True, anchor="sw")
+            pos = draw_positions[sig["file_key"]]
+            can.drawImage(sig["processed_path"], pos["x"], pos["y"], width=pos["width"],
+                           height=pos["height"], mask="auto", preserveAspectRatio=True, anchor="sw")
+        pos = draw_positions["stamp"]
+        can.drawImage(str(stamp_path), pos["x"], pos["y"], width=pos["width"],
+                       height=pos["height"], mask="auto", preserveAspectRatio=True, anchor="sw")
         can.save()
         packet.seek(0)
 
