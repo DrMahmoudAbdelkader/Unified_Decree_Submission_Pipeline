@@ -1,0 +1,140 @@
+diff --git a/Unified_Decree_Submission_Pipeline.py b/Unified_Decree_Submission_Pipeline.py
+index 6006cf7..408ce32 100644
+--- a/Unified_Decree_Submission_Pipeline.py
++++ b/Unified_Decree_Submission_Pipeline.py
+@@ -285,6 +285,13 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
+ # Maximum time allowed for one authenticated MDT render.
+ RENDER_TIMEOUT_SECONDS = 90
+ 
++# Populated at runtime by decree_common._install_mdt_form_font() with the
++# local paths of the font downloaded from Supabase Storage (fonts/mdt_form_font.ttf
++# / mdt_form_font_bold.ttf). Left empty until then; render_print_page_to_pdf()
++# checks this dict itself rather than trusting OS-level fontconfig substitution
++# to have matched the family name correctly.
++MDT_FORM_FONT_PATHS: Dict[str, str] = {}
++
+ # Signature / stamp images.
+ SIGNATURE_FILES = {
+     "sig1": r"C:\Users\drmah\Template_Signatures\mdt1.png",
+@@ -1433,15 +1440,82 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
+                         f"between fetch and render. Will re-login and retry."
+                     )
+ 
+-                # Use the site's OWN print stylesheet - the same one applied
+-                # when you print this page manually from a browser.
++                # --- Font: NOTHING to do here anymore. fc-list in this
++                # run's own log already proves 'Tahoma' is correctly
++                # installed and visible to fontconfig (decree_common's
++                # fc-cache install worked). The @font-face injection that
++                # used to sit here was a mistake — it sampled
++                # document.body's computed font (legitimately "Times New
++                # Roman", the page's generic default, not what the MDT
++                # table itself asks for) and force-applied that name to
++                # EVERY element via `* { ... !important }`, overriding
++                # cells that were already correctly rendering in real
++                # Tahoma through plain fontconfig substitution. That's
++                # what produced the worse, more reflowed result — not a
++                # remaining font problem. Removed; trust the OS-level
++                # install, which is confirmed working.
++
++                # --- PAGE SIZE: measure the REAL rendered dimensions, but
++                # only after switching to print media — not before. This is
++                # the bug in the previous version of this fix: it measured
++                # scrollWidth in normal SCREEN layout, then emulated print
++                # media afterward, so the page.pdf() canvas was sized for a
++                # layout that no longer matched what actually rendered.
++                # Many of these older ASP.NET "print view" pages ship a
++                # genuinely different, narrower @media print stylesheet —
++                # switching media mode can reflow the whole page. Measuring
++                # in the wrong mode produces exactly what you saw: a
++                # narrower rendered form floating inside a canvas sized for
++                # the wider screen layout, with lines wrapping because the
++                # print-mode content doesn't actually fit the width we
++                # measured, which is also what pushed it onto a second page.
++                #
++                # Use the site's OWN print stylesheet FIRST - the same one
++                # applied when you print this page manually from a browser -
++                # then measure against what's actually on screen now.
+                 page.emulate_media(media="print")
+ 
+-                pdf_bytes = page.pdf(
+-                    format="A4",
++                try:
++                    dims = page.evaluate(
++                        "() => ({ "
++                        "w: Math.max(document.documentElement.scrollWidth, "
++                        "document.body ? document.body.scrollWidth : 0), "
++                        "h: Math.max(document.documentElement.scrollHeight, "
++                        "document.body ? document.body.scrollHeight : 0) "
++                        "})"
++                    )
++                    content_width_px = dims.get("w")
++                    content_height_px = dims.get("h")
++                except Exception:
++                    content_width_px = content_height_px = None
++                log.info(
++                    f"MDT print page measured content (in PRINT media, matching "
++                    f"what actually renders): {content_width_px}x{content_height_px}px"
++                )
++
++                pdf_kwargs = dict(
+                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
+                     print_background=True,
+                 )
++                if content_width_px and content_height_px:
++                    # 96 CSS px/in -> inches for page.pdf()'s width/height,
++                    # with a little slack (40px ~ the 5mm side margins
++                    # already requested above, doubled for both edges; plus
++                    # 60px vertical slack for the same top/bottom margins)
++                    # so nothing clips.
++                    width_in = (content_width_px + 40) / 96
++                    height_in = (content_height_px + 60) / 96
++                    log.info(
++                        f"Sizing the PDF page to {width_in:.2f}in x {height_in:.2f}in "
++                        f"to match the print-mode content exactly, instead of forcing "
++                        f"a fixed format that the content has to reflow to fit."
++                    )
++                    pdf_kwargs["width"] = f"{width_in:.2f}in"
++                    pdf_kwargs["height"] = f"{height_in:.2f}in"
++                else:
++                    pdf_kwargs["format"] = "A4"
++
++                pdf_bytes = page.pdf(**pdf_kwargs)
+             finally:
+                 browser.close()
+     except PWTimeoutError as exc:
+diff --git a/decree_common.py b/decree_common.py
+index c517697..024e2c0 100644
+--- a/decree_common.py
++++ b/decree_common.py
+@@ -114,6 +114,30 @@ def _install_mdt_form_font() -> None:
+             subprocess.run(["fc-cache", "-f", font_dir], check=False,
+                             capture_output=True)
+             log.info(f"Installed MDT-form font(s) into {font_dir}: {list(paths.values())}")
++            # Hand the real local paths straight to render_print_page_to_pdf()
++            # so it can inject an explicit @font-face itself (see that
++            # function's comment) instead of relying on fontconfig to have
++            # matched the file's internal name-table family against
++            # whatever family the SMC page's CSS actually asks for.
++            _pipeline_module.MDT_FORM_FONT_PATHS = paths
++            # One-shot diagnostic so a future run's log says definitively
++            # whether the font that landed on disk is actually named
++            # "Tahoma" (or whatever family the page wants) as far as
++            # fontconfig is concerned - if it isn't, that's exactly why a
++            # plain fc-cache install (no @font-face override) would still
++            # silently fall back, with nothing in the log to show why.
++            fc_check = subprocess.run(
++                ["fc-list", ":", "family"], check=False,
++                capture_output=True, text=True,
++            )
++            log.info(f"fc-list after install (fontconfig's view of available families):\n"
++                     f"{fc_check.stdout}")
++        else:
++            log.warning(
++                "fetch_mdt_form_font() returned no paths - MDT_FORM_FONT_PATHS stays "
++                "empty, render_print_page_to_pdf() will fall back to fontconfig "
++                "substitution and log a warning when it does."
++            )
+     except Exception as exc:
+         # Never let a font-install hiccup take down the whole run - the
+         # MDT form still renders, just with a fallback font.

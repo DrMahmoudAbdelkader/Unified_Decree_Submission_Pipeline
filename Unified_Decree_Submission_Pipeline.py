@@ -1455,47 +1455,63 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # --- PAGE WIDTH: this is the more likely actual cause of
-                # the persistent reflow/wrap (split dates, different
-                # layout) even with the font now correct. page.pdf() with
-                # format="A4" constrains layout to A4's printable width
-                # (~718px after 5mm margins). If the SMC print page's
-                # table is natively wider than that — a fixed desktop-
-                # width layout, which is common for older ASP.NET
-                # printable views — Chromium reflows/wraps it to fit,
-                # which looks exactly like "dates splitting" and "whole
-                # format different". Measure the page's real content
-                # width and size the PDF page to match it instead of
-                # forcing A4, so nothing has to reflow.
-                try:
-                    content_width_px = page.evaluate(
-                        "() => Math.max(document.documentElement.scrollWidth, "
-                        "document.body ? document.body.scrollWidth : 0)"
-                    )
-                except Exception:
-                    content_width_px = None
-                log.info(f"MDT print page measured content width: {content_width_px}px")
-
-                # Use the site's OWN print stylesheet - the same one applied
-                # when you print this page manually from a browser.
+                # --- PAGE SIZE: measure the REAL rendered dimensions, but
+                # only after switching to print media — not before. This is
+                # the bug in the previous version of this fix: it measured
+                # scrollWidth in normal SCREEN layout, then emulated print
+                # media afterward, so the page.pdf() canvas was sized for a
+                # layout that no longer matched what actually rendered.
+                # Many of these older ASP.NET "print view" pages ship a
+                # genuinely different, narrower @media print stylesheet —
+                # switching media mode can reflow the whole page. Measuring
+                # in the wrong mode produces exactly what you saw: a
+                # narrower rendered form floating inside a canvas sized for
+                # the wider screen layout, with lines wrapping because the
+                # print-mode content doesn't actually fit the width we
+                # measured, which is also what pushed it onto a second page.
+                #
+                # Use the site's OWN print stylesheet FIRST - the same one
+                # applied when you print this page manually from a browser -
+                # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
+
+                try:
+                    dims = page.evaluate(
+                        "() => ({ "
+                        "w: Math.max(document.documentElement.scrollWidth, "
+                        "document.body ? document.body.scrollWidth : 0), "
+                        "h: Math.max(document.documentElement.scrollHeight, "
+                        "document.body ? document.body.scrollHeight : 0) "
+                        "})"
+                    )
+                    content_width_px = dims.get("w")
+                    content_height_px = dims.get("h")
+                except Exception:
+                    content_width_px = content_height_px = None
+                log.info(
+                    f"MDT print page measured content (in PRINT media, matching "
+                    f"what actually renders): {content_width_px}x{content_height_px}px"
+                )
 
                 pdf_kwargs = dict(
                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
                     print_background=True,
                 )
-                if content_width_px and content_width_px > 900:
-                    # 96 CSS px/in -> convert to inches for page.pdf()'s width/
-                    # height args, with a little slack so nothing clips at
-                    # the edge.
+                if content_width_px and content_height_px:
+                    # 96 CSS px/in -> inches for page.pdf()'s width/height,
+                    # with a little slack (40px ~ the 5mm side margins
+                    # already requested above, doubled for both edges; plus
+                    # 60px vertical slack for the same top/bottom margins)
+                    # so nothing clips.
                     width_in = (content_width_px + 40) / 96
+                    height_in = (content_height_px + 60) / 96
                     log.info(
-                        f"MDT print page content is {content_width_px}px wide — "
-                        f"sizing the PDF page to {width_in:.2f}in instead of forcing "
-                        f"A4, so the table doesn't get reflowed to fit a narrower page."
+                        f"Sizing the PDF page to {width_in:.2f}in x {height_in:.2f}in "
+                        f"to match the print-mode content exactly, instead of forcing "
+                        f"a fixed format that the content has to reflow to fit."
                     )
                     pdf_kwargs["width"] = f"{width_in:.2f}in"
-                    pdf_kwargs["height"] = "16in"  # generous; content defines actual length
+                    pdf_kwargs["height"] = f"{height_in:.2f}in"
                 else:
                     pdf_kwargs["format"] = "A4"
 
