@@ -1544,13 +1544,27 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         let nowrapCells = 0;
                         const nowrapRe = /تاريخ|التوقيع|الوظيفة|اللجنة|\\d{1,4}[-\\/]\\d{1,2}|[٠-٩]{1,4}[-\\/][٠-٩]{1,2}/;
                         const dashRe = /-{5,}|_{5,}|ـ{5,}/;
+                        const protect = cell => {
+                            set(cell, 'white-space', 'nowrap');
+                            set(cell, 'word-break', 'normal');
+                            set(cell, 'overflow-wrap', 'normal');
+                            set(cell, 'overflow', 'visible');
+                            nowrapCells++;
+                        };
+                        for (const row of root.querySelectorAll('tr')) {
+                            const rowText = normalize(row.innerText);
+                            // Dates and dashed signature rows are often split
+                            // across several sibling cells. Protect the whole
+                            // row rather than only the cell containing the
+                            // Arabic label.
+                            if (nowrapRe.test(rowText) || dashRe.test(rowText)) {
+                                for (const cell of row.querySelectorAll('td, th')) protect(cell);
+                            }
+                        }
                         for (const cell of root.querySelectorAll('td, th')) {
                             const text = normalize(cell.innerText);
                             if (nowrapRe.test(text) || dashRe.test(text)) {
-                                set(cell, 'white-space', 'nowrap');
-                                set(cell, 'word-break', 'keep-all');
-                                set(cell, 'overflow', 'visible');
-                                nowrapCells++;
+                                protect(cell);
                             }
                         }
 
@@ -1601,7 +1615,12 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
                     print_background=True,
                     prefer_css_page_size=False,
-                    scale=1.0,
+                    # The widened HTML form is slightly taller than the
+                    # browser's printable A4 content box.  Keep the same
+                    # compact factor that previously kept the complete form
+                    # on one page; this scales the finished layout uniformly
+                    # and does not change its internal RTL geometry.
+                    scale=0.90,
                 )
                 pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
