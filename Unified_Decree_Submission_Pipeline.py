@@ -1549,39 +1549,63 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             parent = parent.parentElement;
                         }}
 
-                        // E. nowrap + min-width on date VALUE cells only.
-                        // Label cells identified by Arabic substring match
-                        // (covers both hamza variants: الإستمارة / الاستمارة).
+                        // E. Date rows: prevent date values from splitting.
+                        //
+                        // Root cause confirmed from logs: font IS Hacen Tunisia
+                        // (fontFamily: '"Hacen Tunisia"') so font metrics are
+                        // correct. The date still splits because the HTML table
+                        // sets an explicit pixel width on the value <td> that
+                        // is too narrow for the date string. nowrap alone does
+                        // not override an explicit width — the cell clips/wraps
+                        // at the fixed width boundary.
+                        //
+                        // Fix: remove the explicit width from the value cell
+                        // AND set min-width:160px + nowrap. Also set
+                        // overflow:visible so the content is never clipped.
+                        // Label cell gets max-width:55% + white-space:normal
+                        // so it keeps wrapping and doesn't expand the row.
                         const dateLabelSubstrings = [
                             '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
                             '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
                             '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0627\u0633\u062a\u0645\u0627\u0631\u0629',
                             '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
-                            '\u0627\u0644\u0639\u0645\u0631',
+                            '\u0627\u0644\u0639\u0645\u0631 (',
                         ];
+                        const isDateRow = row => {{
+                            const t = normalize(row.innerText);
+                            return dateLabelSubstrings.some(s => t.includes(s));
+                        }};
                         const isLabelCell = cell => {{
                             const t = normalize(cell.innerText);
                             return dateLabelSubstrings.some(s => t.includes(s));
                         }};
                         let nowrapCount = 0;
                         for (const row of root.querySelectorAll('tr')) {{
+                            if (!isDateRow(row)) continue;
                             const cells = [...row.querySelectorAll('td, th')];
                             if (cells.length < 2) continue;
-                            if (!cells.some(isLabelCell)) continue;
                             for (const cell of cells) {{
-                                if (isLabelCell(cell)) continue;
-                                // Value cell: nowrap + min-width for any font.
-                                // A date like "2024-01-15" is ~10 chars;
-                                // 120px is enough for any Arabic font at 16px.
-                                set(cell, 'white-space', 'nowrap');
-                                set(cell, 'word-break', 'normal');
-                                set(cell, 'overflow-wrap', 'normal');
-                                set(cell, 'min-width', '120px');
-                                for (const d of cell.querySelectorAll('*')) {{
-                                    set(d, 'white-space', 'nowrap');
-                                    set(d, 'word-break', 'normal');
+                                if (isLabelCell(cell)) {{
+                                    set(cell, 'max-width', '55%');
+                                    set(cell, 'white-space', 'normal');
+                                }} else {{
+                                    // Remove any explicit width the HTML sets
+                                    // on this cell — that is what causes the
+                                    // date to wrap despite nowrap being set.
+                                    cell.style.removeProperty('width');
+                                    set(cell, 'width', 'auto');
+                                    set(cell, 'min-width', '160px');
+                                    set(cell, 'white-space', 'nowrap');
+                                    set(cell, 'word-break', 'normal');
+                                    set(cell, 'overflow-wrap', 'normal');
+                                    set(cell, 'overflow', 'visible');
+                                    for (const d of cell.querySelectorAll('*')) {{
+                                        set(d, 'white-space', 'nowrap');
+                                        set(d, 'word-break', 'normal');
+                                        set(d, 'overflow', 'visible');
+                                    }}
+                                    nowrapCount++;
                                 }}
-                                nowrapCount++;
                             }}
                         }}
 
@@ -1768,17 +1792,28 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
     committee_labels = unique_rows[:3]
 
     # sig4 = the declaration/patient signature.
-    # The form has a row ABOVE the committee heading that contains exactly
-    # two التوقيع labels side by side:
-    #   - RIGHT side (larger x0 in PyMuPDF physical coords) = where sig4 goes
-    #   - LEFT side  (smaller x0) = the other signatory
     #
-    # Algorithm:
-    #   1. Collect all التوقيع labels strictly above the heading (y1 < header_y).
-    #   2. Group into visual rows (y0 within 8px of each other).
-    #   3. Take the row with the largest mean y0 (nearest row above the heading).
-    #   4. Within that row, take the label with the LARGEST x0 = rightmost
-    #      physically = right side of the RTL form = where sig4 belongs.
+    # CRITICAL FINDING from log analysis: PyMuPDF merges BOTH التوقيع
+    # labels in the declaration row into a SINGLE text entry spanning
+    # the full row width. Example from actual log:
+    #   x0=35.2  x1=511.1  text=')---(:التوقيع)---(:التوقيع'
+    # So "nearest_row" always has exactly 1 entry, not 2.
+    #
+    # The entry spans from the LEFT التوقيع (near x0) to the RIGHT
+    # التوقيع (near x1). The blank signature space for sig4 is to the
+    # RIGHT of the right-hand التوقيع label, between x1 and the right
+    # page edge.
+    #
+    # Geometry (from actual log, page_width=595.9pt):
+    #   entry x1 = 511.1  (right edge of right التوقيع label)
+    #   right page edge = 595.9 - 4 = 591.9
+    #   available gap = 591.9 - 511.1 = 80.8pt
+    #   sig4 width in PDF pts ≈ sizes[sig4][width] * scale * (595.9/794)
+    #   Place sig4 centred in that gap, or flush-right if too narrow.
+    #
+    # For the LEFT التوقيع (where the OTHER signatory goes, not sig4),
+    # the blank space is to the LEFT of x0=35.2 — but that’s outside
+    # the form area, so sig4 is definitely the RIGHT one.
     above_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
     if not above_labels:
         log.warning("sig4: no التوقيع labels found above the committee heading — "
@@ -1794,18 +1829,18 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
             row_groups[-1].append(e)
 
     nearest_row = max(row_groups, key=lambda grp: sum(e["y0"] for e in grp) / len(grp))
-    log.info(f"Declaration row ({len(nearest_row)} label(s), nearest above heading y={header_y:.1f}):")
+    log.info(f"Declaration row ({len(nearest_row)} entry/entries, "
+             f"nearest above heading y={header_y:.1f}):")
     for e in sorted(nearest_row, key=lambda e: e["x0"]):
-        log.info(f"  x0={e['x0']:.1f} x1={e['x1']:.1f} y0={e['y0']:.1f}")
+        log.info(f"  x0={e['x0']:.1f} x1={e['x1']:.1f} y0={e['y0']:.1f} "
+                 f"text={e['text'][:60]!r}")
 
-    # RIGHT-hand label = largest x0 in physical coords = right side of RTL form.
-    # sig4 blank space is between this label's x1 and the right page edge.
-    declaration = max(nearest_row, key=lambda e: e["x0"])
-    log.info(f"sig4 anchor chosen: x0={declaration['x0']:.1f} x1={declaration['x1']:.1f} "
-             f"y0={declaration['y0']:.1f} page_width={page_width:.1f}")
-    if len(nearest_row) < 2:
-        log.warning(f"sig4: expected 2 التوقيع labels in declaration row but found "
-                    f"{len(nearest_row)} — sig4 may be misplaced.")
+    # Use the entry with the largest x1 as the anchor — its x1 is the
+    # right edge of the right-hand التوقيع label regardless of whether
+    # PyMuPDF split the row into 1 or 2 entries.
+    declaration = max(nearest_row, key=lambda e: e["x1"])
+    log.info(f"sig4 anchor: x1={declaration['x1']:.1f} y0={declaration['y0']:.1f} "
+             f"page_width={page_width:.1f}")
 
     gap = 4.0
 
@@ -1820,11 +1855,10 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         return {"x": min(x, page_width - width - 2.0), "y": max(2.0, y),
                 "width": width, "height": height}
 
-    def image_box_between_label_and_right_edge(label, key):
-        """sig4: blank space is between the right-hand التوقيع label and
-        the right page edge (larger x in physical coords).
-        Centre the image in that gap; if the gap is too narrow, place
-        flush against the right edge."""
+    def image_box_right_of_declaration(label, key):
+        """sig4: blank space is to the RIGHT of the right-hand التوقيع
+        label, between label.x1 and the right page edge.
+        Centre the image in that gap; if too narrow, place flush-right."""
         width = float(sizes[key]["width"])
         height = float(sizes[key]["height"])
         right_edge = page_width - 4.0
@@ -1833,13 +1867,13 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         if available >= width:
             x = gap_start + (available - width) / 2.0
         else:
-            # Gap too narrow — place flush against right edge.
-            x = right_edge - width
+            x = max(gap_start, right_edge - width)
         cy = (label["y0"] + label["y1"]) / 2.0
         y = page_height - cy - height / 2.0
         log.info(f"  {key}: x={x:.1f} y={y:.1f} "
-                 f"(between label x1={label['x1']:.1f} and right_edge={right_edge:.1f}, "
-                 f"available={available:.1f}, width={width:.1f})")
+                 f"(right of label x1={label['x1']:.1f}, "
+                 f"right_edge={right_edge:.1f}, available={available:.1f}pt, "
+                 f"width={width:.1f}pt)")
         return {"x": max(2.0, min(x, page_width - width - 2.0)), "y": max(2.0, y),
                 "width": width, "height": height}
 
@@ -1847,7 +1881,7 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         "sig1": image_box_left_of_label(committee_labels[0], "sig1"),
         "sig2": image_box_left_of_label(committee_labels[1], "sig2"),
         "sig3": image_box_left_of_label(committee_labels[2], "sig3"),
-        "sig4": image_box_between_label_and_right_edge(declaration, "sig4"),
+        "sig4": image_box_right_of_declaration(declaration, "sig4"),
     }
     # Stamp centered over the three committee signatures, as on the local
     # cleaned form. Its vertical position follows the detected rows.
