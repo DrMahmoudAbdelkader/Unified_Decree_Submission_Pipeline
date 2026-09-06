@@ -1461,154 +1461,158 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # remaining font problem. Removed; trust the OS-level
                 # install, which is confirmed working.
 
-                # ----------------------------------------------------------------
-                # DEFINITIVE LAYOUT FIX — based on the actual API HTML response.
+                # --- PAGE SIZE: measure the REAL rendered dimensions, but
+                # only after switching to print media — not before. This is
+                # the bug in the previous version of this fix: it measured
+                # scrollWidth in normal SCREEN layout, then emulated print
+                # media afterward, so the page.pdf() canvas was sized for a
+                # layout that no longer matched what actually rendered.
+                # Many of these older ASP.NET "print view" pages ship a
+                # genuinely different, narrower @media print stylesheet —
+                # switching media mode can reflow the whole page. Measuring
+                # in the wrong mode produces exactly what you saw: a
+                # narrower rendered form floating inside a canvas sized for
+                # the wider screen layout, with lines wrapping because the
+                # print-mode content doesn't actually fit the width we
+                # measured, which is also what pushed it onto a second page.
                 #
-                # What the original page CSS actually says (confirmed from HTML):
-                #   body  { background-color: gray }          <- gray surround
-                #   .page { width: 210mm;                     <- form width
-                #            min-height: 297mm;               <- A4 height floor
-                #            padding: 10px;                   <- inner padding
-                #            margin: 10mm auto;               <- centred + top gap
-                #            background-color: white; }       <- white form bg
-                #   font-family: 'Hacen Tunisia'              <- on .page inline
-                #   No @page CSS rule exists in the HTML at all.
-                #
-                # Problems caused by previous JS overrides:
-                #   1. min-height:0  -> form loses A4 height, content overflows
-                #      onto page 2 when Chromium adds its own page breaks.
-                #   2. margin-top:0  -> correct visually but the gray body
-                #      background still bleeds into the PDF top margin area.
-                #   3. nowrap on ALL cells in date rows -> label cells contain
-                #      long Arabic text that was wrapping naturally; forcing
-                #      nowrap on them inflates row height, pushing form to 2 pages.
-                #   4. box-sizing:border-box + width:210mm -> double-counts the
-                #      10px padding, making the form fractionally wider.
-                #   5. prefer_css_page_size=True with no @page rule -> no effect,
-                #      but scale=1.0 with the gray body margin means the PDF
-                #      canvas includes the gray surround.
-                #
-                # Correct approach:
-                #   A. Strip body/html background-color so the PDF canvas is
-                #      white (no gray bleed).
-                #   B. Remove .page margin (10mm auto) so the white form sits
-                #      flush at the top-left of the A4 PDF canvas.
-                #   C. Remove .page min-height so the form's natural content
-                #      height drives the output — if content fits in one A4
-                #      page it stays one page; Chromium won't add a blank page
-                #      to fill 297mm.
-                #   D. Fix Bootstrap wrapper overflow/max-width that clips form.
-                #   E. nowrap ONLY on date VALUE cells — the td that holds the
-                #      actual date string, NOT the label td. Identified by
-                #      checking which cell does NOT contain the field-name regex.
-                #   F. page.pdf(): format=A4, zero margins, scale=1.0,
-                #      prefer_css_page_size=False (no @page rule to honour).
-                #      print_background=True to keep table borders/shading.
-                # ----------------------------------------------------------------
+                # Use the site's OWN print stylesheet FIRST - the same one
+                # applied when you print this page manually from a browser -
+                # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
 
+                # The portal's actual HTML defines .page as 210mm plus 10px
+                # padding, with the default content-box model.  That makes
+                # the white form wider than A4 and is the source of the
+                # apparent right blank area/left clipping in Chromium.  Use
+                # the real root and the real table structure; do not flatten
+                # every nested table to 100%.
                 layout_result = page.evaluate(
                     """() => {
-                        const set = (el, prop, val) =>
-                            el.style.setProperty(prop, val, 'important');
-                        const normalize = s =>
-                            (s || '').replace(/\\s+/g, ' ').trim();
+                        const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+                        const root = document.querySelector('.form-horizontal.page') || document.querySelector('.page');
+                        if (!root) return {changed: false, reason: 'mdt-page-root-not-found'};
+                        const before = root.getBoundingClientRect();
+                        const set = (el, name, value) => el.style.setProperty(name, value, 'important');
 
-                        // A. Kill gray body/html background so PDF is white.
-                        set(document.documentElement, 'background-color', 'white');
-                        set(document.body, 'background-color', 'white');
-                        set(document.body, 'margin', '0');
-                        set(document.body, 'padding', '0');
-
-                        // B+C. Find .page and remove only margin + min-height.
-                        // Leave width(210mm), padding(10px), background(white),
-                        // font-family, direction — all untouched.
-                        const root = document.querySelector('.form-horizontal.page')
-                                  || document.querySelector('.page');
-                        if (!root) return {ok: false, reason: 'page-root-not-found'};
-
-                        set(root, 'margin', '0');
-                        set(root, 'min-height', '0');
-                        // Keep height:auto so content drives the height.
+                        // Fit exactly inside the A4 CSS page box. The site
+                        // has padding:10px and the default content-box model;
+                        // border-box prevents the padding from overflowing.
+                        set(root, 'box-sizing', 'border-box');
+                        set(root, 'width', '210mm');
+                        set(root, 'min-width', '0');
+                        set(root, 'max-width', '210mm');
                         set(root, 'height', 'auto');
+                        set(root, 'min-height', '0');
+                        set(root, 'padding', '10px');
+                        set(root, 'margin-left', 'auto');
+                        set(root, 'margin-right', 'auto');
+                        set(root, 'margin-top', '0');
+                        set(root, 'margin-bottom', '0');
+                        set(root, 'direction', 'rtl');
+                        set(root, 'font-family', "'Hacen Tunisia', sans-serif");
+                        set(root, 'overflow', 'visible');
 
-                        // D. Remove Bootstrap wrapper overflow/max-width clipping.
+                        // Keep the site's table/colspan geometry intact. Only
+                        // remove accidental overflow from the Bootstrap
+                        // wrappers; do not rewrite widths or table-layout.
                         let parent = root.parentElement;
                         let levels = 0;
-                        while (parent && parent !== document.body && levels++ < 8) {
+                        while (parent && parent !== document.body && levels++ < 4) {
                             set(parent, 'overflow', 'visible');
                             set(parent, 'max-width', 'none');
-                            set(parent, 'width', 'auto');
-                            set(parent, 'margin', '0');
-                            set(parent, 'padding', '0');
                             parent = parent.parentElement;
                         }
 
-                        // E. nowrap on date VALUE cells only.
-                        //
-                        // The form has two date rows:
-                        //   - "تاريخ تسجيل الإستمارة" (form registration date)
-                        //   - "العمر (تاريخ الميلاد)"  (age / birthdate)
-                        // Each row has a label cell and a value cell. We must
-                        // apply nowrap ONLY to the value cell, not the label.
-                        //
-                        // Strategy: match on partial substrings that are robust
-                        // to font/encoding variation in innerText extraction.
-                        // A cell is a LABEL cell if it contains any of these
-                        // Arabic substrings. Every other cell in the same row
-                        // is a VALUE cell and gets nowrap.
-                        const dateLabelSubstrings = [
-                            '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
-                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
-                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0627\u0633\u062a\u0645\u0627\u0631\u0629',
-                            '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
-                            '\u0627\u0644\u0639\u0645\u0631',
-                        ];
-                        const isLabelCell = cell => {
-                            const t = normalize(cell.innerText);
-                            return dateLabelSubstrings.some(s => t.includes(s));
-                        };
-                        const protectValueCell = cell => {
+                        let nowrapCells = 0;
+                        const dateRe = /تاريخ تسجيل الإستمارة|العمر\\s*\\(تاريخ الميلاد\\)/;
+                        const protect = cell => {
                             set(cell, 'white-space', 'nowrap');
                             set(cell, 'word-break', 'normal');
                             set(cell, 'overflow-wrap', 'normal');
-                            for (const d of cell.querySelectorAll('*')) {
-                                set(d, 'white-space', 'nowrap');
-                                set(d, 'word-break', 'normal');
+                            set(cell, 'overflow', 'visible');
+                            for (const descendant of cell.querySelectorAll('*')) {
+                                set(descendant, 'white-space', 'nowrap');
+                                set(descendant, 'word-break', 'normal');
+                                set(descendant, 'overflow-wrap', 'normal');
                             }
+                            nowrapCells++;
                         };
-                        let nowrapCount = 0;
+                        // Patient date rows: protect the complete value cell
+                        // and its spans, without making declaration paragraphs
+                        // globally nowrap.
                         for (const row of root.querySelectorAll('tr')) {
-                            const cells = [...row.querySelectorAll('td, th')];
-                            if (cells.length < 2) continue;
-                            if (!cells.some(isLabelCell)) continue;
-                            for (const cell of cells) {
-                                if (isLabelCell(cell)) continue;
-                                protectValueCell(cell);
-                                nowrapCount++;
+                            const rowText = normalize(row.innerText);
+                            if (dateRe.test(rowText)) {
+                                for (const cell of row.querySelectorAll('td, th'))
+                                    protect(cell);
                             }
                         }
 
-                        const r = root.getBoundingClientRect();
+                        // The committee signature table is the first table in
+                        // the box whose rows contain both الوظيفة and التوقيع.
+                        const committeeBox = [...root.querySelectorAll('div')]
+                            .find(el => normalize(el.innerText).includes('تقرير اللجنة الثلاثية المتخصصة'));
+                        let committeeRows = 0;
+                        if (committeeBox) {
+                            const signatureTable = [...committeeBox.querySelectorAll('table')]
+                                .find(t => normalize(t.innerText).includes('التوقيع'));
+                            if (signatureTable) {
+                                for (const row of [...signatureTable.querySelectorAll('tr')].slice(0, 3)) {
+                                    const cells = row.querySelectorAll('td, th');
+                                    if (cells.length) protect(cells[cells.length - 1]);
+                                    committeeRows++;
+                                }
+                            }
+                        }
+
+                        const after = root.getBoundingClientRect();
                         return {
-                            ok: true,
-                            nowrapCount,
-                            formWidth:  Math.round(r.width),
-                            formHeight: Math.round(r.height),
-                            direction:  getComputedStyle(root).direction,
-                            fontFamily: getComputedStyle(root).fontFamily,
+                            changed: true, committeeRows, nowrapCells,
+                            tag: root.tagName, id: root.id || '',
+                            before: {left: Math.round(before.left), width: Math.round(before.width)},
+                            after: {left: Math.round(after.left), right: Math.round(after.right),
+                                    width: Math.round(after.width), height: Math.round(after.height)},
+                            direction: getComputedStyle(root).direction
                         };
                     }""",
                 )
-                log.info(f"MDT layout fixup result: {layout_result}")
+                log.info(f"MDT targeted form layout result: {layout_result}")
 
-                # F. Export: A4 canvas, zero PDF margins (the form's own
-                # padding:10px provides the inner whitespace), scale=1.0,
-                # prefer_css_page_size=False (no @page rule in the HTML).
+                try:
+                    dims = page.evaluate(
+                        "() => ({ "
+                        "w: Math.max(document.documentElement.scrollWidth, "
+                        "document.body ? document.body.scrollWidth : 0), "
+                        "h: Math.max(document.documentElement.scrollHeight, "
+                        "document.body ? document.body.scrollHeight : 0) "
+                        "})"
+                    )
+                    content_width_px = dims.get("w")
+                    content_height_px = dims.get("h")
+                except Exception:
+                    content_width_px = content_height_px = None
+                log.info(
+                    f"MDT print page measured content (in PRINT media, matching "
+                    f"what actually renders): {content_width_px}x{content_height_px}px"
+                )
+
+                # The reference MDT is an A4 PDF. Do not turn measured DOM
+                # dimensions into a giant custom paper canvas: that was the
+                # source of the 961.92 x 996 pt output and the useless second
+                # page. Measurements are diagnostics only; the form itself
+                # has already been widened above.
+                log.info(
+                    f"MDT render geometry after form widening: "
+                    f"{content_width_px}x{content_height_px}px; exporting on A4"
+                )
                 pdf_kwargs = dict(
                     format="A4",
-                    margin={"top": "0mm", "bottom": "0mm",
-                            "left": "0mm", "right": "0mm"},
+                    # The supplied HTML explicitly declares @page margin:0.
+                    # The previous 5mm Playwright margins reduced the
+                    # printable box while the .page remained 210mm wide,
+                    # producing the exact left clip/right blank symptom.
+                    margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"},
                     print_background=True,
                     prefer_css_page_size=False,
                     scale=1.0,
@@ -1741,42 +1745,16 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         return None
     committee_labels = unique_rows[:3]
 
-    # sig4 = the declaration/patient signature, which sits in a row ABOVE
-    # the committee heading. That row contains exactly two التوقيع labels
-    # side by side (one on the right, one on the left of the form).
-    # sig4 must go under the RIGHT-HAND one (largest x0 in PyMuPDF coords,
-    # which map left=0 → right=page_width regardless of RTL text direction).
-    #
-    # Algorithm:
-    #   1. Collect all التوقيع labels strictly above the heading (y1 < header_y).
-    #   2. Group into visual rows (labels whose y0 values are within 8px).
-    #   3. Pick the row whose y0 is closest to header_y (nearest row above it).
-    #   4. Within that row, pick the label with the largest x0 (rightmost).
-    above_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
-    if not above_labels:
+    declaration_labels = [e for e in entries if is_signature(e) and
+                          header_y - 145 <= e["y1"] < header_y]
+    if len(declaration_labels) < 2:
+        declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    if not declaration_labels:
         return None
-
-    # Group by visual row.
-    above_labels_sorted = sorted(above_labels, key=lambda e: e["y0"])
-    row_groups: List[List[Dict]] = []
-    for e in above_labels_sorted:
-        if not row_groups or abs(e["y0"] - row_groups[-1][0]["y0"]) > 8:
-            row_groups.append([e])
-        else:
-            row_groups[-1].append(e)
-
-    # Row closest to the committee heading = largest mean y0.
-    nearest_row = max(row_groups, key=lambda grp: sum(e["y0"] for e in grp) / len(grp))
-
-    # Rightmost label in that row = largest x0.
-    declaration = max(nearest_row, key=lambda e: e["x0"])
-    log.info(f"sig4 anchor: x0={declaration['x0']:.1f} y0={declaration['y0']:.1f} "
-             f"(row had {len(nearest_row)} label(s), picked rightmost)")
-    if len(nearest_row) < 2:
-        log.warning("sig4: expected 2 التوقيع labels in declaration row but found "
-                    f"{len(nearest_row)} — sig4 may be misplaced; check the output PDF.")
-    if not above_labels:
-        return None
+    # PDF coordinates increase from left to right. The visually right-hand
+    # declaration label therefore has the larger x coordinate; use the
+    # nearest label to the right side of the declaration row explicitly.
+    declaration = max(declaration_labels, key=lambda e: e["x0"])
 
     gap = 3.0
 
