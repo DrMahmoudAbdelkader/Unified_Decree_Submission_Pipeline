@@ -286,7 +286,7 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 # The supplied local reference's visible form block is approximately 600 CSS
 # px in Chromium's 96-DPI CSS coordinate system.  Keeping this below the full
 # A4 content width preserves the reference's balanced outer margins.
-MDT_FORM_CONTENT_WIDTH_PX = 600
+MDT_FORM_CONTENT_WIDTH_PX = 575
 
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
@@ -1514,7 +1514,8 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             ['box-sizing', 'border-box'], ['margin-left', 'auto'],
                             ['margin-right', 'auto'], ['left', 'auto'], ['right', 'auto'],
                             ['transform', 'none'], ['overflow', 'visible'],
-                            ['position', 'relative']
+                            ['position', 'static'], ['display', 'table'],
+                            ['float', 'none']
                         ]) set(root, name, value);
                         root.removeAttribute('width');
 
@@ -1528,6 +1529,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             set(parent, 'left', 'auto');
                             set(parent, 'right', 'auto');
                             set(parent, 'transform', 'none');
+                            set(parent, 'text-align', 'center');
                             parent.removeAttribute('width');
                             parent = parent.parentElement;
                         }
@@ -1539,6 +1541,8 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             set(table, 'max-width', 'none');
                             set(table, 'table-layout', 'auto');
                             set(table, 'box-sizing', 'border-box');
+                            set(table, 'margin-left', 'auto');
+                            set(table, 'margin-right', 'auto');
                             table.removeAttribute('width');
                             nestedTables++;
                         }
@@ -1565,7 +1569,11 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             // row rather than only the cell containing the
                             // Arabic label.
                             if (nowrapRe.test(rowText) || dashRe.test(rowText)) {
-                                for (const cell of row.querySelectorAll('td, th')) protect(cell);
+                                for (const cell of row.querySelectorAll('td, th')) {
+                                    protect(cell);
+                                    set(cell, 'min-width', 'max-content');
+                                    set(cell, 'width', 'auto');
+                                }
                             }
                         }
                         for (const cell of root.querySelectorAll('td, th')) {
@@ -1757,9 +1765,15 @@ def _find_mdt_signature_positions(mdt_pdf_bytes: bytes, sizes: Dict[str, float])
         return None
     committee_labels = unique_rows[:3]
 
-    declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
+    declaration_labels = [e for e in entries if is_signature(e) and
+                          header_y - 145 <= e["y1"] < header_y]
+    if len(declaration_labels) < 2:
+        declaration_labels = [e for e in entries if is_signature(e) and e["y1"] < header_y]
     if not declaration_labels:
         return None
+    # PDF coordinates increase from left to right. The visually right-hand
+    # declaration label therefore has the larger x coordinate; use the
+    # nearest label to the right side of the declaration row explicitly.
     declaration = max(declaration_labels, key=lambda e: e["x0"])
 
     gap = 3.0
