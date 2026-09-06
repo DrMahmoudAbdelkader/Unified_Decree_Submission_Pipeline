@@ -1475,6 +1475,59 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
 
+                # --- WIDEN THE ACTUAL CONTENT BOX, not just the PDF canvas.
+                # page.pdf({width, height}) only sets the output PAPER size -
+                # it does NOT stretch content that has a hard-coded pixel
+                # width in the page's own CSS. If the SMC print page's table
+                # is set to something like width:600px in its stylesheet,
+                # giving it a bigger PDF page just adds blank space around
+                # that same 600px block; the box itself never grows - which
+                # is exactly the "wider canvas, same narrow printed area"
+                # result. Since the page's HTML/CSS isn't ours to see ahead
+                # of time (it's behind auth), find every hard-coded pixel
+                # width in a plausible range for this kind of form
+                # container/table and add real width to it directly, in
+                # both external/inline stylesheet rules and inline
+                # style="width:...px" attributes - not just the surrounding
+                # page. +55px targets the ~600px -> ~650px gap measured
+                # against the local render.
+                try:
+                    widened = page.evaluate(
+                        "(extra) => { "
+                        "let count = 0; "
+                        "const bump = (w) => { "
+                        "  const m = /^([0-9.]+)px$/.exec(w || ''); "
+                        "  if (!m) return null; "
+                        "  const val = parseFloat(m[1]); "
+                        "  if (val < 300 || val > 900) return null; "
+                        "  return (val + extra) + 'px'; "
+                        "}; "
+                        "for (const sheet of document.styleSheets) { "
+                        "  let rules; "
+                        "  try { rules = sheet.cssRules; } catch (e) { continue; } "
+                        "  for (const rule of rules) { "
+                        "    if (rule.style && rule.style.width) { "
+                        "      const nw = bump(rule.style.width); "
+                        "      if (nw) { rule.style.width = nw; count++; } "
+                        "    } "
+                        "  } "
+                        "} "
+                        "document.querySelectorAll('[style*=\"width\"]').forEach(el => { "
+                        "  const nw = bump(el.style.width); "
+                        "  if (nw) { el.style.width = nw; count++; } "
+                        "}); "
+                        "return count; "
+                        "}",
+                        55,
+                    )
+                    log.info(
+                        f"Widened {widened} hard-coded pixel-width rule(s)/element(s) "
+                        f"by 55px each, targeting the ~600px->~650px content gap."
+                    )
+                except Exception as widen_exc:
+                    log.warning(f"Content-width widening failed ({widen_exc}) - "
+                                f"continuing without it.")
+
                 try:
                     dims = page.evaluate(
                         "() => ({ "
@@ -1489,8 +1542,8 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 except Exception:
                     content_width_px = content_height_px = None
                 log.info(
-                    f"MDT print page measured content (in PRINT media, matching "
-                    f"what actually renders): {content_width_px}x{content_height_px}px"
+                    f"MDT print page measured content AFTER widening: "
+                    f"{content_width_px}x{content_height_px}px"
                 )
 
                 pdf_kwargs = dict(
