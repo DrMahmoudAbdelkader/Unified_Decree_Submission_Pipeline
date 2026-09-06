@@ -282,6 +282,10 @@ MEDICAL_REPORT_TEMPLATE = Path(r"D:\MDT_Medical_Report_Template\medical_report_t
 # (WKHTMLTOPDF_PATH removed - MDT print rendering now uses Playwright/
 #  Chromium; see render_print_page_to_pdf(). Run "playwright install
 #  chromium" once after "pip install playwright".)
+# Width of the actual MDT form block, not the PDF paper canvas.
+# The supplied local reference is approximately 650 CSS px wide.
+MDT_FORM_CONTENT_WIDTH_PX = 650
+
 # Maximum time allowed for one authenticated MDT render.
 RENDER_TIMEOUT_SECONDS = 90
 
@@ -1475,58 +1479,51 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 # then measure against what's actually on screen now.
                 page.emulate_media(media="print")
 
-                # --- WIDEN THE ACTUAL CONTENT BOX, not just the PDF canvas.
-                # page.pdf({width, height}) only sets the output PAPER size -
-                # it does NOT stretch content that has a hard-coded pixel
-                # width in the page's own CSS. If the SMC print page's table
-                # is set to something like width:600px in its stylesheet,
-                # giving it a bigger PDF page just adds blank space around
-                # that same 600px block; the box itself never grows - which
-                # is exactly the "wider canvas, same narrow printed area"
-                # result. Since the page's HTML/CSS isn't ours to see ahead
-                # of time (it's behind auth), find every hard-coded pixel
-                # width in a plausible range for this kind of form
-                # container/table and add real width to it directly, in
-                # both external/inline stylesheet rules and inline
-                # style="width:...px" attributes - not just the surrounding
-                # page. +55px targets the ~600px -> ~650px gap measured
-                # against the local render.
-                try:
-                    widened = page.evaluate(
-                        "(extra) => { "
-                        "let count = 0; "
-                        "const bump = (w) => { "
-                        "  const m = /^([0-9.]+)px$/.exec(w || ''); "
-                        "  if (!m) return null; "
-                        "  const val = parseFloat(m[1]); "
-                        "  if (val < 300 || val > 900) return null; "
-                        "  return (val + extra) + 'px'; "
-                        "}; "
-                        "for (const sheet of document.styleSheets) { "
-                        "  let rules; "
-                        "  try { rules = sheet.cssRules; } catch (e) { continue; } "
-                        "  for (const rule of rules) { "
-                        "    if (rule.style && rule.style.width) { "
-                        "      const nw = bump(rule.style.width); "
-                        "      if (nw) { rule.style.width = nw; count++; } "
-                        "    } "
-                        "  } "
-                        "} "
-                        "document.querySelectorAll('[style*=\"width\"]').forEach(el => { "
-                        "  const nw = bump(el.style.width); "
-                        "  if (nw) { el.style.width = nw; count++; } "
-                        "}); "
-                        "return count; "
-                        "}",
-                        55,
-                    )
-                    log.info(
-                        f"Widened {widened} hard-coded pixel-width rule(s)/element(s) "
-                        f"by 55px each, targeting the ~600px->~650px content gap."
-                    )
-                except Exception as widen_exc:
-                    log.warning(f"Content-width widening failed ({widen_exc}) - "
-                                f"continuing without it.")
+                # page.pdf(width=...) enlarges only the paper canvas. It does
+                # not enlarge a narrow table/container inside that canvas.
+                # Widen the largest plausible MDT form container after print
+                # CSS is active and before measuring the rendered dimensions.
+                widen_result = page.evaluate(
+                    """(targetWidth) => {
+                        const candidates = [];
+                        for (const el of document.querySelectorAll('body *')) {
+                            const tag = el.tagName.toLowerCase();
+                            if (!['table', 'form', 'main', 'section', 'article', 'div'].includes(tag)) continue;
+                            const r = el.getBoundingClientRect();
+                            const cs = getComputedStyle(el);
+                            if (r.width < 560 || r.width > 630 || r.height < 120) continue;
+                            if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                            candidates.push({el, width: r.width, area: r.width * r.height});
+                        }
+                        if (!candidates.length) return {changed: false, candidates: 0};
+                        candidates.sort((a, b) => b.area - a.area);
+                        const chosen = candidates[0].el;
+                        const before = chosen.getBoundingClientRect().width;
+                        const css = `width:${targetWidth}px !important;` +
+                                    `min-width:${targetWidth}px !important;` +
+                                    `max-width:${targetWidth}px !important;` +
+                                    `box-sizing:border-box !important;`;
+                        chosen.style.cssText += ';' + css;
+                        if (chosen.hasAttribute('width')) chosen.setAttribute('width', String(targetWidth));
+                        let parent = chosen.parentElement;
+                        let levels = 0;
+                        while (parent && parent !== document.body && levels < 4) {
+                            const pr = parent.getBoundingClientRect();
+                            if (pr.width >= 560 && pr.width <= 630) {
+                                parent.style.cssText += ';' + css;
+                                if (parent.hasAttribute('width')) parent.setAttribute('width', String(targetWidth));
+                            }
+                            parent = parent.parentElement;
+                            levels++;
+                        }
+                        const after = chosen.getBoundingClientRect().width;
+                        return {changed: after > before + 1, candidates: candidates.length,
+                                before: Math.round(before), after: Math.round(after),
+                                tag: chosen.tagName, id: chosen.id || ''};
+                    }""",
+                    MDT_FORM_CONTENT_WIDTH_PX,
+                )
+                log.info(f"MDT actual form-container widening result: {widen_result}")
 
                 try:
                     dims = page.evaluate(
@@ -1542,32 +1539,26 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 except Exception:
                     content_width_px = content_height_px = None
                 log.info(
-                    f"MDT print page measured content AFTER widening: "
-                    f"{content_width_px}x{content_height_px}px"
+                    f"MDT print page measured content (in PRINT media, matching "
+                    f"what actually renders): {content_width_px}x{content_height_px}px"
                 )
 
+                # The reference MDT is an A4 PDF. Do not turn measured DOM
+                # dimensions into a giant custom paper canvas: that was the
+                # source of the 961.92 x 996 pt output and the useless second
+                # page. Measurements are diagnostics only; the form itself
+                # has already been widened above.
+                log.info(
+                    f"MDT render geometry after form widening: "
+                    f"{content_width_px}x{content_height_px}px; exporting on A4"
+                )
                 pdf_kwargs = dict(
+                    format="A4",
                     margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
                     print_background=True,
+                    prefer_css_page_size=False,
+                    scale=0.90,
                 )
-                if content_width_px and content_height_px:
-                    # 96 CSS px/in -> inches for page.pdf()'s width/height,
-                    # with a little slack (40px ~ the 5mm side margins
-                    # already requested above, doubled for both edges; plus
-                    # 60px vertical slack for the same top/bottom margins)
-                    # so nothing clips.
-                    width_in = (content_width_px + 40) / 96
-                    height_in = (content_height_px + 60) / 96
-                    log.info(
-                        f"Sizing the PDF page to {width_in:.2f}in x {height_in:.2f}in "
-                        f"to match the print-mode content exactly, instead of forcing "
-                        f"a fixed format that the content has to reflow to fit."
-                    )
-                    pdf_kwargs["width"] = f"{width_in:.2f}in"
-                    pdf_kwargs["height"] = f"{height_in:.2f}in"
-                else:
-                    pdf_kwargs["format"] = "A4"
-
                 pdf_bytes = page.pdf(**pdf_kwargs)
             finally:
                 browser.close()
