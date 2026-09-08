@@ -1549,62 +1549,64 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                             parent = parent.parentElement;
                         }}
 
-                        // E. Date rows: prevent date values from splitting.
+                        // E. Prevent date strings (digit runs joined by
+                        // hyphens, e.g. "2026-09-07") from line-breaking,
+                        // WITHOUT touching any width/table-layout property.
                         //
-                        // Root cause (confirmed from logs): scrollHeight stays
-                        // 1207px across runs, proving the JS runs but the date
-                        // still splits. The form tables use table-layout:fixed
-                        // with widths on <col> elements. Removing width from
-                        // <td> has no effect under fixed layout. Fix: switch
-                        // the parent table to table-layout:auto and clear all
-                        // <col> widths so the browser recalculates column
-                        // widths from content, then set nowrap+min-width on
-                        // the value cell.
-                        const dateLabelSubstrings = [
-                            '\u062a\u0627\u0631\u064a\u062e \u062a\u0633\u062c\u064a\u0644',
-                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0625\u0633\u062a\u0645\u0627\u0631\u0629',
-                            '\u062a\u0633\u062c\u064a\u0644 \u0627\u0644\u0627\u0633\u062a\u0645\u0627\u0631\u0629',
-                            '\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0645\u064a\u0644\u0627\u062f',
-                            '\u0627\u0644\u0639\u0645\u0631 (',
-                        ];
-                        const isDateRow = row => dateLabelSubstrings.some(
-                            s => normalize(row.innerText).includes(s)
-                        );
-                        const isLabelCell = cell => dateLabelSubstrings.some(
-                            s => normalize(cell.innerText).includes(s)
-                        );
-                        let nowrapCount = 0;
-                        for (const row of root.querySelectorAll('tr')) {{
-                            if (!isDateRow(row)) continue;
-                            const cells = [...row.querySelectorAll('td, th')];
-                            if (cells.length < 2) continue;
-                            // Switch parent table to auto layout and clear
-                            // all <col> fixed widths.
-                            const tbl = row.closest('table');
-                            if (tbl) {{
-                                set(tbl, 'table-layout', 'auto');
-                                for (const col of tbl.querySelectorAll('col'))
-                                    set(col, 'width', 'auto');
-                            }}
-                            for (const cell of cells) {{
-                                if (isLabelCell(cell)) {{
-                                    set(cell, 'white-space', 'normal');
-                                    set(cell, 'width', 'auto');
-                                    set(cell, 'max-width', '60%');
-                                }} else {{
-                                    set(cell, 'white-space', 'nowrap');
-                                    set(cell, 'word-break', 'normal');
-                                    set(cell, 'overflow-wrap', 'normal');
-                                    set(cell, 'overflow', 'visible');
-                                    set(cell, 'width', 'auto');
-                                    set(cell, 'min-width', '160px');
-                                    for (const d of cell.querySelectorAll('*')) {{
-                                        set(d, 'white-space', 'nowrap');
-                                        set(d, 'word-break', 'normal');
-                                        set(d, 'overflow', 'visible');
-                                    }}
-                                    nowrapCount++;
+                        // Root cause: a hyphen is a normal soft line-break
+                        // opportunity in CSS text layout even with no
+                        // surrounding whitespace, so a date can split right
+                        // after a "-" regardless of column width. Earlier
+                        // attempts forced min-width/table-layout:auto on the
+                        // whole date cell to "make room" for the date - but
+                        // that stole width from the neighbouring Arabic
+                        // label cell, which then wrapped onto extra lines
+                        // and pushed the form to two pages. That approach
+                        // is removed entirely; nothing about cell/table
+                        // width or layout is touched anymore.
+                        //
+                        // Fix: walk every text node under the form root,
+                        // find date-like digit-hyphen runs, and wrap just
+                        // that exact run in its own
+                        // <span style="white-space:nowrap">. This makes the
+                        // date text itself unbreakable without changing any
+                        // column's width, so it can't force other cells to
+                        // wrap and can't reintroduce a second page.
+                        const dateRe = /\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/g;
+                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                        const textNodes = [];
+                        let tn;
+                        while ((tn = walker.nextNode())) {{
+                            dateRe.lastIndex = 0;
+                            if (dateRe.test(tn.nodeValue)) textNodes.push(tn);
+                        }}
+                        let dateSpansWrapped = 0;
+                        for (const node of textNodes) {{
+                            const text = node.nodeValue;
+                            dateRe.lastIndex = 0;
+                            let match;
+                            let lastIndex = 0;
+                            let any = false;
+                            const frag = document.createDocumentFragment();
+                            while ((match = dateRe.exec(text)) !== null) {{
+                                any = true;
+                                if (match.index > lastIndex) {{
+                                    frag.appendChild(document.createTextNode(
+                                        text.slice(lastIndex, match.index)));
                                 }}
+                                const span = document.createElement('span');
+                                set(span, 'white-space', 'nowrap');
+                                span.textContent = match[0];
+                                frag.appendChild(span);
+                                lastIndex = match.index + match[0].length;
+                                dateSpansWrapped++;
+                            }}
+                            if (any) {{
+                                if (lastIndex < text.length) {{
+                                    frag.appendChild(document.createTextNode(
+                                        text.slice(lastIndex)));
+                                }}
+                                node.parentNode.replaceChild(frag, node);
                             }}
                         }}
 
@@ -1617,7 +1619,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         );
                         return {{
                             ok: true,
-                            nowrapCount,
+                            dateSpansWrapped,
                             fontInjected: !!fontFaceCSS,
                             formWidth:  Math.round(r.width),
                             formHeight: Math.round(r.height),
