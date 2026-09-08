@@ -1611,6 +1611,48 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         }}
 
                         const r = root.getBoundingClientRect();
+
+                        // E2. Some rows still don't collapse onto a single
+                        // physical line at full size in this headless
+                        // render environment — either a label+value pair
+                        // (the value, now a single unbreakable unit from
+                        // step E, has nowhere to go but the next line), or
+                        // a long placeholder dash-run ("---------------")
+                        // that wraps a dash or two early. The true original
+                        // site fits both on one line. Rather than guess at
+                        // exactly why (font metrics we can't fully match
+                        // without the live site's CSS), shrink JUST that
+                        // one row's font-size in small steps until it
+                        // collapses back to a single line. Tightly scoped:
+                        // only LEAF rows (no nested <tr>, so a wrapping
+                        // container row is never touched) whose text
+                        // contains a long dash-run or a date/ID-like
+                        // digit-hyphen pattern are even considered, and a
+                        // row that already fits on one line is left
+                        // completely alone — nothing else in the document
+                        // is affected.
+                        const wrapRe = /-{{3,}}|\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/;
+                        const isSingleLine = el => {{
+                            const cs = getComputedStyle(el);
+                            let lh = parseFloat(cs.lineHeight);
+                            if (!lh || isNaN(lh)) lh = parseFloat(cs.fontSize) * 1.2;
+                            return el.getBoundingClientRect().height <= lh * 1.35;
+                        }};
+                        let rowsShrunk = 0;
+                        for (const row of root.querySelectorAll('tr')) {{
+                            if (row.querySelector('tr')) continue;  // skip wrapping/container rows
+                            if (!wrapRe.test(row.innerText)) continue;
+                            if (isSingleLine(row)) continue;  // already fits — leave alone
+                            const baseSize = parseFloat(getComputedStyle(row).fontSize) || 16;
+                            let factor = 1.0;
+                            let guard = 0;
+                            while (factor > 0.6 && !isSingleLine(row) && guard++ < 10) {{
+                                factor -= 0.04;
+                                set(row, 'font-size', (baseSize * factor).toFixed(2) + 'px');
+                            }}
+                            if (factor < 1.0) rowsShrunk++;
+                        }}
+
                         // Measure full document scroll height so we can
                         // compute the exact scale to fit one A4 page.
                         const scrollH = Math.max(
@@ -1620,6 +1662,7 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                         return {{
                             ok: true,
                             dateSpansWrapped,
+                            rowsShrunk,
                             fontInjected: !!fontFaceCSS,
                             formWidth:  Math.round(r.width),
                             formHeight: Math.round(r.height),
