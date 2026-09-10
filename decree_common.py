@@ -26,6 +26,10 @@ from Unified_Decree_Submission_Pipeline import (
     SMCSession,
     stage_render_and_sign,
     stage_upload_merged_pdf,
+    stage_fix_uhi_exclusion_and_reprint_mdt,
+    is_deep_uhi_upload_error,
+    is_max_requests_reached_error,
+    RowProcessingError,
     merge_final_pdf,
     call_with_reconnect,
 )
@@ -312,8 +316,57 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
             return {"status": "FAILED", "error": f"Merged PDF write failed or suspiciously small: {merged_pdf_path}"}
 
         log.info("  [Stage 6] Uploading merged PDF to the website …")
-        final_request_no = call_with_reconnect(session, "Final upload", stage_upload_merged_pdf,
-                                                session, national_id, pre_request_id, merged_pdf_path, tumor_cfg)
+        try:
+            final_request_no = call_with_reconnect(session, "Final upload", stage_upload_merged_pdf,
+                                                    session, national_id, pre_request_id, merged_pdf_path, tumor_cfg)
+        except RowProcessingError as upload_exc:
+            if is_max_requests_reached_error(upload_exc):
+                # Site-side per-patient concurrent-open-request cap, NOT a
+                # UHI/insurance issue - the UHI-exclusion edit below never
+                # clears it on retry (same string comes back every time)
+                # and would wrongly flag a possibly-insured patient as
+                # UHI-excluded. The MDT itself was created fine; only this
+                # final upload is blocked. Fail distinctly so a human
+                # knows to retry later, not to re-run a UHI fix.
+                raise RowProcessingError(
+                    f"Patient {national_id} hit the site's max-open-requests limit for "
+                    f"MDT #{pre_request_id} (Requests/SearchSSN returned "
+                    "'MaxNumberOfRequestsReached'). This is a site-side per-patient "
+                    "concurrent-request cap, NOT a UHI/insurance issue - the MDT itself "
+                    "was created fine and was left untouched. Retry this case on its own "
+                    "later, once this patient's other open request(s) have cleared."
+                ) from upload_exc
+
+            if not is_deep_uhi_upload_error(upload_exc):
+                raise
+
+            # The quick HASINSURANCE=N/UHIEXCLUDED=Y resend inside
+            # stage_upload_merged_pdf already tried and failed for a
+            # genuine UHI-insurance block. Fall back to editing the
+            # pre-request + re-printing the MDT form, then rebuild the
+            # merged PDF with the CORRECTED form and retry the upload
+            # once. The previous merged PDF (built from the faulty/stuck
+            # first print) is overwritten/discarded here.
+            log.warning(f"  case {case_id}: UHI-blocked after standard resend — editing "
+                        f"pre-request + re-printing MDT form.")
+            mdt_signed_bytes = call_with_reconnect(
+                session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
+                session, national_id, pre_request_id, broad=True,
+            )
+            log.info("  Re-merging with the corrected MDT form …")
+            try:
+                os.remove(merged_pdf_path)
+            except OSError:
+                pass
+            merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, patient_pdf_path, merged_pdf_path)
+            if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
+                return {"status": "FAILED",
+                        "error": f"Re-merged PDF (post-UHI-fix) write failed or suspiciously small: {merged_pdf_path}"}
+            log.info("  Retrying upload with the corrected merged PDF …")
+            final_request_no = call_with_reconnect(
+                session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,
+                session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
+            )
 
         # NOT re-uploaded to R2 here, on purpose — per your instruction,
         # the script never needs to keep a copy of the PDF it just used.

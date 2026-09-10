@@ -933,6 +933,34 @@ from patient_pdf_website_fallback import download_patient_pdf_from_website  # no
 # PATIENT_DOCS_ROOT itself under the same patient ID.
 FALLBACK_PATIENT_DOCS_DIR = PATIENT_DOCS_UNDER_PROCESSED_DIR
 os.makedirs(FALLBACK_PATIENT_DOCS_DIR, exist_ok=True)
+
+
+def normalize_extracted_patient_pdf_name(pdf_path: Optional[str], patient_id: str) -> Optional[str]:
+    """Return a freshly extracted PDF as exactly ``<patient_id>.pdf``.
+
+    The DMS fallback may create names such as ``<patient_id>-archive.pdf``.
+    Keep the PDF in the same extraction directory while removing that source
+    suffix so it follows the cleaned SMC naming convention.
+    """
+    if not pdf_path:
+        return None
+    source = Path(pdf_path)
+    if not source.exists():
+        return pdf_path
+    target = source.with_name(f"{patient_id}.pdf")
+    if source.resolve() == target.resolve():
+        return str(target)
+    try:
+        if target.exists():
+            target.unlink()
+        source.replace(target)
+        log.info(f"  Normalized extracted PDF name: {source.name} -> {target.name}")
+        return str(target)
+    except OSError as exc:
+        log.warning(f"Could not rename extracted PDF {source} to {target}: {exc}")
+        return str(source)
+
+
 os.makedirs(PATIENT_DOCS_ROOT, exist_ok=True)
 
 
@@ -949,10 +977,60 @@ class RowBlacklisted(Exception):
     """Patient is on the SMC blacklist - row skipped, not a failure."""
 
 
+class UHIASessionDesyncError(Exception):
+    """Raised when a UHIA/SMC lookup endpoint (PreRequest/SearchSSN or
+    Requests/SearchSSN) returns HTTP 200 with a body that DOES parse as
+    JSON, but is NOT the expected object/dict shape (e.g. a short plain
+    string like an error/session message instead of {"patient": {...}, ...}),
+    and that string is NOT the known "MaxNumberOfRequestsReached" business
+    condition (see MaxRequestsReachedError below - that one is NOT a
+    session issue and must NOT be retried the same way).
+
+    Originally seen in the wild (run log _R6IBJT2.log, 8 occurrences) as:
+        POST Requests/SearchSSN -> 200  (28 chars)
+        AttributeError: 'str' object has no attribute 'get'
+    which crashed the whole row instead of being handled. This is meant
+    to be retried via call_with_reconnect (re-login + redo the whole
+    stage from scratch), same as a network blip - reserved for payload
+    shapes that are genuinely unexplained, not for the specific known
+    "MaxNumberOfRequestsReached" string."""
+
+
+class MaxRequestsReachedError(RowProcessingError):
+    """Raised when Requests/SearchSSN (final-upload stage) returns the
+    literal string "MaxNumberOfRequestsReached" instead of patient data.
+
+    CONFIRMED NOT a session/network blip (run log unified_run_IDS_1.log):
+    call_with_reconnect retried this 5 times, re-logging in each time,
+    and got the exact same "MaxNumberOfRequestsReached" response on every
+    attempt before giving up - proving a fresh login does not clear it.
+    It is a per-patient concurrent/open-decree-request cap on the SMC
+    site's side, tied to the patient (not the session and NOT UHI/
+    insurance status, despite the class living in this file's UHI
+    section) - so subclassing RowProcessingError (rather than adding it
+    to NETWORK_EXCEPTIONS) means call_with_reconnect will NOT blindly
+    retry it.
+
+    CONFIRMED not UHI-related: unified_run_IDS_2 through IDS_12.log show
+    every occurrence hitting a patient with 2+ rows for the same national
+    ID submitted back-to-back in one run (earlier row(s) for that patient
+    succeed; later ones for the SAME patient hit this), and the
+    UHIEXCLUDED=Y edit NEVER clears it on retry - the identical string
+    comes back every single time, unlike genuine UHI-block cases where
+    that edit reliably fixes things. process_row() therefore does NOT
+    route this through stage_fix_uhi_exclusion_and_reprint_mdt() anymore
+    (that would only risk mislabeling a possibly-insured patient as
+    UHI-excluded, with no chance of actually fixing the error) - it fails
+    the row immediately with a distinct message so it's clear this needs
+    a later standalone retry, once this patient's other open request(s)
+    have cleared, not a UHI fix."""
+
+
 NETWORK_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     requests.exceptions.ChunkedEncodingError,
+    UHIASessionDesyncError,
 )
 
 # Chromium (via Playwright) runs out-of-process, so its own transient
@@ -1165,15 +1243,28 @@ class SMCSession:
             return {}
 
     def search_ssn_prerequest(self, ssn: str) -> Optional[Dict]:
-        """POST /smc/PreRequest/SearchSSN — used during MDT creation."""
+        """POST /smc/PreRequest/SearchSSN — used during MDT creation.
+
+        Same UHIA session-desync fallback as search_ssn_requests() below:
+        a non-dict JSON body here (short plain string instead of
+        {"patient": {...}, ...}) is raised as UHIASessionDesyncError so
+        call_with_reconnect retries it instead of the caller crashing
+        with AttributeError: 'str' object has no attribute 'get'."""
         r = self._post_ajax(f"{BASE_URL}/smc/PreRequest/SearchSSN", data={"SSN": ssn})
         if r is None:
             return None
         try:
-            return r.json()
+            parsed = r.json()
         except Exception:
             log.error(f"PreRequest/SearchSSN returned non-JSON for {ssn}")
             return None
+        if not isinstance(parsed, dict):
+            raise UHIASessionDesyncError(
+                f"PreRequest/SearchSSN returned a non-object JSON payload "
+                f"(likely a stale/desynced session) for SSN {ssn}: "
+                f"{r.text[:300]!r}"
+            )
+        return parsed
 
     def get_last_letter_content(self, ssn: str) -> str:
         r = self._post_ajax(f"{BASE_URL}/smc/PreRequest/GetLastLetterContent", data={"SSN": ssn})
@@ -1253,6 +1344,256 @@ class SMCSession:
         return [(c.name, c.value) for c in self.s.cookies]
 
     # ------------------------------------------------------------------
+    # DEEP UHI-EXCLUSION FALLBACK  (PreRequest/Edit/{id})
+    # ------------------------------------------------------------------
+    # For some patients, resending the FINAL upload (Requests/Create) with
+    # HASINSURANCE=N / UHIEXCLUDED=Y — the existing quick fix in
+    # stage_upload_merged_pdf — is not enough: it still comes back with
+    # "Upload validation errors: لا يمكن استكمال الطلب هذا الرقم القومي
+    # يتبع منظومة التامين الصحي الشامل". What actually clears it (verified
+    # against a manual browser session) is editing the PRE-REQUEST record
+    # itself via PreRequest/Edit/{id}, then RE-PRINTING the MDT form — the
+    # print taken right after the original PreRequest/Create is permanently
+    # the wrong/faulty paper for these patients (it just carries the same
+    # administrative UHI notice instead of a real MDT form) and must never
+    # be used; only the form printed AFTER this Edit call is correct.
+
+    @staticmethod
+    def _scrape_form_fields(html: str) -> List[Tuple[str, str]]:
+        """Scrapes the current value of every input/select/textarea in an
+        HTML page, keyed by name. Used so the UHI-exclusion Edit resubmit
+        below sends back EVERY field exactly as the page rendered it —
+        same as a browser form submit — with only HASINSURANCE/UHIEXCLUDED
+        overridden, instead of trying to hand-reconstruct the full Edit
+        payload field by field.
+
+        Excludes type="file" and disabled/readonly-locked inputs: a real
+        browser never includes a disabled field in a form submission, and
+        can only send actual file BYTES for a file input (never a plain
+        string) — this POST is plain x-www-form-urlencoded, not
+        multipart, so a real browser would send no entry at all for an
+        empty file input.
+
+        DUPLICATE FIELD NAMES — CONFIRMED ROOT CAUSE OF THE 500s:
+        the PreRequest/Edit page renders some field names MORE THAN
+        ONCE (verified against a captured real browser submission —
+        e.g. 'SENDINGSITEID' appears twice: once as the real numeric
+        value, and once as a broken Kendo/Razor placeholder literally
+        reading "{ id = SENDINGSITEID }"; 'ACTIVE' and 'PREREQUESTID'
+        are also duplicated, harmlessly, with the same value both
+        times). A real browser submits EVERY occurrence of a repeated
+        field name; ASP.NET model binding takes the FIRST value it
+        sees for a repeated key, so the browser lands on the correct
+        value even though the garbage duplicate rides along too.
+
+        This function used to return a Dict[str, str] — one slot per
+        NAME — so scraping a page with a duplicated field name meant
+        whichever occurrence came LAST in the DOM silently overwrote
+        the earlier one. For SENDINGSITEID that meant the real value
+        ("20821") was being discarded in favor of the literal garbage
+        string "{ id = SENDINGSITEID }", which the server then tried
+        to bind a required numeric site-ID field to — an unhandled
+        server-side exception, i.e. exactly the HTTP 500 seen on every
+        single PreRequest/Edit attempt in both unified_run_IDS_1.log
+        and _R6IBJT2.log, independent of which patient/row it was.
+
+        Fixed by returning a List[Tuple[str, str]] that preserves
+        EVERY occurrence in DOM order — never deduplicated — so the
+        outgoing POST body matches a real browser submission
+        byte-for-byte (aside from the deliberate HASINSURANCE/
+        UHIEXCLUDED overrides applied by the caller)."""
+        soup = BeautifulSoup(html, "html.parser")
+        fields: List[Tuple[str, str]] = []
+        for tag in soup.find_all(["input", "textarea"]):
+            name = tag.get("name")
+            if not name:
+                continue
+            if tag.has_attr("disabled"):
+                continue
+            ttype = (tag.get("type") or "text").lower()
+            if ttype == "file":
+                continue
+            if ttype in ("checkbox", "radio"):
+                if tag.has_attr("checked"):
+                    fields.append((name, tag.get("value", "on")))
+                else:
+                    fields.append((name, ""))
+                continue
+            if ttype == "submit":
+                continue
+            fields.append((name, tag.text if tag.name == "textarea" else tag.get("value", "")))
+        for tag in soup.find_all("select"):
+            name = tag.get("name")
+            if not name or tag.has_attr("disabled"):
+                continue
+            selected = tag.find("option", selected=True) or tag.find("option")
+            fields.append((name, selected.get("value", "") if selected else ""))
+        return fields
+
+    def get_edit_page_context(self, pre_request_id: str) -> Tuple[List[Tuple[str, str]], str]:
+        url = f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}"
+        r = self._get(url)
+        if r is None:
+            raise RuntimeError(f"Could not load PreRequest/Edit/{pre_request_id} page.")
+        fields = self._scrape_form_fields(r.text)
+        if not any(name == "__RequestVerificationToken" for name, _ in fields):
+            raise RuntimeError(
+                f"Could not scrape __RequestVerificationToken from PreRequest/Edit/{pre_request_id} page."
+            )
+        return fields, url
+
+    def edit_prerequest(self, pre_request_id: str, field_overrides: Dict[str, str]) -> Tuple[bool, str]:
+        """POSTs PreRequest/Edit/{id} with the page's own current field
+        values, overridden by field_overrides (e.g. HASINSURANCE/
+        UHIEXCLUDED).
+
+        NATIVE SUCCESS STATUS: a manual browser/requests session against
+        the live site showed that this endpoint's own successful response
+        is a 308 Permanent Redirect with an empty body — not the 302
+        originally assumed. 302/307/308 all mean the same thing here
+        (site-native redirect-on-success) and are treated identically.
+
+        THIS CALL DELIBERATELY DOES NOT USE _post_form_submit AND DOES
+        NOT FOLLOW THE REDIRECT (allow_redirects=False), unlike every
+        other POST in this class:
+          - _post_form_submit always follows redirects and treats
+            anything other than a final 200 as failure. That's correct
+            for create_prerequest/submit_request_with_pdf, but wrong
+            here: chasing a 308's Location header buys nothing (the
+            record already committed server-side by the time the
+            redirect is issued) and, worse, whatever the redirect
+            lands on is not a reliable success/failure signal — it's
+            what caused this same edit to earlier surface as a false
+            HTTP 500 (see the verify-fields fallback below) instead of
+            the native 308.
+          - So: capture the RAW, un-followed status code straight off
+            the POST. 302/307/308 = native success, full stop, no need
+            to inspect a body that (per the docstring above) is empty
+            anyway.
+          - This is intentionally scoped to ONLY this one endpoint —
+            _post_form_submit and every other caller (create_prerequest,
+            submit_request_with_pdf, etc.) are untouched, so a real
+            failure on any other API call still surfaces loudly instead
+            of being silently treated as success.
+
+        FIXED (root cause of the HTTP 500 seen in earlier runs): this
+        page renders some field names MORE THAN ONCE — e.g.
+        SENDINGSITEID appears both with its real value and as a broken
+        placeholder literally reading "{ id = SENDINGSITEID }" — and the
+        old dict-based scrape silently kept only the LAST occurrence,
+        which happened to be the garbage one. The server then choked
+        trying to bind a required numeric field to that string. fields
+        is a List[Tuple[str, str]] preserving every occurrence, in the
+        same order the page rendered them, exactly like a real browser
+        submission. field_overrides is applied by replacing every
+        occurrence whose name matches (so a field the page happened to
+        duplicate stays duplicated, just with the overridden value on
+        each copy) and appending the override once if the name never
+        appeared at all — never collapsed down to one instance."""
+        fields, edit_url = self.get_edit_page_context(pre_request_id)
+        overridden_names = set()
+        new_fields: List[Tuple[str, str]] = []
+        for name, value in fields:
+            if name in field_overrides:
+                new_fields.append((name, field_overrides[name]))
+                overridden_names.add(name)
+            else:
+                new_fields.append((name, value))
+        for name, value in field_overrides.items():
+            if name not in overridden_names:
+                new_fields.append((name, value))
+        fields = new_fields
+        edit_post_url = f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}"
+
+        EDIT_NATIVE_SUCCESS_REDIRECTS = (302, 307, 308)
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Origin": BASE_URL,
+            "Referer": edit_url,
+        }
+        try:
+            r = self.s.post(edit_post_url, data=fields, headers=headers,
+                             timeout=60, allow_redirects=False)
+            log.info(
+                f"    POST(form,no-redirect) PreRequest/Edit/{pre_request_id} "
+                f"-> {r.status_code}  ({len(r.text)} chars)"
+            )
+        except NETWORK_EXCEPTIONS:
+            raise
+        except Exception as exc:
+            log.error(f"POST(form,no-redirect) {edit_post_url}: {exc}")
+            return False, ""
+
+        if r.status_code in EDIT_NATIVE_SUCCESS_REDIRECTS:
+            log.info(
+                f"    PreRequest/Edit/{pre_request_id} -> {r.status_code} "
+                f"(native success redirect, not followed; "
+                f"Location={r.headers.get('Location', '')!r})"
+            )
+            return True, f"native-redirect-{r.status_code}"
+
+        if r.status_code != 200:
+            dump_debug_artifacts(f"EDIT_{pre_request_id}", fields, r.text)
+            # CONFIRMED (real case): PreRequest/Edit can return a plain
+            # ASP.NET 500 error page (generic bootstrap-cdn boilerplate,
+            # not a validation page) even though the underlying record WAS
+            # updated — the write commits, then something downstream in
+            # the controller (building the confirmation view) throws. A
+            # bare 500 is therefore NOT reliable evidence of failure here.
+            # Before giving up on the whole row, reload the Edit page and
+            # check whether the overridden fields actually took — if they
+            # did, treat this as success instead of aborting. This is a
+            # LAST-RESORT check, only reached for genuinely unexpected
+            # statuses (i.e. neither the native success redirect above
+            # nor a plain 200) — it never runs on the normal 308 path.
+            verified, verify_detail = self._verify_prerequest_fields_applied(
+                pre_request_id, field_overrides
+            )
+            if verified:
+                log.warning(
+                    f"    PreRequest/Edit/{pre_request_id} returned HTTP {r.status_code}, but "
+                    f"re-checking the pre-request confirms the field(s) were applied server-side "
+                    f"({verify_detail}) — treating as SUCCESS rather than aborting the row."
+                )
+                return True, f"verified-applied-despite-http-{r.status_code}: {verify_detail}"
+            return False, (
+                f"PreRequest/Edit/{pre_request_id} returned HTTP {r.status_code} instead of "
+                f"the expected 200/redirect, AND a re-check of the pre-request could not confirm "
+                f"the field(s) were applied ({verify_detail}). Full response body + the exact "
+                f"fields submitted were dumped to {DEBUG_DIR}\\EDIT_{pre_request_id}_* for inspection."
+            )
+        # status_code == 200: the site stayed on the same page instead of
+        # redirecting, which for this endpoint means validation failed —
+        # check the rendered body for the actual error(s).
+        errors = extract_upload_validation_errors(r.text)
+        return (not errors), r.text
+
+    def _verify_prerequest_fields_applied(self, pre_request_id: str,
+                                           field_overrides: Dict[str, str]) -> Tuple[bool, str]:
+        """Re-fetches PreRequest/Edit/{id} and checks whether every field in
+        field_overrides now holds its expected value. Used only to recover
+        from an ambiguous non-200 response on the Edit POST (see
+        edit_prerequest above) — never as the primary success signal.
+
+        A field may legitimately appear more than once on this page (see
+        edit_prerequest's docstring on duplicated field names, e.g. the
+        broken "{ id = SENDINGSITEID }" placeholder alongside the real
+        value), so a field counts as confirmed if ANY of its occurrences
+        equals the expected value, not just the first/last one."""
+        try:
+            fields, _ = self.get_edit_page_context(pre_request_id)
+        except Exception as exc:
+            return False, f"could not reload PreRequest/Edit/{pre_request_id} to verify: {exc}"
+        for name, expected in field_overrides.items():
+            occurrences = [v for n, v in fields if n == name]
+            if expected not in occurrences:
+                return False, f"{name} expected {expected!r}, found {occurrences!r}"
+        return True, "all overridden field(s) confirmed on reload: " + ", ".join(
+            f"{k}={v!r}" for k, v in field_overrides.items()
+        )
+
+    # ------------------------------------------------------------------
     # FINAL UPLOAD FLOW  (Requests/* endpoints)
     # ------------------------------------------------------------------
 
@@ -1297,7 +1638,26 @@ class SMCSession:
 
     def search_ssn_requests(self, patient_id: str, pre_request_id: str) -> Optional[dict]:
         """POST /smc/Requests/SearchSSN — used during final upload (different
-        endpoint from search_ssn_prerequest, deliberately named apart)."""
+        endpoint from search_ssn_prerequest, deliberately named apart).
+
+        FALLBACK LOGIC: this endpoint has been observed to return HTTP 200
+        with a valid-JSON body that is just a short plain string instead
+        of the expected {"patient": {...}, ...} object. Two distinct
+        cases, handled differently:
+
+        1. The literal string "MaxNumberOfRequestsReached" - a genuine
+           UHIA-side business rule tied to THIS pre-request record, not a
+           session problem. Retrying via reconnect does NOT clear it (5
+           identical re-login + retry attempts all get the exact same
+           string back). Raised here as MaxRequestsReachedError so
+           process_row()/run_finalize_stages() fail the row distinctly
+           instead of uselessly retrying the same call.
+        2. Any OTHER non-dict payload - genuinely unexplained, previously
+           crashed the caller with AttributeError: 'str' object has no
+           attribute 'get'. Raised as UHIASessionDesyncError, which IS
+           retried via call_with_reconnect (re-login + redo the stage),
+           since these were seen alongside a GetPreRequests 404 right
+           before them, consistent with a momentary session hiccup."""
         r = self._post_ajax(
             f"{BASE_URL}/smc/Requests/SearchSSN",
             data={"SSN": patient_id, "checkDecree": "false", "preRequestID": pre_request_id},
@@ -1305,10 +1665,24 @@ class SMCSession:
         if r is None:
             return None
         try:
-            return r.json()
+            parsed = r.json()
         except Exception:
             log.error(f"Requests/SearchSSN returned non-JSON: {r.text[:300]!r}")
             return None
+        if isinstance(parsed, str) and parsed.strip() == "MaxNumberOfRequestsReached":
+            raise MaxRequestsReachedError(
+                f"Requests/SearchSSN returned 'MaxNumberOfRequestsReached' for "
+                f"patient {patient_id}, prid={pre_request_id} — this pre-request "
+                "has hit the UHIA max-requests limit; needs the PreRequest/Edit + "
+                "re-print fallback, not a plain retry."
+            )
+        if not isinstance(parsed, dict):
+            raise UHIASessionDesyncError(
+                f"Requests/SearchSSN returned a non-object JSON payload "
+                f"(likely a stale/desynced session) for patient {patient_id}, "
+                f"prid={pre_request_id}: {r.text[:300]!r}"
+            )
+        return parsed
 
     def get_file_size(self, referer: Optional[str] = None):
         self._get(f"{BASE_URL}/smc//Requests/GetFileSize", ajax=True, referer=referer)
@@ -2089,18 +2463,48 @@ def parse_committee_date(ms_date: Optional[str]) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def dump_debug_artifacts(patient_id: str, payload: Dict[str, str], raw_html: str):
+def dump_debug_artifacts(patient_id: str, payload, raw_html: str):
+    """payload may be a Dict[str, str] (old callers) or a
+    List[Tuple[str, str]] (edit_prerequest, since duplicate field names
+    on PreRequest/Edit are meaningful and must NOT be collapsed to one
+    entry per name — see edit_prerequest's docstring). Lists are dumped
+    as [[name, value], ...] pairs so duplicate names are visible
+    in the debug JSON exactly as they were POSTed, instead of silently
+    losing one via a dict key collision the way the old code did."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     payload_path = os.path.join(DEBUG_DIR, f"{patient_id}_{ts}_mdt_payload.json")
     html_path = os.path.join(DEBUG_DIR, f"{patient_id}_{ts}_mdt_response.html")
+    dumpable = [[name, value] for name, value in payload] if isinstance(payload, list) else payload
     try:
         with open(payload_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(dumpable, f, ensure_ascii=False, indent=2)
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(raw_html)
         log.info(f"    Debug artifacts written: {payload_path} , {html_path}")
     except Exception as exc:
         log.error(f"    Could not write debug artifacts: {exc}")
+
+
+# SMC blocks submission for national IDs it recognises as belonging to the
+# Comprehensive Health Insurance (UHI / "التأمين الصحي الشامل") system unless
+# the form explicitly says HASINSURANCE=N *and* UHIEXCLUDED=Y — this is what
+# the "this patient has no insurance" checkbox does when someone submits it
+# by hand.
+UHI_BLOCK_ERROR_SNIPPET = "يتبع منظومة التامين الصحي الشامل"
+
+
+def extract_upload_validation_errors(raw_html: str) -> List[str]:
+    """Pulls the human-readable validation messages out of a Requests/Create
+    (or PreRequest/Create) response. Factored out so both the first attempt
+    and the UHI-exclusion retry can reuse the same parsing."""
+    errors = re.findall(
+        r'<span[^>]*class="[^"]*field-validation-error[^"]*"[^>]*>(.*?)</span>',
+        raw_html, re.S,
+    ) + re.findall(
+        r'<div[^>]*class="[^"]*validation-summary-errors[^"]*"[^>]*>(.*?)</div>',
+        raw_html, re.S,
+    )
+    return [re.sub(r"<.*?>", "", e).strip() for e in errors if re.sub(r"<.*?>", "", e).strip()]
 
 
 def save_debug_html(patient_id: str, pre_request_id: str, html: str):
@@ -2131,7 +2535,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         raise RowBlacklisted(f"Blacklist check returned: {bl}")
 
     patient_resp = session.search_ssn_prerequest(patient_id)
-    if not patient_resp or not patient_resp.get("patient"):
+    if not isinstance(patient_resp, dict) or not patient_resp.get("patient"):
         raise RowProcessingError(f"PreRequest/SearchSSN returned no patient data. Raw: {str(patient_resp)[:300]}")
     patient = patient_resp["patient"]
     city_id = patient_resp.get("cityId")
@@ -2168,6 +2572,17 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
     proc_desc = session.get_treatment_proc_desc(tumor_cfg["proc_id"])
     if not proc_desc:
         warnings.append("GetReqTreatmentProcDesc returned no description.")
+
+    # FIXED BUG: proc_desc was fetched above (and used only for the
+    # "not found" warning) but never actually placed into the
+    # TREATMENTPLAN field sent to PreRequest/Create. Manually creating an
+    # MDT for a scan/surgery/pet-ct row always submits TREATMENTPLAN as
+    # the procedure's own Arabic description (e.g. "أبحاث أورام" for
+    # proc_id 141/scan) on its own first line, followed by a newline,
+    # then the free-text treatment-plan wording. Without this, the row
+    # still submitted successfully but silently carried NO indication of
+    # the procedure/category on the MDT form itself.
+    treatment_plan_text = f"{proc_desc}\r\n{description}" if proc_desc else description
 
     try:
         ctx = session.get_create_page_context()
@@ -2227,7 +2642,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         "INITIALICD10CODE": tumor_cfg["diag_code"],
         "TREATMENTPROCEDUREID": tumor_cfg["proc_id"],
         "RENALLFAILURESESSIONSTARTDATE": "",
-        "TREATMENTPLAN": description,
+        "TREATMENTPLAN": treatment_plan_text,
         "DIAGNOSISGROUP": tumor_cfg["speciality_code"],
         "DEPARTMENTIDFK": str(department_id or ""),
         "INITIALICD10CODECOMMENT": "",
@@ -2241,6 +2656,21 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
     }
 
     pre_request_id, raw_html = session.create_prerequest(payload)
+    if not pre_request_id:
+        errors = extract_upload_validation_errors(raw_html)
+        if any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors):
+            log.warning(
+                f"    {patient_id}: flagged as belonging to the Comprehensive Health "
+                f"Insurance (UHI) system ({errors[0]!r}) at MDT-creation time — "
+                f"resubmitting with HASINSURANCE=N and UHIEXCLUDED=Y."
+            )
+            payload = dict(payload)
+            payload["HASINSURANCE"] = "N"
+            payload["UHIEXCLUDED"] = "Y"
+            pre_request_id, raw_html = session.create_prerequest(payload)
+            if pre_request_id:
+                log.info(f"    {patient_id}: UHI-exclusion resubmission succeeded.")
+
     if not pre_request_id:
         dump_debug_artifacts(patient_id, payload, raw_html)
         raise RowProcessingError(
@@ -2258,6 +2688,76 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
 def stage_render_and_sign(session: SMCSession, pre_request_id: str) -> bytes:
     mdt_pdf_bytes = render_print_page_to_pdf(session, pre_request_id)
     return apply_signatures_and_stamp(mdt_pdf_bytes)
+
+
+def is_deep_uhi_upload_error(exc: Exception) -> bool:
+    """True only for the specific case the quick UHI resend inside
+    stage_upload_merged_pdf could NOT fix on its own: it already retried
+    with HASINSURANCE=N/UHIEXCLUDED=Y and STILL got the UHI validation
+    error back. That's the signal to fall back to editing the pre-request
+    itself and re-printing the MDT form (see stage_fix_uhi_exclusion_and_
+    reprint_mdt below) rather than treating this row as failed."""
+    msg = str(exc)
+    return msg.startswith("Upload validation errors:") and UHI_BLOCK_ERROR_SNIPPET in msg
+
+
+def is_max_requests_reached_error(exc: Exception) -> bool:
+    """True for MaxRequestsReachedError - the "MaxNumberOfRequestsReached"
+    site-side per-patient open-request cap (NOT a UHI/insurance issue -
+    see MaxRequestsReachedError's docstring). Callers should fail the row
+    immediately on this rather than routing it through the UHI-exclusion
+    fallback, which was confirmed to never actually clear it - the
+    identical string just comes back again on retry every time."""
+    return isinstance(exc, MaxRequestsReachedError)
+
+
+def stage_fix_uhi_exclusion_and_reprint_mdt(session: SMCSession, patient_id: str,
+                                             pre_request_id: str) -> bytes:
+    """
+    Deep UHI fallback (only reached when the quick resend at upload time
+    still fails — see is_deep_uhi_upload_error above).
+
+    1. POST /smc/PreRequest/Edit/{pre_request_id} with HASINSURANCE=N and
+       UHIEXCLUDED=Y set on the PRE-REQUEST record itself (not just on the
+       final submission form, which is what the quick fix does and which
+       is not sufficient for these patients).
+    2. Re-print the MDT form. The print taken right after the ORIGINAL
+       PreRequest/Create is permanently the faulty paper for these
+       patients (just the administrative UHI notice, not a real MDT form)
+       and must be discarded — never signed, merged, or uploaded. Only
+       the form printed AFTER this Edit call is the correct one.
+    3. Re-sign the corrected form the same way stage_render_and_sign does.
+
+    Returns the newly signed+stamped MDT PDF bytes. Caller is responsible
+    for re-merging this into a fresh merged PDF (replacing/overwriting the
+    one built from the faulty first print) and retrying the upload.
+    """
+    log.warning(
+        f"    {patient_id}: MDT #{pre_request_id} still UHI-blocked after the standard "
+        f"resend — editing the pre-request (UHIEXCLUDED=Y) and re-printing the MDT form."
+    )
+    ok, edit_html = session.edit_prerequest(pre_request_id, {
+        "HASINSURANCE": "N",
+        "UHIEXCLUDED": "Y",
+    })
+    if not ok:
+        errors = extract_upload_validation_errors(edit_html)
+        if errors:
+            detail = " | ".join(errors)
+        elif edit_html:
+            # Non-empty but no <span class="field-validation-error">/
+            # validation-summary matches means it's not a normal HTML
+            # validation page — most likely the HTTP-status diagnostic
+            # message edit_prerequest() builds on a non-200 (e.g. a
+            # PreRequest/Edit -> 500). Surface it as-is instead of
+            # discarding it as "no confirmation".
+            detail = edit_html
+        else:
+            detail = "no confirmation in response after redirect"
+        raise RowProcessingError("PreRequest/Edit UHI-exclusion fallback failed: " + detail)
+    log.info(f"    {patient_id}: PreRequest/Edit UHI-exclusion succeeded — re-printing MDT form.")
+    corrected_mdt_bytes = render_print_page_to_pdf(session, pre_request_id)
+    return apply_signatures_and_stamp(corrected_mdt_bytes)
 
 
 # =====================================================================
@@ -2278,7 +2778,7 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     create_page_referer = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
 
     ssn_resp = session.search_ssn_requests(patient_id, pre_request_id)
-    if not ssn_resp or not ssn_resp.get("patient"):
+    if not isinstance(ssn_resp, dict) or not ssn_resp.get("patient"):
         raise RowProcessingError(f"Requests/SearchSSN returned no patient data. Raw: {str(ssn_resp)[:300]}")
 
     patient = ssn_resp["patient"]
@@ -2356,17 +2856,30 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
 
     new_req_no, raw_html = session.submit_request_with_pdf(form_fields, merged_pdf_path, referer_prid=pre_request_id)
 
+    if not new_req_no:
+        errors = extract_upload_validation_errors(raw_html)
+        if any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors):
+            # Same fix a human makes by ticking "this patient has no
+            # insurance" in the UI: resend with HASINSURANCE=N and
+            # UHIEXCLUDED=Y and nothing else changed.
+            log.warning(
+                f"    {patient_id}: flagged as belonging to the Comprehensive Health "
+                f"Insurance (UHI) system ({errors[0]!r}) — resubmitting with "
+                f"HASINSURANCE=N and UHIEXCLUDED=Y."
+            )
+            retry_fields = dict(form_fields)
+            retry_fields["HASINSURANCE"] = "N"
+            retry_fields["UHIEXCLUDED"] = "Y"
+            new_req_no, raw_html = session.submit_request_with_pdf(
+                retry_fields, merged_pdf_path, referer_prid=pre_request_id
+            )
+            if new_req_no:
+                log.info(f"    {patient_id}: UHI-exclusion resubmission succeeded.")
+
     if new_req_no:
         return new_req_no
 
-    errors = re.findall(
-        r'<span[^>]*class="[^"]*field-validation-error[^"]*"[^>]*>(.*?)</span>',
-        raw_html, re.S,
-    ) + re.findall(
-        r'<div[^>]*class="[^"]*validation-summary-errors[^"]*"[^>]*>(.*?)</div>',
-        raw_html, re.S,
-    )
-    errors = [re.sub(r"<.*?>", "", e).strip() for e in errors if re.sub(r"<.*?>", "", e).strip()]
+    errors = extract_upload_validation_errors(raw_html)
     save_debug_html(patient_id, pre_request_id, raw_html)
     if errors:
         raise RowProcessingError("Upload validation errors: " + " | ".join(errors))
@@ -2490,6 +3003,7 @@ def locate_patient_document_pdf(
         id_pdf_path = None
 
     if id_pdf_path:
+        id_pdf_path = normalize_extracted_patient_pdf_name(id_pdf_path, patient_id)
         return id_pdf_path, "cmis_full_archive", True
 
     # ---- Step 4: nothing anywhere ----
@@ -2903,9 +3417,81 @@ def process_row(session: SMCSession, patient_id: str, description: str, tumor_ty
 
         # ---- Stage 6: Upload ----
         log.info("  [Stage 6/6] Uploading merged PDF to the website …")
-        final_request_no = call_with_reconnect(session, "Final upload", stage_upload_merged_pdf,
-                                                 session, patient_id, pre_request_id, merged_pdf_path,
-                                                 tumor_cfg)
+        try:
+            final_request_no = call_with_reconnect(session, "Final upload", stage_upload_merged_pdf,
+                                                     session, patient_id, pre_request_id, merged_pdf_path,
+                                                     tumor_cfg)
+        except RowProcessingError as upload_exc:
+            deep_uhi_case = is_deep_uhi_upload_error(upload_exc)
+            max_requests_case = is_max_requests_reached_error(upload_exc)
+
+            if max_requests_case:
+                # NOT a UHI/insurance issue, despite living in the same
+                # try/except as the genuine UHI case below. Every observed
+                # occurrence hit a patient with 2+ rows for the same
+                # national ID submitted back-to-back in one run (the
+                # first row(s) for that patient succeed; later ones for
+                # the SAME patient hit this) - a site-side cap on open/
+                # concurrent decree requests per patient, unrelated to
+                # insurance status. The UHIEXCLUDED=Y edit below NEVER
+                # clears it on retry (same string comes back every time)
+                # and would wrongly flag a possibly-insured patient as
+                # UHI-excluded for a problem that has nothing to do with
+                # insurance - so it must NOT be attempted here. MDT
+                # #{pre_request_id} itself was created successfully and is
+                # fine; only this final upload is blocked. Fail the row
+                # distinctly instead, so it's obvious at a glance this
+                # needs a later standalone retry, not a UHI fix.
+                raise RowProcessingError(
+                    f"Patient {patient_id} hit the site's max-open-requests limit for "
+                    f"MDT #{pre_request_id} (Requests/SearchSSN returned "
+                    "'MaxNumberOfRequestsReached'). This is a site-side per-patient "
+                    "concurrent-request cap, NOT a UHI/insurance issue - the MDT itself "
+                    "was created fine and was left untouched (no UHI-exclusion edit was "
+                    "attempted). Retry this row on its own later, once this patient's "
+                    "other open request(s) have cleared, rather than re-running it "
+                    "stacked with other rows for the same patient."
+                ) from upload_exc
+
+            if not deep_uhi_case:
+                raise
+            # The quick HASINSURANCE=N/UHIEXCLUDED=Y resend inside
+            # stage_upload_merged_pdf already tried and failed for a
+            # genuine UHI-insurance block. Fall back to editing the
+            # pre-request + re-printing the MDT form, then rebuild the
+            # merged PDF with the CORRECTED form and retry the upload
+            # once. The previous merged PDF (built from the faulty/stuck
+            # first print) is overwritten/discarded here — it must never
+            # be the one that gets uploaded.
+            mdt_signed_bytes = call_with_reconnect(
+                session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
+                session, patient_id, pre_request_id, broad=True,
+            )
+            result["warnings"].append(
+                "First MDT print for this patient was the faulty UHI-notice paper; a "
+                "corrected form was regenerated via PreRequest/Edit and used instead."
+            )
+            log.info("  Re-merging with the corrected MDT form …")
+            try:
+                os.remove(merged_pdf_path)
+            except OSError:
+                pass
+            merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, id_pdf_path, merged_pdf_path)
+            if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
+                raise RowProcessingError(
+                    f"Re-merged PDF (post-UHI-fix) write failed or suspiciously small: {merged_pdf_path}"
+                )
+            save_checkpoint(CHECKPOINT_PATH, checkpoints, ckpt_key, {
+                "stage": "merged", "pre_request_id": pre_request_id,
+                "full_name": full_name, "patient_id": patient_id,
+                "merged_pdf_path": merged_pdf_path,
+                "note": "merged_pdf rebuilt with corrected (post-PreRequest/Edit) MDT form",
+            })
+            log.info("  Retrying upload with the corrected merged PDF …")
+            final_request_no = call_with_reconnect(
+                session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,
+                session, patient_id, pre_request_id, merged_pdf_path, tumor_cfg,
+            )
         result["final_request_no"] = final_request_no
         result["status"] = "SUCCESS"
         log.info(f"    ✔ Success — final decree request number: {final_request_no}")

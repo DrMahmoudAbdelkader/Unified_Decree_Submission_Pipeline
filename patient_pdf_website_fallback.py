@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -45,10 +46,45 @@ log = logging.getLogger("patient_pdf_website_fallback")
 # eligible - same filter as the standalone script.
 FACILITY_KEYWORD = "جوستاف"
 
+# Second-choice facility. ONLY used when FACILITY_KEYWORD returns zero
+# matching rows for this patient (not merely zero *downloadable* PDFs -
+# see download_patient_pdf_from_website below). When it applies, the most
+# recent request under this facility is tried first.
+FALLBACK_FACILITY_KEYWORD = "البرنامج القومي لصحه المرأه الاداره العامه للأشعه"
+
+# Column layout for a date isn't confirmed for GetRequests's table, so
+# request dates are found by scanning every cell's text for something
+# date-shaped rather than assuming a fixed column index.
+_DATE_PATTERN = re.compile(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})")
+
 SEARCH_FROM_DATE = "01/01/2000"
 REQUEST_TIMEOUT = 30
 RETRIES = 2
 REQUEST_SLEEP = 0.3
+
+
+def _extract_row_date(tds) -> Optional[datetime]:
+    """Best-effort: scan every cell in a request row for a date-looking
+    string and parse the first one found. Tries both day/month and
+    month/day orderings since the site's date format for this table isn't
+    confirmed; returns None if nothing parses (caller falls back to the
+    site's own table order, same assumption the existing Gustave-only
+    logic already relied on)."""
+    for td in tds:
+        text = td.get_text(strip=True)
+        m = _DATE_PATTERN.search(text)
+        if not m:
+            continue
+        a, b, y = m.groups()
+        y = int(y)
+        if y < 100:
+            y += 2000
+        for day, month in ((int(a), int(b)), (int(b), int(a))):
+            try:
+                return datetime(y, month, day)
+            except ValueError:
+                continue
+    return None
 
 
 def _parse_requests_table(html: str):
@@ -77,6 +113,7 @@ def _parse_requests_table(html: str):
                 "request_id": request_id,
                 "sending_site": sending_site,
                 "treatment_site": treatment_site,
+                "request_date": _extract_row_date(tds),
             })
 
     total_pages = 1
@@ -135,11 +172,15 @@ def _search_requests_by_national_id(sess, base_url: str, national_id: str) -> Li
     return all_rows
 
 
-def _filter_gustave_rows(rows: List[Dict]) -> List[Dict]:
+def _filter_rows_by_facility(rows: List[Dict], keyword: str) -> List[Dict]:
     return [
         r for r in rows
-        if FACILITY_KEYWORD in r.get("sending_site", "") or FACILITY_KEYWORD in r.get("treatment_site", "")
+        if keyword in r.get("sending_site", "") or keyword in r.get("treatment_site", "")
     ]
+
+
+def _filter_gustave_rows(rows: List[Dict]) -> List[Dict]:
+    return _filter_rows_by_facility(rows, FACILITY_KEYWORD)
 
 
 def _parse_details_page(html: str, request_id: str) -> Dict:
@@ -208,6 +249,28 @@ def _download_pdf(sess, pdf_url: str, national_id: str, request_id: str, output_
     return None
 
 
+def _try_download_from_rows(pipeline_session, base_url: str, national_id: str,
+                             rows: List[Dict], output_dir: str, facility_label: str) -> Optional[str]:
+    """Tries each row in order until one has a downloadable PDF. Shared by
+    both the Gustave path and the fallback-facility path below."""
+    for row in rows:
+        request_id = row["request_id"]
+        details = _get_request_details(pipeline_session.s, base_url, request_id)
+        if not details:
+            continue
+        if not details.get("pdf_url"):
+            continue
+        log.info(f"  [website fallback] Found PDF link in request {request_id} "
+                 f"({facility_label}), downloading …")
+        saved_path = _download_pdf(pipeline_session.s, details["pdf_url"], national_id,
+                                    request_id, output_dir)
+        if saved_path:
+            log.info(f"  [website fallback] ✅ Downloaded to {saved_path}")
+            return saved_path
+        time.sleep(REQUEST_SLEEP)
+    return None
+
+
 def download_patient_pdf_from_website(pipeline_session, base_url: str, national_id: str,
                                        output_dir: str) -> Optional[str]:
     """
@@ -225,12 +288,28 @@ def download_patient_pdf_from_website(pipeline_session, base_url: str, national_
         output_dir:        folder to save the downloaded PDF into. Saved
                             as "<national_id>.pdf" inside it.
 
+    FACILITY LOGIC:
+        1. Look for requests under FACILITY_KEYWORD ("جوستاف") first, same
+           as before. Try each until one has a working PDF.
+        2. ONLY if step 1 found ZERO matching requests for this patient
+           (not merely zero *downloadable* PDFs among requests that WERE
+           found) - look for requests under FALLBACK_FACILITY_KEYWORD
+           ("البرنامج القومي لصحه المرأه الاداره العامه للأشعه") instead.
+           If Gustave rows existed but none downloaded, this fallback is
+           NOT tried - the function returns None as before, same as the
+           pre-existing behavior.
+        3. Among FALLBACK_FACILITY_KEYWORD rows, the most recent request
+           (by parsed date; ties/unparseable dates fall back to the
+           site's own table order) is tried first, then the next-most-
+           recent, and so on, same "try until one downloads" pattern as
+           step 1.
+
     Returns:
-        Full path to the downloaded PDF on success, or None if no
-        Gustave-facility request for this patient had a working PDF
-        (or the patient has no requests on the site at all). A None
-        return is not itself an error - it means "try the next
-        fallback" (the DMS archive fallback) or give up on this row.
+        Full path to the downloaded PDF on success, or None if neither
+        facility's requests for this patient had a working PDF (or the
+        patient has no requests on the site at all). A None return is
+        not itself an error - it means "try the next fallback" (the DMS
+        archive fallback) or give up on this row.
     """
     log.info(f"  [website fallback] Searching SMC site requests for patient {national_id} …")
     all_rows = _search_requests_by_national_id(pipeline_session.s, base_url, national_id)
@@ -238,24 +317,31 @@ def download_patient_pdf_from_website(pipeline_session, base_url: str, national_
     log.info(f"  [website fallback] {len(all_rows)} total request(s), "
              f"{len(gustave_rows)} matching facility keyword '{FACILITY_KEYWORD}'")
 
-    if not gustave_rows:
-        log.info("  [website fallback] No matching requests found for this patient.")
+    if gustave_rows:
+        saved_path = _try_download_from_rows(pipeline_session, base_url, national_id,
+                                              gustave_rows, output_dir, FACILITY_KEYWORD)
+        if saved_path:
+            return saved_path
+        log.info("  [website fallback] All matching requests checked - none had a working PDF.")
         return None
 
-    for row in gustave_rows:
-        request_id = row["request_id"]
-        details = _get_request_details(pipeline_session.s, base_url, request_id)
-        if not details:
-            continue
-        if not details.get("pdf_url"):
-            continue
-        log.info(f"  [website fallback] Found PDF link in request {request_id}, downloading …")
-        saved_path = _download_pdf(pipeline_session.s, details["pdf_url"], national_id,
-                                    request_id, output_dir)
-        if saved_path:
-            log.info(f"  [website fallback] ✅ Downloaded to {saved_path}")
-            return saved_path
-        time.sleep(REQUEST_SLEEP)
+    # No Gustave-facility requests found AT ALL for this patient (as
+    # opposed to some found but none downloadable, handled above) - only
+    # now check the second-choice facility.
+    log.info(f"  [website fallback] No '{FACILITY_KEYWORD}' requests found for this patient - "
+             f"checking '{FALLBACK_FACILITY_KEYWORD}' requests instead …")
+    fallback_rows = _filter_rows_by_facility(all_rows, FALLBACK_FACILITY_KEYWORD)
+    if not fallback_rows:
+        log.info("  [website fallback] No matching requests found for this patient under either facility.")
+        return None
 
-    log.info("  [website fallback] All matching requests checked - none had a working PDF.")
-    return None
+    fallback_rows_sorted = sorted(
+        fallback_rows, key=lambda r: r.get("request_date") or datetime.min, reverse=True
+    )
+    log.info(f"  [website fallback] {len(fallback_rows)} request(s) found under "
+             f"'{FALLBACK_FACILITY_KEYWORD}' - trying most recent first.")
+    saved_path = _try_download_from_rows(pipeline_session, base_url, national_id,
+                                          fallback_rows_sorted, output_dir, FALLBACK_FACILITY_KEYWORD)
+    if not saved_path:
+        log.info("  [website fallback] All matching requests checked - none had a working PDF.")
+    return saved_path
