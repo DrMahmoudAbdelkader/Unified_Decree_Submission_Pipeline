@@ -1885,8 +1885,37 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
         try:
             context.add_cookies(playwright_cookies)
             page = context.new_page()
-            page.goto(url, wait_until="networkidle",
+            # !! PERF/RELIABILITY FIX !!
+            # wait_until="networkidle" was the entire cause of the repeated
+            # multi-minute "Chromium timed out rendering ... (likely a hung
+            # asset request)" stalls seen in CI (each retry burns the full
+            # RENDER_TIMEOUT_SECONDS=90s, then a 5s sleep + re-login, up to
+            # 5x = ~8 minutes wasted on a SINGLE case). networkidle waits for
+            # ZERO in-flight network requests for 500ms straight -- any one
+            # long-polling/keep-alive/analytics/beacon request the SMC page
+            # fires in the background (common on ASP.NET sites, and more
+            # likely to matter at all on a GitHub-hosted runner's network
+            # path than on a local machine, which is exactly why this was
+            # invisible locally and only bit in CI) resets that timer
+            # forever and the wait runs out the full timeout even though
+            # everything actually needed for the print form is long since
+            # rendered. Playwright's own docs recommend against networkidle
+            # for this reason.
+            # Fix: wait for "load" (fires once every resource -- images,
+            # css, sync scripts -- has finished; doesn't care about ongoing
+            # background chatter) instead, which is what's actually needed
+            # before the layout measurement/font-face injection below runs.
+            # Then make a best-effort, SEPARATELY-BOUNDED attempt to let
+            # things settle further (harmless if the page truly does go
+            # idle quickly, never fatal or full-timeout-length if it
+            # doesn't) rather than either trusting "load" blindly or
+            # re-introducing the same unbounded hang.
+            page.goto(url, wait_until="load",
                        timeout=RENDER_TIMEOUT_SECONDS * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except PWTimeoutError:
+                pass  # fine -- "load" already fired, this was only a bonus
 
             rendered_html = page.content()
             if ("اسم المستخدم" in rendered_html and "كلمة السر" in rendered_html):
