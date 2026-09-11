@@ -541,7 +541,8 @@ _add_generic_tumor_type("gynecological_cancer", "Gynecological Cancer", "أور�
 # selectable entries. speciality_code/proc_id left at the "9"/"10"
 # default per the note above _SUPPLIED_TUMOR_TABLE - update if this
 # needs its own committee/proc routing.
-_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56")
+_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56",
+                         extra_aliases=["ovarian_cancer"])
 
 # Explicitly requested addition - Thyroid Gland Tumor, diag_code C73 as
 # supplied. english_label is set to match the exact Column C spelling
