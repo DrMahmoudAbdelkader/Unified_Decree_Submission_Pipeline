@@ -517,3 +517,31 @@ def write_submission_result(case_id: int, attempt_id: int, result: dict, request
     else:
         msg = result.get("error") or "Submission failed at the sign/report/merge/upload stage."
         open_requirement(case_id, attempt_id, msg)
+        # FIXED: previously stopped here — document_review_status stayed
+        # 'approved' and case_status was never touched, so a failed
+        # finalize (e.g. the SMC site's MaxNumberOfRequestsReached cap, a
+        # desynced session, a stale pre-signed R2 upload URL — none of
+        # which are fixed by re-approving the SAME document) left the case
+        # permanently stuck in the review queue: matched forever by
+        # document_review_status=in.(pending_review,awaiting_linked_review,
+        # approved) in loadSmcSubmissionData(), and never eligible for the
+        # ready/blocked list below it (that query is
+        # case_status=eq.READY_TO_SUBMIT). It just sat there showing
+        # "تمت الموافقة" / "إرسال للتوقيع" forever, indistinguishable from
+        # a case that had never been retried at all, with the actual
+        # failure reason nowhere the operator could see it.
+        #
+        # 'not_required' is reused deliberately rather than adding a new
+        # status value — it's already a value the document_review_status
+        # column accepts (used on success above, and by the module's
+        # manual "dismiss" button), so this can't violate a CHECK
+        # constraint I have no way to verify from here. Putting case_status
+        # back to READY_TO_SUBMIT is exactly what "send" already does from
+        # the ready list — the case becomes retryable through the normal
+        # flow, with the failure message already visible via the OPEN
+        # decree_request_requirements row just inserted above (the
+        # ready/blocked list already renders those per-case; the review
+        # queue was recently updated to render them too, for whatever
+        # window it takes this fix to reach every stuck case).
+        sb.update(ATTEMPTS_TABLE, attempt_id, {"document_review_status": "not_required"})
+        sb.update(CASES_TABLE, case_id, {"case_status": "READY_TO_SUBMIT"})
