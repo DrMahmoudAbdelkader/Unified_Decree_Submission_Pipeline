@@ -464,7 +464,35 @@ def main():
     pending_review_by_patient: Dict[str, int] = {}
     try:
         for case in cases:
-            results.append(prepare_one_case(session, case, aliases, doc_cache, pending_review_by_patient))
+            # !! CRASH-ISOLATION FIX !!
+            # This used to be a bare `results.append(prepare_one_case(...))`
+            # with NO per-case try/except — an unhandled exception ANYWHERE
+            # inside prepare_one_case() (e.g. link_sibling_to_pending_review()'s
+            # Supabase write hitting a DB check-constraint that hadn't been
+            # migrated yet) propagated straight out of this loop and killed
+            # the entire run, silently skipping every remaining case in the
+            # batch (they were never even attempted, not "processed with an
+            # error" — just never reached). That's what made a single bad
+            # case look like "the whole batch crashes under load": it had
+            # nothing to do with how many cases were queued, only with
+            # WHERE in the list the first unexpected exception happened to
+            # land. Every OTHER failure mode in prepare_one_case() already
+            # catches its own exceptions and opens a human-reviewable
+            # requirement instead of raising (see the try/except around
+            # stage_create_mdt above, for example) — this makes that the
+            # rule for the whole loop, not just the paths someone thought
+            # to wrap already.
+            case_id = case.get("id")
+            try:
+                results.append(prepare_one_case(session, case, aliases, doc_cache, pending_review_by_patient))
+            except Exception as exc:
+                log.exception(f"case {case_id}: unexpected error — flagging and continuing with the rest of the batch")
+                msg = f"خطأ غير متوقع أثناء تجهيز هذا الطلب — راجعه يدويًا. ({exc})"
+                try:
+                    common.open_requirement(case_id, None, msg)
+                except Exception:
+                    log.exception(f"case {case_id}: also failed to open a requirement for the above error")
+                results.append({"case_id": case_id, "status": "unexpected_error", "message": str(exc)})
     finally:
         # Tears down the shared Chromium/Playwright process started lazily
         # by render_print_page_to_pdf() (see Unified_Decree_Submission_
@@ -478,6 +506,7 @@ def main():
         "pending_review": sum(1 for r in results if r["status"] == "pending_review"),
         "pending_review_linked": sum(1 for r in results if r["status"] == "pending_review_linked"),
         "requirement_opened": sum(1 for r in results if r["status"] == "requirement_opened"),
+        "unexpected_error": sum(1 for r in results if r["status"] == "unexpected_error"),
         "debug_stopped": sum(1 for r in results if r["status"] == "debug_stopped"),
         "results": results,
     }
@@ -491,6 +520,7 @@ def main():
                     f"- Linked to another case's pending review (same patient, no extra review needed): "
                     f"**{summary['pending_review_linked']}**\n"
                     f"- Needs attention: **{summary['requirement_opened']}**\n"
+                    f"- Unexpected errors (flagged, batch continued): **{summary['unexpected_error']}**\n"
                     f"- Debug-stopped (render only): **{summary['debug_stopped']}**\n")
 
     if summary["total"] > 0 and summary["submitted"] == 0 and summary["pending_review"] == 0 \
