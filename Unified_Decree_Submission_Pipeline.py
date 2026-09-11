@@ -833,6 +833,25 @@ TUMOR_TYPE_ALIASES = {
     # central nervous system cancer". Assumed to mean the same thing;
     # flag this specific mapping for a quick sanity check on your end.
     "brain tumor": "brain_cns",                    # U37.6
+    # --------------------------------------------------------------
+    # Added after reconciling the live Supabase cancer_type_group list
+    # against TUMOR_TYPE_CONFIG. Every entry below is the SAME diagnosis
+    # /organ as an already-coded canonical type — only the Arabic
+    # wording differs (different preposition: "بال" vs "ال"/"في", or
+    # "ورم"/"ورم خبيث" vs "سرطان", or a ة/ه spelling difference). No
+    # diag/proc/speciality code was invented for any of these; each
+    # just points at the SAME existing code as its already-working
+    # sibling spelling. Anything that could plausibly be a genuinely
+    # different diagnosis or organ was deliberately left OUT of this
+    # list (see the reply for the full breakdown) - those still need
+    # a real diag_code from you before they can resolve.
+    "سرطان الانسجه الرخوه": "soft_tissue_sarcoma",   # C49.9 - missing "بال" vs. registered "سرطان بالانسجه الرخوه"
+    "سرطان المعده": "gastric_cancer",                # C16.9 - ة/ه spelling of registered "سرطان المعدة"
+    "سرطان بالخصيه": "testicular_cancer",            # C62.9 - "بال"+ة/ه spelling of registered "سرطان الخصية"
+    "لوكيميا": "blood_tumor",                        # C95 - bare Arabic word, same precedent as the existing bare English "leukemia"/"blood cancer" aliases above
+    "ورم بالغدة الدرقية": "thyroid_cancer",          # C73 - "ورم بالغدة" vs registered "سرطان الغدة" wording of the SAME organ (thyroid)
+    "ورم خبيث بالبروستاتا": "prostate_cancer",       # C61 - "ورم خبيث بال" vs registered "سرطان ال" wording of the SAME organ (prostate)
+    "ورم خبيث فى الغدة النكفية": "salivary_gland_cancer",  # C08.9 - the parotid IS a major salivary gland; same ICD bucket as registered "سرطان بالغده اللعابيه"
 }
 
 # FIXED BUG: this used to be a blind TUMOR_TYPE_ALIASES.update(_EXTRA_ALIASES),
