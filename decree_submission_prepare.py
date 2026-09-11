@@ -271,23 +271,51 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
 
     # Resolution order:
     #   1. Supabase cancer_type_aliases table, if this case's exact
-    #      tumor_type text has a hand-added override row there (kept as an
-    #      escape hatch for one-off text your module produces that you'd
-    #      rather remap from the dashboard than by editing this script).
-    #   2. Otherwise, the raw tumor_type text itself, straight into
-    #      resolve_tumor_type() below — this is now the primary path, since
-    #      the decree-request module's Excel export writes plain diagnosis
-    #      text (e.g. "Breast Cancer") and TUMOR_TYPE_ALIASES in the
-    #      pipeline script already recognizes that text directly. The
-    #      Supabase table is no longer required for a case to go through.
-    pipeline_key = aliases.get(case["tumor_type"]) or case["tumor_type"]
+    #      tumor_type CODE (e.g. "OTHER_ONCOLOGY") has a hand-added
+    #      override row there (kept as an escape hatch — but note it's a
+    #      single GLOBAL override per code, so it can't distinguish one
+    #      OTHER_CUSTOM case's real diagnosis from another's).
+    #   2. FIXED — was previously never consulted here: case["tumor_type_custom"],
+    #      the raw cancer_type_group text. Since decree-request-entry.js's
+    #      deriveTumorTypeFromCancerGroup() rewrite, this field ALWAYS
+    #      carries the real, verbatim, submission-synced cancer-type text
+    #      (Arabic diagnosis name) for EVERY case — not just OTHER_CUSTOM
+    #      ones — and is kept byte-for-byte in sync with the Arabic names
+    #      registered in this script via _add_generic_tumor_type() (see
+    #      that module's CANCER_TYPE_GROUP_TO_SUBMISSION_LABEL comment). A
+    #      case filed under the generic "OTHER_ONCOLOGY" bucket is, by
+    #      that module's own design, still a REAL, already-catalogued
+    #      cancer type (e.g. "سرطان المبيض" -> ovarian_cancer, C56) — it
+    #      just isn't one of the ~42 fixed TUMOR_TYPES dropdown codes.
+    #      Passing only the coarse "OTHER_ONCOLOGY" string (as before)
+    #      could never resolve to anything; the actual diagnosis text
+    #      resolves it correctly, with no human judgment call needed.
+    #   3. Falls back to the coarse tumor_type code itself if #2 didn't
+    #      resolve (covers rows where tumor_type_custom is blank/stale) —
+    #      the original primary path, still correct for the ~11
+    #      hand-curated TUMOR_TYPES codes that match module-key aliases
+    #      directly (e.g. BREAST_CANCER).
+    # Only a case that fails ALL THREE — a genuinely unrecognized
+    # cancer_type_group, i.e. real OTHER_CUSTOM — legitimately needs a
+    # human to add a mapping. That's the only kind of "custom" left after
+    # this fix.
+    alias_override = aliases.get(case["tumor_type"])
+    tumor_type_custom = (case.get("tumor_type_custom") or "").strip()
 
+    pipeline_key = alias_override or tumor_type_custom or case["tumor_type"]
     canonical, tumor_cfg_base = resolve_tumor_type(pipeline_key)
+
+    if canonical is None and not alias_override and tumor_type_custom:
+        # tumor_type_custom didn't resolve either — last resort, try the
+        # coarse code itself.
+        canonical, tumor_cfg_base = resolve_tumor_type(case["tumor_type"])
+
     if canonical is None:
-        msg = (f"لم يتم التعرف على نوع الورم \"{case['tumor_type']}\" لا في جدول "
-               f"cancer_type_aliases ولا في TUMOR_TYPE_ALIASES بالسكربت. "
-               f"أضف نوع الورم هذا في السكربت (Unified_Decree_Submission_Pipeline.py) "
-               f"أو أضف تحويلاً له في جدول cancer_type_aliases.")
+        msg = (f"لم يتم التعرف على نوع الورم \"{tumor_type_custom or case['tumor_type']}\" "
+               f"(نوع الحالة: {case['tumor_type']}) لا في جدول cancer_type_aliases ولا في "
+               f"TUMOR_TYPE_ALIASES بالسكربت. أضف نوع الورم هذا في السكربت "
+               f"(Unified_Decree_Submission_Pipeline.py) أو أضف تحويلاً له في جدول "
+               f"cancer_type_aliases.")
         common.open_requirement(case_id, None, msg)
         return {"case_id": case_id, "status": "requirement_opened", "message": msg}
 
