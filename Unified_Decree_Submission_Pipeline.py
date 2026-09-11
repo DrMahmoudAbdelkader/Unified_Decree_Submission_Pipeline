@@ -606,6 +606,7 @@ _SUPPLIED_TUMOR_TABLE = [
     ("post_jaw_tumor_resection",       "Jaw Tumor, Status Post Resection with Bone Deformity", "ما بعد استئصال ورم سرطاني بالفك مع تشوه بعظام الفك", "AB30.0"),
     ("neuroendocrine_recurrent",       "Recurrent Treatment-Resistant Neuroendocrine Tumor", "ورم سرطاني بالغدد العصبيه مرتجع غير مستجيب للعلاج", "AB45.1"),
     ("rectal_cancer_stricture",        "Rectal Cancer with Colonic Stricture",     "سرطان مستقيم + ضيق بالقولون",        "AB31.5"),
+    ("Ovarian_Cancer",                 "Ovarian Cancer",                           "سرطان المبيض",                    "C56"),
 ]
 for _cid, _elabel, _arname, _dcode in _SUPPLIED_TUMOR_TABLE:
     _add_generic_tumor_type(_cid, _elabel, _arname, _dcode)
