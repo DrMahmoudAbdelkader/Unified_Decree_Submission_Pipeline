@@ -34,7 +34,7 @@ from typing import List
 sys.path.insert(0, os.path.dirname(__file__))
 
 import decree_common as common
-from Unified_Decree_Submission_Pipeline import SMCSession
+from Unified_Decree_Submission_Pipeline import SMCSession, shutdown_shared_browser
 import supabase_client as sb
 import r2_client
 
@@ -63,6 +63,72 @@ def _download_approved_doc(national_id: str) -> str:
             f"saved it there yet. Approve only after the cleaned PDF is actually in R2."
         )
     return local_path
+
+
+def _find_linked_sibling_attempts(primary_case_id: int) -> List[dict]:
+    """Cases prepare.py parked at document_review_status='awaiting_linked_review'
+    because they share their patient's document with primary_case_id (see
+    decree_submission_prepare.py's link_sibling_to_pending_review()). These
+    were never shown to the human as a separate review — the SAME document
+    the human just approved for the primary case covers them too, so they
+    finalize automatically the moment the primary case succeeds, instead of
+    asking for (or breaking on) a second, already-consumed pending file.
+
+    PostgREST's ->> lets us filter directly on the JSON field rather than
+    pulling every awaiting_linked_review attempt and filtering in Python."""
+    return sb.select(
+        common.ATTEMPTS_TABLE, select="*",
+        filters={
+            "document_review_status": "eq.awaiting_linked_review",
+            "pipeline_state->>linked_primary_case_id": f"eq.{primary_case_id}",
+        },
+    )
+
+
+def finalize_linked_siblings(session: SMCSession, primary_case_id: int, patient_pdf_path: str) -> List[dict]:
+    """Runs Stages 2-6 for every case linked to primary_case_id, reusing
+    the SAME already-downloaded patient_pdf_path (no second R2 read, no
+    second human review) — each sibling still gets its own MDT
+    render/report/merge/upload, exactly as if it had gone through
+    finalize_one_case() on its own, just without needing its own approval
+    click first."""
+    sibling_results = []
+    for attempt in _find_linked_sibling_attempts(primary_case_id):
+        sib_case_id = attempt["case_id"]
+        sib_attempt_id = attempt["id"]
+        pipeline_state = attempt.get("pipeline_state")
+        if isinstance(pipeline_state, str):
+            pipeline_state = json.loads(pipeline_state)
+        if not pipeline_state:
+            msg = "لا توجد بيانات محفوظة لإكمال هذا الطلب المرتبط (pipeline_state فارغ)."
+            common.open_requirement(sib_case_id, sib_attempt_id, msg)
+            sibling_results.append({"case_id": sib_case_id, "status": "error", "message": msg})
+            continue
+
+        sib_case_rows = sb.select(common.CASES_TABLE, select="*", filters={"id": f"eq.{sib_case_id}"})
+        if not sib_case_rows:
+            continue
+        sib_case = sib_case_rows[0]
+        national_id = common.get_national_id(sib_case["patient_id"])
+
+        # Bookkeeping only — the document itself was already approved once
+        # for the primary case; this just keeps the attempt's own status
+        # history honest rather than jumping straight from
+        # awaiting_linked_review to SUBMITTED.
+        sb.update(common.ATTEMPTS_TABLE, sib_attempt_id, {"document_review_status": "approved"})
+        common.log_event(sib_case_id, sib_attempt_id, "auto_finalized_via_linked_review",
+                          {"primary_case_id": primary_case_id})
+
+        result = common.run_finalize_stages(session, sib_case_id, sib_attempt_id, national_id,
+                                             pipeline_state, patient_pdf_path)
+        common.write_submission_result(sib_case_id, sib_attempt_id, result,
+                                        pipeline_state.get("request_category", "ordinary"))
+        if result["status"] == "SUCCESS":
+            sibling_results.append({"case_id": sib_case_id, "status": "submitted",
+                                     "request_number": result["final_request_no"]})
+        else:
+            sibling_results.append({"case_id": sib_case_id, "status": "error", "message": result.get("error")})
+    return sibling_results
 
 
 def finalize_one_case(session: SMCSession, case: dict) -> dict:
@@ -106,7 +172,12 @@ def finalize_one_case(session: SMCSession, case: dict) -> dict:
     common.write_submission_result(case_id, attempt_id, result, pipeline_state.get("request_category", "ordinary"))
 
     if result["status"] == "SUCCESS":
-        return {"case_id": case_id, "status": "submitted", "request_number": result["final_request_no"]}
+        # Same patient, same document, other case(s) that were linked
+        # instead of duplicated at prepare time (see decree_submission_
+        # prepare.py) — finish them now, automatically, no second review.
+        linked_results = finalize_linked_siblings(session, case_id, patient_pdf_path)
+        return {"case_id": case_id, "status": "submitted", "request_number": result["final_request_no"],
+                "linked_siblings": linked_results}
     return {"case_id": case_id, "status": "error", "message": result.get("error")}
 
 
@@ -123,12 +194,22 @@ def main():
         raise SystemExit("SMC login failed — check SMC_USERNAME/SMC_PASSWORD secrets.")
 
     cases = sb.select(common.CASES_TABLE, select="*", filters={"id": f"in.({','.join(str(i) for i in case_ids)})"})
-    results = [finalize_one_case(session, case) for case in cases]
+    try:
+        results = [finalize_one_case(session, case) for case in cases]
+    finally:
+        # Tears down the shared Chromium/Playwright process started lazily
+        # by render_print_page_to_pdf() (see Unified_Decree_Submission_
+        # Pipeline.py's shared-browser block) — always, even if a case
+        # raised, so nothing is left running after this script exits.
+        shutdown_shared_browser()
 
     summary = {
         "total": len(results),
         "submitted": sum(1 for r in results if r["status"] == "submitted"),
         "error": sum(1 for r in results if r["status"] == "error"),
+        "linked_siblings_submitted": sum(
+            1 for r in results for s in r.get("linked_siblings", []) if s["status"] == "submitted"
+        ),
         "results": results,
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -136,7 +217,9 @@ def main():
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"## Decree finalize run\n- Submitted: **{summary['submitted']}**\n- Errors: **{summary['error']}**\n")
+            f.write(f"## Decree finalize run\n- Submitted: **{summary['submitted']}**\n"
+                    f"- Also auto-submitted (linked to the same patient's approved document): "
+                    f"**{summary['linked_siblings_submitted']}**\n- Errors: **{summary['error']}**\n")
 
     if summary["error"] > 0:
         sys.exit(1)

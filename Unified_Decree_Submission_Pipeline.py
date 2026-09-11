@@ -298,6 +298,64 @@ RENDER_TIMEOUT_SECONDS = 90
 # to have matched the family name correctly.
 MDT_FORM_FONT_PATHS: Dict[str, str] = {}
 
+# =====================================================================
+# SHARED CHROMIUM/PLAYWRIGHT PROCESS (performance only — no rendering
+# behavior change)
+# =====================================================================
+# render_print_page_to_pdf() used to open `with sync_playwright() as pw:
+# browser = pw.chromium.launch()` and tear the whole thing down again on
+# every single call — i.e. once PER CASE in a batch run. Starting the
+# Playwright driver subprocess and launching a fresh headless Chromium
+# is by far the most expensive fixed cost in this whole pipeline (easily
+# 1-3+ seconds each, more on a cold GitHub-hosted runner), and it was
+# being paid over and over for no reason: nothing about a single render
+# actually requires its own dedicated browser PROCESS, only its own
+# browser CONTEXT (for cookie isolation), which is orders of magnitude
+# cheaper to create/destroy. This starts the driver + browser ONCE per
+# script run (lazily, on first render) and every call below just opens
+# and closes its own context against that one shared browser — same
+# cookies, same page, same render/print/scale logic as before, just
+# without re-paying the launch cost every time. Call
+# shutdown_shared_browser() once at the very end of a run (both
+# decree_submission_prepare.py's and decree_submission_finalize.py's
+# main() do this in a finally block) so nothing is left running.
+_shared_playwright = None
+_shared_browser = None
+
+
+def _get_shared_browser():
+    global _shared_playwright, _shared_browser
+    if _shared_browser is not None:
+        try:
+            # Cheap liveness check — a context create/close is (much)
+            # cheaper than a relaunch, and catches the rare case where
+            # the browser process died mid-run.
+            _shared_browser.new_context().close()
+            return _shared_browser
+        except Exception:
+            log.warning("Shared Chromium instance looks dead — relaunching once.")
+            shutdown_shared_browser()
+    _shared_playwright = sync_playwright().start()
+    _shared_browser = _shared_playwright.chromium.launch()
+    return _shared_browser
+
+
+def shutdown_shared_browser():
+    global _shared_playwright, _shared_browser
+    try:
+        if _shared_browser is not None:
+            _shared_browser.close()
+    except Exception:
+        pass
+    try:
+        if _shared_playwright is not None:
+            _shared_playwright.stop()
+    except Exception:
+        pass
+    _shared_browser = None
+    _shared_playwright = None
+
+
 # Signature / stamp images.
 SIGNATURE_FILES = {
     "sig1": r"C:\Users\drmah\Template_Signatures\mdt1.png",
@@ -1803,280 +1861,279 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
     ]
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch()
-            try:
-                context = browser.new_context()
-                context.add_cookies(playwright_cookies)
-                page = context.new_page()
-                page.goto(url, wait_until="networkidle",
-                           timeout=RENDER_TIMEOUT_SECONDS * 1000)
+        browser = _get_shared_browser()
+        context = browser.new_context()
+        try:
+            context.add_cookies(playwright_cookies)
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle",
+                       timeout=RENDER_TIMEOUT_SECONDS * 1000)
 
-                rendered_html = page.content()
-                if ("اسم المستخدم" in rendered_html and "كلمة السر" in rendered_html):
-                    raise OSError(
-                        f"Chromium landed on the logged-out SMC page for "
-                        f"pre_request_id={pre_request_id} — session expired "
-                        f"between fetch and render. Will re-login and retry."
-                    )
-
-                # --- Font: NOTHING to do here anymore. fc-list in this
-                # run's own log already proves 'Tahoma' is correctly
-                # installed and visible to fontconfig (decree_common's
-                # fc-cache install worked). The @font-face injection that
-                # used to sit here was a mistake — it sampled
-                # document.body's computed font (legitimately "Times New
-                # Roman", the page's generic default, not what the MDT
-                # table itself asks for) and force-applied that name to
-                # EVERY element via `* { ... !important }`, overriding
-                # cells that were already correctly rendering in real
-                # Tahoma through plain fontconfig substitution. That's
-                # what produced the worse, more reflowed result — not a
-                # remaining font problem. Removed; trust the OS-level
-                # install, which is confirmed working.
-
-                # ----------------------------------------------------------------
-                # FONT-AGNOSTIC LAYOUT FIX
-                #
-                # The runner installs Amiri (fonts-hosny-amiri) which has wider
-                # character metrics than the page's requested 'Hacen Tunisia'.
-                # This causes date values to wrap even with nowrap on the td,
-                # because the column is too narrow for Amiri's wider glyphs.
-                #
-                # Strategy:
-                #   A. White background on body/html, zero body margin.
-                #   B. Remove .page margin + min-height only. Leave all other
-                #      .page properties (width:210mm, padding:10px) untouched.
-                #   C. Clear Bootstrap wrapper overflow/max-width clipping.
-                #   D. Inject @font-face for the installed font so Chromium
-                #      uses it consistently (avoids silent fallback to a
-                #      different font with different metrics mid-render).
-                #   E. Date VALUE cells: nowrap + explicit min-width large
-                #      enough to hold a date string in any Arabic font.
-                #      Label cells are identified by Arabic substring match
-                #      (robust to hamza normalisation variants).
-                #   F. scale=0.97 in page.pdf() as final safety net.
-                # ----------------------------------------------------------------
-                page.emulate_media(media="print")
-
-                # Build the @font-face injection string from whatever font
-                # file is actually installed on this runner. MDT_FORM_FONT_PATHS
-                # is populated by decree_common._install_mdt_form_font() when
-                # running in CI; empty dict when running locally (font already
-                # present via OS). When empty, skip injection and trust the OS.
-                font_face_css = ""
-                _font_paths = MDT_FORM_FONT_PATHS  # module-level dict
-                if _font_paths.get("regular"):
-                    _fp = _font_paths["regular"].replace("\\", "/")
-                    font_face_css += (
-                        f"@font-face {{font-family:'Hacen Tunisia';"
-                        f"src:url('file://{_fp}') format('truetype');"
-                        f"font-weight:normal;font-style:normal;}}"
-                    )
-                if _font_paths.get("bold"):
-                    _fp = _font_paths["bold"].replace("\\", "/")
-                    font_face_css += (
-                        f"@font-face {{font-family:'Hacen Tunisia';"
-                        f"src:url('file://{_fp}') format('truetype');"
-                        f"font-weight:bold;font-style:normal;}}"
-                    )
-
-                layout_result = page.evaluate(
-                    f"""() => {{
-                        const set = (el, prop, val) =>
-                            el.style.setProperty(prop, val, 'important');
-                        const normalize = s =>
-                            (s || '').replace(/\\s+/g, ' ').trim();
-
-                        // A. White background, zero body margin.
-                        set(document.documentElement, 'background-color', 'white');
-                        set(document.body, 'background-color', 'white');
-                        set(document.body, 'margin', '0');
-                        set(document.body, 'padding', '0');
-
-                        // D. Inject @font-face so Chromium uses the installed
-                        // font consistently under its real family name.
-                        const fontFaceCSS = {repr(font_face_css)};
-                        if (fontFaceCSS) {{
-                            const style = document.createElement('style');
-                            style.textContent = fontFaceCSS;
-                            document.head.appendChild(style);
-                        }}
-
-                        // B. Find .page, remove margin + min-height only.
-                        const root = document.querySelector('.form-horizontal.page')
-                                  || document.querySelector('.page');
-                        if (!root) return {{ok: false, reason: 'page-root-not-found'}};
-                        set(root, 'margin', '0');
-                        set(root, 'min-height', '0');
-                        set(root, 'height', 'auto');
-
-                        // C. Remove Bootstrap wrapper overflow/max-width.
-                        let parent = root.parentElement;
-                        let levels = 0;
-                        while (parent && parent !== document.body && levels++ < 8) {{
-                            set(parent, 'overflow', 'visible');
-                            set(parent, 'max-width', 'none');
-                            set(parent, 'width', 'auto');
-                            set(parent, 'margin', '0');
-                            set(parent, 'padding', '0');
-                            parent = parent.parentElement;
-                        }}
-
-                        // E. Prevent date strings (digit runs joined by
-                        // hyphens, e.g. "2026-09-07") from line-breaking,
-                        // WITHOUT touching any width/table-layout property.
-                        //
-                        // Root cause: a hyphen is a normal soft line-break
-                        // opportunity in CSS text layout even with no
-                        // surrounding whitespace, so a date can split right
-                        // after a "-" regardless of column width. Earlier
-                        // attempts forced min-width/table-layout:auto on the
-                        // whole date cell to "make room" for the date - but
-                        // that stole width from the neighbouring Arabic
-                        // label cell, which then wrapped onto extra lines
-                        // and pushed the form to two pages. That approach
-                        // is removed entirely; nothing about cell/table
-                        // width or layout is touched anymore.
-                        //
-                        // Fix: walk every text node under the form root,
-                        // find date-like digit-hyphen runs, and wrap just
-                        // that exact run in its own
-                        // <span style="white-space:nowrap">. This makes the
-                        // date text itself unbreakable without changing any
-                        // column's width, so it can't force other cells to
-                        // wrap and can't reintroduce a second page.
-                        const dateRe = /\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/g;
-                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-                        const textNodes = [];
-                        let tn;
-                        while ((tn = walker.nextNode())) {{
-                            dateRe.lastIndex = 0;
-                            if (dateRe.test(tn.nodeValue)) textNodes.push(tn);
-                        }}
-                        let dateSpansWrapped = 0;
-                        for (const node of textNodes) {{
-                            const text = node.nodeValue;
-                            dateRe.lastIndex = 0;
-                            let match;
-                            let lastIndex = 0;
-                            let any = false;
-                            const frag = document.createDocumentFragment();
-                            while ((match = dateRe.exec(text)) !== null) {{
-                                any = true;
-                                if (match.index > lastIndex) {{
-                                    frag.appendChild(document.createTextNode(
-                                        text.slice(lastIndex, match.index)));
-                                }}
-                                const span = document.createElement('span');
-                                set(span, 'white-space', 'nowrap');
-                                span.textContent = match[0];
-                                frag.appendChild(span);
-                                lastIndex = match.index + match[0].length;
-                                dateSpansWrapped++;
-                            }}
-                            if (any) {{
-                                if (lastIndex < text.length) {{
-                                    frag.appendChild(document.createTextNode(
-                                        text.slice(lastIndex)));
-                                }}
-                                node.parentNode.replaceChild(frag, node);
-                            }}
-                        }}
-
-                        const r = root.getBoundingClientRect();
-
-                        // E2. Some rows still don't collapse onto a single
-                        // physical line at full size in this headless
-                        // render environment — either a label+value pair
-                        // (the value, now a single unbreakable unit from
-                        // step E, has nowhere to go but the next line), or
-                        // a long placeholder dash-run ("---------------")
-                        // that wraps a dash or two early. The true original
-                        // site fits both on one line. Rather than guess at
-                        // exactly why (font metrics we can't fully match
-                        // without the live site's CSS), shrink JUST that
-                        // one row's font-size in small steps until it
-                        // collapses back to a single line. Tightly scoped:
-                        // only LEAF rows (no nested <tr>, so a wrapping
-                        // container row is never touched) whose text
-                        // contains a long dash-run or a date/ID-like
-                        // digit-hyphen pattern are even considered, and a
-                        // row that already fits on one line is left
-                        // completely alone — nothing else in the document
-                        // is affected.
-                        const wrapRe = /-{{3,}}|\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/;
-                        const isSingleLine = el => {{
-                            const cs = getComputedStyle(el);
-                            let lh = parseFloat(cs.lineHeight);
-                            if (!lh || isNaN(lh)) lh = parseFloat(cs.fontSize) * 1.2;
-                            return el.getBoundingClientRect().height <= lh * 1.35;
-                        }};
-                        let rowsShrunk = 0;
-                        for (const row of root.querySelectorAll('tr')) {{
-                            if (row.querySelector('tr')) continue;  // skip wrapping/container rows
-                            if (!wrapRe.test(row.innerText)) continue;
-                            if (isSingleLine(row)) continue;  // already fits — leave alone
-                            const baseSize = parseFloat(getComputedStyle(row).fontSize) || 16;
-                            let factor = 1.0;
-                            let guard = 0;
-                            while (factor > 0.6 && !isSingleLine(row) && guard++ < 10) {{
-                                factor -= 0.04;
-                                set(row, 'font-size', (baseSize * factor).toFixed(2) + 'px');
-                            }}
-                            if (factor < 1.0) rowsShrunk++;
-                        }}
-
-                        // Measure full document scroll height so we can
-                        // compute the exact scale to fit one A4 page.
-                        const scrollH = Math.max(
-                            document.documentElement.scrollHeight,
-                            document.body ? document.body.scrollHeight : 0
-                        );
-                        return {{
-                            ok: true,
-                            dateSpansWrapped,
-                            rowsShrunk,
-                            fontInjected: !!fontFaceCSS,
-                            formWidth:  Math.round(r.width),
-                            formHeight: Math.round(r.height),
-                            scrollHeight: Math.round(scrollH),
-                            direction:  getComputedStyle(root).direction,
-                            fontFamily: getComputedStyle(root).fontFamily,
-                        }};
-                    }}""",
+            rendered_html = page.content()
+            if ("اسم المستخدم" in rendered_html and "كلمة السر" in rendered_html):
+                raise OSError(
+                    f"Chromium landed on the logged-out SMC page for "
+                    f"pre_request_id={pre_request_id} — session expired "
+                    f"between fetch and render. Will re-login and retry."
                 )
-                log.info(f"MDT layout fixup result: {layout_result}")
 
-                # Compute exact scale to fit rendered content on one A4 page.
-                # A4 at 96 CSS px/inch = 297mm = 1122.52px tall.
-                # We measure scrollHeight (full document height in px after
-                # all JS manipulations) and scale down just enough to fit.
-                # This is font-agnostic: works whether Chromium uses Amiri,
-                # Hacen Tunisia, or any other font with different metrics.
-                A4_HEIGHT_PX = 1122.0
-                scroll_h = (layout_result or {}).get("scrollHeight")
-                if scroll_h and scroll_h > A4_HEIGHT_PX:
-                    computed_scale = round(A4_HEIGHT_PX / scroll_h, 4)
-                    computed_scale = max(0.70, computed_scale)  # safety floor
-                    log.info(f"MDT scrollHeight={scroll_h}px > A4 {A4_HEIGHT_PX}px: "
-                             f"auto-scaling to {computed_scale} to fit one page.")
-                else:
-                    computed_scale = 1.0
-                    log.info(f"MDT scrollHeight={scroll_h}px fits within A4 "
-                             f"{A4_HEIGHT_PX}px: scale=1.0.")
+            # --- Font: NOTHING to do here anymore. fc-list in this
+            # run's own log already proves 'Tahoma' is correctly
+            # installed and visible to fontconfig (decree_common's
+            # fc-cache install worked). The @font-face injection that
+            # used to sit here was a mistake — it sampled
+            # document.body's computed font (legitimately "Times New
+            # Roman", the page's generic default, not what the MDT
+            # table itself asks for) and force-applied that name to
+            # EVERY element via `* { ... !important }`, overriding
+            # cells that were already correctly rendering in real
+            # Tahoma through plain fontconfig substitution. That's
+            # what produced the worse, more reflowed result — not a
+            # remaining font problem. Removed; trust the OS-level
+            # install, which is confirmed working.
 
-                pdf_kwargs = dict(
-                    format="A4",
-                    margin={"top": "0mm", "bottom": "0mm",
-                            "left": "0mm", "right": "0mm"},
-                    print_background=True,
-                    prefer_css_page_size=False,
-                    scale=computed_scale,
+            # ----------------------------------------------------------------
+            # FONT-AGNOSTIC LAYOUT FIX
+            #
+            # The runner installs Amiri (fonts-hosny-amiri) which has wider
+            # character metrics than the page's requested 'Hacen Tunisia'.
+            # This causes date values to wrap even with nowrap on the td,
+            # because the column is too narrow for Amiri's wider glyphs.
+            #
+            # Strategy:
+            #   A. White background on body/html, zero body margin.
+            #   B. Remove .page margin + min-height only. Leave all other
+            #      .page properties (width:210mm, padding:10px) untouched.
+            #   C. Clear Bootstrap wrapper overflow/max-width clipping.
+            #   D. Inject @font-face for the installed font so Chromium
+            #      uses it consistently (avoids silent fallback to a
+            #      different font with different metrics mid-render).
+            #   E. Date VALUE cells: nowrap + explicit min-width large
+            #      enough to hold a date string in any Arabic font.
+            #      Label cells are identified by Arabic substring match
+            #      (robust to hamza normalisation variants).
+            #   F. scale=0.97 in page.pdf() as final safety net.
+            # ----------------------------------------------------------------
+            page.emulate_media(media="print")
+
+            # Build the @font-face injection string from whatever font
+            # file is actually installed on this runner. MDT_FORM_FONT_PATHS
+            # is populated by decree_common._install_mdt_form_font() when
+            # running in CI; empty dict when running locally (font already
+            # present via OS). When empty, skip injection and trust the OS.
+            font_face_css = ""
+            _font_paths = MDT_FORM_FONT_PATHS  # module-level dict
+            if _font_paths.get("regular"):
+                _fp = _font_paths["regular"].replace("\\", "/")
+                font_face_css += (
+                    f"@font-face {{font-family:'Hacen Tunisia';"
+                    f"src:url('file://{_fp}') format('truetype');"
+                    f"font-weight:normal;font-style:normal;}}"
                 )
-                pdf_bytes = page.pdf(**pdf_kwargs)
-            finally:
-                browser.close()
+            if _font_paths.get("bold"):
+                _fp = _font_paths["bold"].replace("\\", "/")
+                font_face_css += (
+                    f"@font-face {{font-family:'Hacen Tunisia';"
+                    f"src:url('file://{_fp}') format('truetype');"
+                    f"font-weight:bold;font-style:normal;}}"
+                )
+
+            layout_result = page.evaluate(
+                f"""() => {{
+                    const set = (el, prop, val) =>
+                        el.style.setProperty(prop, val, 'important');
+                    const normalize = s =>
+                        (s || '').replace(/\\s+/g, ' ').trim();
+
+                    // A. White background, zero body margin.
+                    set(document.documentElement, 'background-color', 'white');
+                    set(document.body, 'background-color', 'white');
+                    set(document.body, 'margin', '0');
+                    set(document.body, 'padding', '0');
+
+                    // D. Inject @font-face so Chromium uses the installed
+                    // font consistently under its real family name.
+                    const fontFaceCSS = {repr(font_face_css)};
+                    if (fontFaceCSS) {{
+                        const style = document.createElement('style');
+                        style.textContent = fontFaceCSS;
+                        document.head.appendChild(style);
+                    }}
+
+                    // B. Find .page, remove margin + min-height only.
+                    const root = document.querySelector('.form-horizontal.page')
+                              || document.querySelector('.page');
+                    if (!root) return {{ok: false, reason: 'page-root-not-found'}};
+                    set(root, 'margin', '0');
+                    set(root, 'min-height', '0');
+                    set(root, 'height', 'auto');
+
+                    // C. Remove Bootstrap wrapper overflow/max-width.
+                    let parent = root.parentElement;
+                    let levels = 0;
+                    while (parent && parent !== document.body && levels++ < 8) {{
+                        set(parent, 'overflow', 'visible');
+                        set(parent, 'max-width', 'none');
+                        set(parent, 'width', 'auto');
+                        set(parent, 'margin', '0');
+                        set(parent, 'padding', '0');
+                        parent = parent.parentElement;
+                    }}
+
+                    // E. Prevent date strings (digit runs joined by
+                    // hyphens, e.g. "2026-09-07") from line-breaking,
+                    // WITHOUT touching any width/table-layout property.
+                    //
+                    // Root cause: a hyphen is a normal soft line-break
+                    // opportunity in CSS text layout even with no
+                    // surrounding whitespace, so a date can split right
+                    // after a "-" regardless of column width. Earlier
+                    // attempts forced min-width/table-layout:auto on the
+                    // whole date cell to "make room" for the date - but
+                    // that stole width from the neighbouring Arabic
+                    // label cell, which then wrapped onto extra lines
+                    // and pushed the form to two pages. That approach
+                    // is removed entirely; nothing about cell/table
+                    // width or layout is touched anymore.
+                    //
+                    // Fix: walk every text node under the form root,
+                    // find date-like digit-hyphen runs, and wrap just
+                    // that exact run in its own
+                    // <span style="white-space:nowrap">. This makes the
+                    // date text itself unbreakable without changing any
+                    // column's width, so it can't force other cells to
+                    // wrap and can't reintroduce a second page.
+                    const dateRe = /\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/g;
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                    const textNodes = [];
+                    let tn;
+                    while ((tn = walker.nextNode())) {{
+                        dateRe.lastIndex = 0;
+                        if (dateRe.test(tn.nodeValue)) textNodes.push(tn);
+                    }}
+                    let dateSpansWrapped = 0;
+                    for (const node of textNodes) {{
+                        const text = node.nodeValue;
+                        dateRe.lastIndex = 0;
+                        let match;
+                        let lastIndex = 0;
+                        let any = false;
+                        const frag = document.createDocumentFragment();
+                        while ((match = dateRe.exec(text)) !== null) {{
+                            any = true;
+                            if (match.index > lastIndex) {{
+                                frag.appendChild(document.createTextNode(
+                                    text.slice(lastIndex, match.index)));
+                            }}
+                            const span = document.createElement('span');
+                            set(span, 'white-space', 'nowrap');
+                            span.textContent = match[0];
+                            frag.appendChild(span);
+                            lastIndex = match.index + match[0].length;
+                            dateSpansWrapped++;
+                        }}
+                        if (any) {{
+                            if (lastIndex < text.length) {{
+                                frag.appendChild(document.createTextNode(
+                                    text.slice(lastIndex)));
+                            }}
+                            node.parentNode.replaceChild(frag, node);
+                        }}
+                    }}
+
+                    const r = root.getBoundingClientRect();
+
+                    // E2. Some rows still don't collapse onto a single
+                    // physical line at full size in this headless
+                    // render environment — either a label+value pair
+                    // (the value, now a single unbreakable unit from
+                    // step E, has nowhere to go but the next line), or
+                    // a long placeholder dash-run ("---------------")
+                    // that wraps a dash or two early. The true original
+                    // site fits both on one line. Rather than guess at
+                    // exactly why (font metrics we can't fully match
+                    // without the live site's CSS), shrink JUST that
+                    // one row's font-size in small steps until it
+                    // collapses back to a single line. Tightly scoped:
+                    // only LEAF rows (no nested <tr>, so a wrapping
+                    // container row is never touched) whose text
+                    // contains a long dash-run or a date/ID-like
+                    // digit-hyphen pattern are even considered, and a
+                    // row that already fits on one line is left
+                    // completely alone — nothing else in the document
+                    // is affected.
+                    const wrapRe = /-{{3,}}|\\d[\\d\\u0660-\\u0669]*(?:-[\\d\\u0660-\\u0669]+)+/;
+                    const isSingleLine = el => {{
+                        const cs = getComputedStyle(el);
+                        let lh = parseFloat(cs.lineHeight);
+                        if (!lh || isNaN(lh)) lh = parseFloat(cs.fontSize) * 1.2;
+                        return el.getBoundingClientRect().height <= lh * 1.35;
+                    }};
+                    let rowsShrunk = 0;
+                    for (const row of root.querySelectorAll('tr')) {{
+                        if (row.querySelector('tr')) continue;  // skip wrapping/container rows
+                        if (!wrapRe.test(row.innerText)) continue;
+                        if (isSingleLine(row)) continue;  // already fits — leave alone
+                        const baseSize = parseFloat(getComputedStyle(row).fontSize) || 16;
+                        let factor = 1.0;
+                        let guard = 0;
+                        while (factor > 0.6 && !isSingleLine(row) && guard++ < 10) {{
+                            factor -= 0.04;
+                            set(row, 'font-size', (baseSize * factor).toFixed(2) + 'px');
+                        }}
+                        if (factor < 1.0) rowsShrunk++;
+                    }}
+
+                    // Measure full document scroll height so we can
+                    // compute the exact scale to fit one A4 page.
+                    const scrollH = Math.max(
+                        document.documentElement.scrollHeight,
+                        document.body ? document.body.scrollHeight : 0
+                    );
+                    return {{
+                        ok: true,
+                        dateSpansWrapped,
+                        rowsShrunk,
+                        fontInjected: !!fontFaceCSS,
+                        formWidth:  Math.round(r.width),
+                        formHeight: Math.round(r.height),
+                        scrollHeight: Math.round(scrollH),
+                        direction:  getComputedStyle(root).direction,
+                        fontFamily: getComputedStyle(root).fontFamily,
+                    }};
+                }}""",
+            )
+            log.info(f"MDT layout fixup result: {layout_result}")
+
+            # Compute exact scale to fit rendered content on one A4 page.
+            # A4 at 96 CSS px/inch = 297mm = 1122.52px tall.
+            # We measure scrollHeight (full document height in px after
+            # all JS manipulations) and scale down just enough to fit.
+            # This is font-agnostic: works whether Chromium uses Amiri,
+            # Hacen Tunisia, or any other font with different metrics.
+            A4_HEIGHT_PX = 1122.0
+            scroll_h = (layout_result or {}).get("scrollHeight")
+            if scroll_h and scroll_h > A4_HEIGHT_PX:
+                computed_scale = round(A4_HEIGHT_PX / scroll_h, 4)
+                computed_scale = max(0.70, computed_scale)  # safety floor
+                log.info(f"MDT scrollHeight={scroll_h}px > A4 {A4_HEIGHT_PX}px: "
+                         f"auto-scaling to {computed_scale} to fit one page.")
+            else:
+                computed_scale = 1.0
+                log.info(f"MDT scrollHeight={scroll_h}px fits within A4 "
+                         f"{A4_HEIGHT_PX}px: scale=1.0.")
+
+            pdf_kwargs = dict(
+                format="A4",
+                margin={"top": "0mm", "bottom": "0mm",
+                        "left": "0mm", "right": "0mm"},
+                print_background=True,
+                prefer_css_page_size=False,
+                scale=computed_scale,
+            )
+            pdf_bytes = page.pdf(**pdf_kwargs)
+        finally:
+            context.close()
     except PWTimeoutError as exc:
         raise OSError(
             f"Chromium timed out rendering pre_request_id={pre_request_id} "

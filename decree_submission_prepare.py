@@ -25,10 +25,20 @@ For each READY_TO_SUBMIT case:
          to the live SMC-website / CMIS-archive fallback extraction,
          same as before. Because this is freshly extracted, per the
          two-phase decision, this run STOPS here — uploads the extracted
-         PDF to the Supabase Storage pending-review bucket, saves
-         everything decree_submission_finalize.py will need to resume,
-         and opens a requirement asking a human to review it in the
-         module before the actual signing/merging/upload happens.
+         PDF to R2's pending/<national_id>.pdf key (see r2_client.py;
+         same bucket as the permanent cache, different prefix — NOT
+         Supabase Storage), saves everything decree_submission_finalize.py
+         will need to resume, and opens a requirement asking a human to
+         review it in the module before the actual signing/merging/upload
+         happens.
+       - SAME-PATIENT SIBLINGS: if another case for this same national_id
+         already has an attempt sitting at pending_review earlier in THIS
+         run, this case is never uploaded/reviewed a second time — see
+         link_sibling_to_pending_review() and pending_review_by_patient
+         below. It's parked at document_review_status='awaiting_linked_review'
+         and finalize_linked_siblings() (decree_submission_finalize.py)
+         finishes it automatically the moment the primary case's document
+         is approved, reusing that one already-downloaded PDF.
 
 RUN LOCALLY (test one case before trusting the cron/click):
     export SUPABASE_URL=...  SUPABASE_SERVICE_ROLE_KEY=...
@@ -51,7 +61,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import decree_common as common
 from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, stage_create_mdt, \
     locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id, \
-    render_print_page_to_pdf, apply_signatures_and_stamp
+    render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser
 import supabase_client as sb
 import r2_client
 
@@ -195,7 +205,68 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
                                            "requirement_text": msg, "status": "OPEN"})
 
 
-def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -> dict:
+def link_sibling_to_pending_review(case: dict, attempt_id: int, national_id: str, pre_request_id: str,
+                                    full_name: str, tumor_cfg: dict, medical_report_text: str,
+                                    request_category: str, doc_source: str, primary_case_id: int):
+    """A SIBLING case for a patient that already has another case in this
+    same run sitting at pending_review (see resolve_patient_document() /
+    pending_review_by_patient in main()).
+
+    Deliberately does NOT call r2_client.upload_pending() again (the
+    primary case's stage_and_flag_for_review() already put the ONE copy
+    of this patient's extracted document there) and does NOT set
+    document_review_status='pending_review' or open a requirement — doing
+    either would be exactly the bug being fixed: a second, independent
+    "needs review" card for a document a human is already about to review
+    once. Instead this attempt is parked at 'awaiting_linked_review' with
+    enough pipeline_state to finish on its own, and
+    decree_submission_finalize.py's cascade (see finalize_linked_siblings())
+    picks it up automatically the moment the primary case is approved and
+    successfully finalized — no second review, ever, for the same file.
+    """
+    case_id = case["id"]
+    pipeline_state = {
+        "pre_request_id": pre_request_id,
+        "full_name": full_name,
+        "tumor_cfg": tumor_cfg,
+        "medical_report_text": medical_report_text,
+        "request_category": request_category,
+        "doc_source": doc_source,
+        "linked_primary_case_id": primary_case_id,
+    }
+    sb.update(common.ATTEMPTS_TABLE, attempt_id, {
+        "document_review_status": "awaiting_linked_review",
+        "document_storage_key": f"r2:pending/{national_id}.pdf",
+        "pipeline_state": pipeline_state,
+    })
+    sb.update(common.CASES_TABLE, case_id, {"case_status": "PENDING"})
+    common.log_event(case_id, attempt_id, "linked_to_sibling_pending_review",
+                      {"pre_request_id": pre_request_id, "primary_case_id": primary_case_id,
+                       "national_id": national_id})
+
+
+def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: Dict[str, tuple]):
+    """locate_patient_document_pdf() is the potentially-slow step (SMC
+    website search + CMIS archive fallback when nothing's cached) — and
+    when the same patient has more than one case in a single run, calling
+    it once per CASE instead of once per PATIENT was both the root cause
+    of the duplicate-review bug (two independent 'newly extracted'
+    results for the exact same document) and pure wasted time (the same
+    slow fallback search running twice for nothing). doc_cache is a plain
+    dict scoped to this run, keyed by national_id, so every case for the
+    same patient after the first one reuses the already-resolved result
+    instead of hitting the network again."""
+    if national_id in doc_cache:
+        return doc_cache[national_id]
+    result = locate_patient_document_pdf(
+        session, national_id, find_local_fn=make_r2_aware_finder(national_id),
+    )
+    doc_cache[national_id] = result
+    return result
+
+
+def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
+                      doc_cache: Dict[str, tuple], pending_review_by_patient: Dict[str, int]) -> dict:
     case_id = case["id"]
 
     # Resolution order:
@@ -274,9 +345,10 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -
     if debug_mode_on():
         return debug_dump_mdt_and_stop(session, case_id, attempt_id, pre_request_id, national_id)
 
-    id_pdf_path, doc_source, newly_extracted = locate_patient_document_pdf(
-        session, national_id, find_local_fn=make_r2_aware_finder(national_id),
-    )
+    # Resolved ONCE per patient per run (see resolve_patient_document's
+    # docstring) — a second case for the same patient reuses this instead
+    # of re-searching the SMC website / CMIS archive from scratch.
+    id_pdf_path, doc_source, newly_extracted = resolve_patient_document(session, national_id, doc_cache)
 
     if not id_pdf_path:
         msg = (f"لم يتم العثور على مستند المريض لا في الأرشيف الدائم ولا على موقع SMC ولا في أرشيف CMIS. "
@@ -285,9 +357,21 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str]) -
         return {"case_id": case_id, "status": "requirement_opened", "message": msg}
 
     if newly_extracted:
-        stage_and_flag_for_review(case, attempt_id, national_id, pre_request_id, full_name, tumor_cfg,
-                                   texts["medical_report_text"], request_category, id_pdf_path, doc_source)
-        return {"case_id": case_id, "status": "pending_review", "pre_request_id": pre_request_id}
+        primary_case_id = pending_review_by_patient.get(national_id)
+        if primary_case_id is None:
+            # First case for this patient in this run to need review —
+            # this is the ONE card the human will see and label.
+            stage_and_flag_for_review(case, attempt_id, national_id, pre_request_id, full_name, tumor_cfg,
+                                       texts["medical_report_text"], request_category, id_pdf_path, doc_source)
+            pending_review_by_patient[national_id] = case_id
+            return {"case_id": case_id, "status": "pending_review", "pre_request_id": pre_request_id}
+        # A sibling case for a patient that's already queued for review
+        # above — link it instead of opening a second review for the same
+        # physical document.
+        link_sibling_to_pending_review(case, attempt_id, national_id, pre_request_id, full_name, tumor_cfg,
+                                        texts["medical_report_text"], request_category, doc_source, primary_case_id)
+        return {"case_id": case_id, "status": "pending_review_linked",
+                "pre_request_id": pre_request_id, "linked_primary_case_id": primary_case_id}
 
     # Cache hit — already reviewed and approved for this patient before.
     # Continue straight through to submission in this same run.
@@ -333,14 +417,38 @@ def main():
     filters = {"case_status": "eq.READY_TO_SUBMIT"}
     if case_ids:
         filters["id"] = f"in.({','.join(str(i) for i in case_ids)})"
-    cases = sb.select(common.CASES_TABLE, select="*", filters=filters)
+    # Ordered by created_at so that, when a patient has more than one
+    # READY_TO_SUBMIT case, the OLDEST one is always the "primary" that
+    # gets the human-reviewable card (see pending_review_by_patient
+    # above) — deterministic and predictable, rather than depending on
+    # whatever order Postgres happens to return rows in.
+    cases = sb.select(common.CASES_TABLE, select="*", filters=filters, order="created_at.asc")
     log.info(f"{len(cases)} case(s) with case_status=READY_TO_SUBMIT" + (f" matching case_ids={case_ids}" if case_ids else ""))
 
-    results = [prepare_one_case(session, case, aliases) for case in cases]
+    results = []
+    # Scoped to this one run: reused across every case below so that (a)
+    # a patient with more than one case only has their document searched
+    # for once (see resolve_patient_document()), and (b) only their FIRST
+    # such case opens a human-reviewable card — see
+    # link_sibling_to_pending_review() for why the rest link to it instead
+    # of duplicating it.
+    doc_cache: Dict[str, tuple] = {}
+    pending_review_by_patient: Dict[str, int] = {}
+    try:
+        for case in cases:
+            results.append(prepare_one_case(session, case, aliases, doc_cache, pending_review_by_patient))
+    finally:
+        # Tears down the shared Chromium/Playwright process started lazily
+        # by render_print_page_to_pdf() (see Unified_Decree_Submission_
+        # Pipeline.py's shared-browser block) — always, even on an
+        # unhandled error partway through the batch, so nothing is left
+        # running after this script exits.
+        shutdown_shared_browser()
     summary = {
         "total": len(results),
         "submitted": sum(1 for r in results if r["status"] == "submitted"),
         "pending_review": sum(1 for r in results if r["status"] == "pending_review"),
+        "pending_review_linked": sum(1 for r in results if r["status"] == "pending_review_linked"),
         "requirement_opened": sum(1 for r in results if r["status"] == "requirement_opened"),
         "debug_stopped": sum(1 for r in results if r["status"] == "debug_stopped"),
         "results": results,
@@ -352,6 +460,8 @@ def main():
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"## Decree prepare run\n- Submitted: **{summary['submitted']}**\n"
                     f"- Pending review: **{summary['pending_review']}**\n"
+                    f"- Linked to another case's pending review (same patient, no extra review needed): "
+                    f"**{summary['pending_review_linked']}**\n"
                     f"- Needs attention: **{summary['requirement_opened']}**\n"
                     f"- Debug-stopped (render only): **{summary['debug_stopped']}**\n")
 
