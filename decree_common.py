@@ -372,9 +372,36 @@ def resolve_request_category_value(case: dict, plan: dict) -> str:
     return PLAN_CATEGORY_TO_PIPELINE_CATEGORY.get(plan_value, "ordinary")
 
 
+_national_id_cache: Dict[int, Optional[str]] = {}
+
+
 def get_national_id(patient_id: int) -> Optional[str]:
+    """Cached per-process: the same patient_id always maps to the same
+    national_id within a single run, so we never hit the DB more than
+    once per unique patient_id regardless of how many cases they have."""
+    if patient_id in _national_id_cache:
+        return _national_id_cache[patient_id]
     rows = sb.select(PATIENTS_TABLE, select="national_id", filters={"id": f"eq.{patient_id}"})
-    return rows[0]["national_id"] if rows else None
+    result = rows[0]["national_id"] if rows else None
+    _national_id_cache[patient_id] = result
+    return result
+
+
+def prefetch_national_ids(patient_ids: list) -> None:
+    """Batch-fetch national_ids for a list of patient_ids in one round-trip,
+    populating the cache so subsequent get_national_id() calls are instant.
+    Call this once at the start of a batch run with all patient_ids in the
+    batch to avoid N separate DB round-trips (one per case)."""
+    uncached = [pid for pid in patient_ids if pid not in _national_id_cache]
+    if not uncached:
+        return
+    # Deduplicate and batch in one query.
+    unique = list(set(uncached))
+    rows = sb.select(PATIENTS_TABLE, select="id,national_id",
+                     filters={"id": f"in.({','.join(str(p) for p in unique)})"})
+    fetched = {r["id"]: r["national_id"] for r in rows}
+    for pid in unique:
+        _national_id_cache[pid] = fetched.get(pid)
 
 
 # =====================================================================
