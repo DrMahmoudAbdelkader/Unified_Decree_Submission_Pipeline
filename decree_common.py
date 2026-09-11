@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -216,14 +217,106 @@ def log_event(case_id: int, attempt_id: Optional[int], event_type: str, details:
     })
 
 
+def _normalize_plan_name(name: Optional[str]) -> str:
+    """MUST match smc-submissions.js's normalizePlanName() exactly (trim,
+    lowercase, collapse whitespace) — this is what lets a plan name typed
+    once in the module compare equal here, in the JS readiness check, and
+    in decree-request-entry.js's own catalogPlanForCase(), regardless of
+    which of the three actually resolves a given case first."""
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+_active_official_plans_cache: Optional[list] = None
+
+
+def _active_official_plans() -> list:
+    """Fetched ONCE per process (module-level cache), not once per case —
+    prepare.py calls resolve_plan() in a loop over every case in the
+    batch, and this catalog is the same ~2000+-row active table on every
+    call. Same reasoning as smc-submissions.js's loadSmcSubmissionData(),
+    which fetches its copy once per page load rather than per row."""
+    global _active_official_plans_cache
+    if _active_official_plans_cache is None:
+        _active_official_plans_cache = sb.select(PLANS_TABLE, select="*", filters={"is_active": "is.true"})
+    return _active_official_plans_cache
+
+
+def _best_official_match(target_name: str) -> Optional[dict]:
+    """Same tie-break scoring as resolvePlanForCase()/catalogPlanForCase()
+    in the JS side: prefer whichever same-named official plan has the most
+    complete data (protocol code, website wording, MDT text)."""
+    if not target_name:
+        return None
+    rows = _active_official_plans()
+    matches = [r for r in rows if _normalize_plan_name(r.get("reception_display_name")) == target_name]
+    if not matches:
+        return None
+
+    def _score(p: dict) -> int:
+        return (
+            int(bool(p.get("website_protocol_code")))
+            + int(bool(p.get("website_submission_treatment_plan")))
+            + int(bool(p.get("mdt_treatment_plan_text")))
+        )
+
+    matches.sort(key=_score, reverse=True)
+    return matches[0]
+
+
 def resolve_plan(case: dict) -> Optional[dict]:
+    """Resolves the ACTUAL plan that should govern this case — NOT
+    necessarily the plan case['plan_source']/treatment_plan_id/
+    custom_treatment_plan_id still points to.
+
+    FIXED: this used to be a blind FK-only lookup. "ربط الخطة المخصصة
+    بخطة موجودة" (mapCustomPlanToExisting() in decree-request-entry.js)
+    clones the matched official plan's data into a brand-new
+    decree_treatment_plans row and sets decree_custom_treatment_plans.
+    is_active = false on the original custom row — but it deliberately
+    does NOT repoint the case's own custom_treatment_plan_id FK to that
+    new row (see decree-request-entry.js's NOTE ON
+    map_custom_treatment_plan_to_existing). So a case created against a
+    custom plan that was LATER tied to an official one still has
+    plan_source = 'CUSTOM' and an FK pointing at the now-retired
+    (is_active=false, but NOT deleted) custom row.
+
+    A naive FK lookup here still finds that retired custom row fine (it's
+    fetched by id, not filtered on is_active) — so this never crashed or
+    returned None outright. But it hands back the OLD custom row, whose
+    mdt_treatment_plan_text nobody keeps updated once a plan is tied to an
+    official one — the real, current MDT text lives on the NEW official
+    row. That's what was silently reaching Stage 2 with stale/blank plan
+    text, and exactly why the SAME case reads correctly in
+    decree-request-entry.js (whose own catalogPlanForCase() already
+    re-resolves by name, never trusting this FK) but failed here / showed
+    "لا توجد خطة علاجية مرتبطة" or "لا تحتوي على نص خطة MDT" wherever this
+    function's result was used to judge readiness.
+
+    This mirrors resolvePlanForCase() in smc-submissions.js exactly: for
+    a CUSTOM-sourced case, re-resolve fresh by NAME against the live
+    active official catalog every time, rather than trusting the
+    plan_source/FK snapshot. Only if no official plan shares the custom
+    row's name does the (still genuinely custom) row get used as-is.
+    """
     if case.get("plan_source") == "OFFICIAL" and case.get("treatment_plan_id"):
         rows = sb.select(PLANS_TABLE, select="*", filters={"id": f"eq.{case['treatment_plan_id']}"})
-    elif case.get("custom_treatment_plan_id"):
-        rows = sb.select(CUSTOM_PLANS_TABLE, select="*", filters={"id": f"eq.{case['custom_treatment_plan_id']}"})
-    else:
+        return rows[0] if rows else None
+
+    if not case.get("custom_treatment_plan_id"):
         return None
-    return rows[0] if rows else None
+
+    custom_rows = sb.select(CUSTOM_PLANS_TABLE, select="*",
+                             filters={"id": f"eq.{case['custom_treatment_plan_id']}"})
+    if not custom_rows:
+        return None
+    custom_row = custom_rows[0]
+
+    target_name = _normalize_plan_name(custom_row.get("reception_display_name"))
+    if not target_name:
+        return custom_row
+
+    official_match = _best_official_match(target_name)
+    return official_match or custom_row  # never tied to an official plan — still genuinely custom
 
 
 def resolve_plan_texts(plan: dict) -> Dict[str, str]:
