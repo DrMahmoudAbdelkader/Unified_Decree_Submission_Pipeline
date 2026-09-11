@@ -198,7 +198,20 @@ def _resolve_request_category(case: dict, plan: dict) -> str:
 def submit_one_case(session: SMCSession, case: dict, checkpoints: dict, aliases: Dict[str, str]) -> dict:
     case_id = case["id"]
 
-    pipeline_key = aliases.get(case["tumor_type"])
+    # Resolution order (mirrors decree_submission_prepare.py's prepare_one_case):
+    #   1. cancer_type_aliases override for this tumor_type code
+    #   2. tumor_type_custom (the raw Arabic cancer_type_group text) — always
+    #      populated by decree-request-entry.js's deriveTumorTypeFromCancerGroup()
+    #      for every case, not just OTHER_CUSTOM ones.
+    #   3. Coarse tumor_type code itself (fallback for legacy rows where
+    #      tumor_type_custom is blank).
+    # Only OTHER_CUSTOM with no alias and no recognizable custom text is a
+    # genuine "needs human mapping" case — OTHER_ONCOLOGY is a real, already-
+    # catalogued cancer type that just doesn't have its own fixed code.
+    alias_override = aliases.get(case["tumor_type"])
+    tumor_type_custom = (case.get("tumor_type_custom") or "").strip()
+    pipeline_key = alias_override or tumor_type_custom or case["tumor_type"]
+
     if not pipeline_key:
         msg = (f"نوع الورم \"{case['tumor_type']}\" غير مربوط بعد بأنواع الأورام في السكربت. "
                f"اطلب من أحد المسؤولين إضافته من إعدادات أنواع الأورام (جدول cancer_type_aliases).")
@@ -241,7 +254,7 @@ def submit_one_case(session: SMCSession, case: dict, checkpoints: dict, aliases:
             session=session,
             patient_id=national_id,
             description=texts["mdt_text"],
-            tumor_type_raw=pipeline_key,
+            tumor_type_raw=pipeline_key,  # already resolved: alias > custom text > code
             request_category_raw=request_category,
             row_num=case_id,
             checkpoints=checkpoints,

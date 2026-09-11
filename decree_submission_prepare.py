@@ -266,7 +266,8 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
 
 
 def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
-                      doc_cache: Dict[str, tuple], pending_review_by_patient: Dict[str, int]) -> dict:
+                      doc_cache: Dict[str, tuple], pending_review_by_patient: Dict[str, int],
+                      existing_attempt_counts: Optional[Dict[int, int]] = None) -> dict:
     case_id = case["id"]
 
     # Resolution order:
@@ -348,8 +349,12 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
     tumor_cfg = dict(tumor_cfg_base)
     tumor_cfg["proc_id"] = resolve_effective_proc_id(tumor_cfg_base, request_category)
 
-    existing_attempts = sb.select(common.ATTEMPTS_TABLE, select="id,attempt_number", filters={"case_id": f"eq.{case_id}"})
-    attempt_number = max((a["attempt_number"] for a in existing_attempts), default=0) + 1
+    # Use pre-fetched attempt count if available (batch optimization), else query individually.
+    if existing_attempt_counts is not None and case_id in existing_attempt_counts:
+        attempt_number = existing_attempt_counts[case_id] + 1
+    else:
+        existing_attempts = sb.select(common.ATTEMPTS_TABLE, select="id,attempt_number", filters={"case_id": f"eq.{case_id}"})
+        attempt_number = max((a["attempt_number"] for a in existing_attempts), default=0) + 1
     attempt = sb.insert(common.ATTEMPTS_TABLE, {
         "case_id": case_id,
         "attempt_number": attempt_number,
@@ -454,6 +459,29 @@ def main():
     log.info(f"{len(cases)} case(s) with case_status=READY_TO_SUBMIT" + (f" matching case_ids={case_ids}" if case_ids else ""))
 
     results = []
+    # Performance: batch-fetch all national_ids for this run's cases in
+    # one DB round-trip instead of one per case (see decree_common.py's
+    # prefetch_national_ids / get_national_id cache).
+    patient_ids = list({c["patient_id"] for c in cases if c.get("patient_id")})
+    if patient_ids:
+        common.prefetch_national_ids(patient_ids)
+
+    # Performance: batch-fetch existing attempt counts for all cases in one
+    # round-trip so prepare_one_case() doesn't need a separate query per case.
+    existing_attempt_counts: Dict[int, int] = {}
+    if cases:
+        case_id_list = [c["id"] for c in cases]
+        try:
+            attempt_rows = sb.select(
+                common.ATTEMPTS_TABLE, select="case_id,attempt_number",
+                filters={"case_id": f"in.({','.join(str(i) for i in case_id_list)})"},
+            )
+            for row in attempt_rows:
+                cid = row["case_id"]
+                existing_attempt_counts[cid] = max(existing_attempt_counts.get(cid, 0), row["attempt_number"])
+        except Exception as e:
+            log.warning(f"Could not batch-fetch attempt counts ({e}) — will query per-case instead.")
+
     # Scoped to this one run: reused across every case below so that (a)
     # a patient with more than one case only has their document searched
     # for once (see resolve_patient_document()), and (b) only their FIRST
@@ -484,7 +512,7 @@ def main():
             # to wrap already.
             case_id = case.get("id")
             try:
-                results.append(prepare_one_case(session, case, aliases, doc_cache, pending_review_by_patient))
+                results.append(prepare_one_case(session, case, aliases, doc_cache, pending_review_by_patient, existing_attempt_counts))
             except Exception as exc:
                 log.exception(f"case {case_id}: unexpected error — flagging and continuing with the rest of the batch")
                 msg = f"خطأ غير متوقع أثناء تجهيز هذا الطلب — راجعه يدويًا. ({exc})"

@@ -194,6 +194,10 @@ def main():
         raise SystemExit("SMC login failed — check SMC_USERNAME/SMC_PASSWORD secrets.")
 
     cases = sb.select(common.CASES_TABLE, select="*", filters={"id": f"in.({','.join(str(i) for i in case_ids)})"})
+    # Performance: batch-fetch national_ids for all cases in one round-trip.
+    patient_ids = list({c["patient_id"] for c in cases if c.get("patient_id")})
+    if patient_ids:
+        common.prefetch_national_ids(patient_ids)
     try:
         results = [finalize_one_case(session, case) for case in cases]
     finally:
