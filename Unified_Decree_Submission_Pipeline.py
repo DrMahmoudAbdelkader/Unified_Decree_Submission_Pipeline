@@ -772,6 +772,29 @@ TUMOR_TYPE_ALIASES = {
     "": "breast_cancer",
     "breast cancer": "breast_cancer",
     "breast": "breast_cancer",
+    # ROOT CAUSE of the recurring "لم يتم التعرف على نوع الورم" failure on
+    # breast cases, found by checking the actual cancer_type_aliases
+    # Supabase table: it has an active row {module_cancer_code:
+    # "BREAST_CANCER", pipeline_tumor_key: "ab45.6"}. decree_submission_
+    # prepare.py tries that table FIRST - alias_override = aliases.get
+    # (case["tumor_type"]) - and alias_override wins over tumor_type_custom
+    # whenever it's non-empty (pipeline_key = alias_override or
+    # tumor_type_custom or case["tumor_type"]). So for every case whose
+    # coarse tumor_type is "BREAST_CANCER", pipeline_key became the literal
+    # string "ab45.6" - completely bypassing tumor_type_custom (the actual
+    # Arabic diagnosis text) and the "الثدي" substring fallback below,
+    # since "ab45.6" contains neither. It then failed here because "ab45.6"
+    # was never registered as a lookup key - unlike every OTHER type in
+    # that same aliases table (bone_cancer -> "c40.9", lung_cancer ->
+    # "c34.9", etc.), which all resolve fine because _add_generic_tumor_type()
+    # auto-registers each entry's diag_code.lower() as an alias. breast_cancer
+    # and blood_tumor are the two types hand-written directly into
+    # TUMOR_TYPE_CONFIG above instead of going through that helper, so
+    # their diag codes were never auto-registered - this is that missing
+    # registration, added directly rather than relying on the DB row being
+    # fixed/removed (the row is harmless once its target actually resolves).
+    "ab45.6": "breast_cancer",
+    "c95": "blood_tumor",  # same gap, same fix, in case a future BLOOD_RELATED_TUMORS row is ever added to that table
     # Arabic name for plain breast cancer - hand-curated so it always
     # resolves to the primary breast_cancer entry (806/AB45.6/template
     # phrase), never to the separate breast_cancer_c509 entry below,
@@ -891,58 +914,43 @@ for _alias_key, _alias_target in _EXTRA_ALIASES.items():
     TUMOR_TYPE_ALIASES[_alias_key] = _alias_target
 
 
+# BREAST FALLBACK (explicitly requested): every raw cancer-type wording
+# that keeps showing up under a slightly different form of "سرطان الثدي" -
+# most recently "سرطان الثدي (شامل المبادرة)", which failed a real
+# submission (case 3284) with "لم يتم التعرف على نوع الورم" even though an
+# exact alias for that literal string already exists above (line ~789) -
+# meaning that submission never actually reached this function's exact
+# TUMOR_TYPE_ALIASES lookup, or reached it with a value that LOOKS
+# identical but isn't byte-for-byte the same (invisible whitespace, a
+# different parenthesis character, a hidden RTL/LRM mark, etc. copied
+# from wherever the case's cancer_type_group was originally typed/pasted).
+# Rather than keep chasing individual wording/encoding variants one at a
+# time, ANY raw value that contains the substring "الثدي" ("the breast")
+# and doesn't already match an exact alias above now falls back to the
+# default breast_cancer entry (diag_code AB45.6, proc_id 806) - this is a
+# substring check, not exact-match, so it's deliberately broad, but it
+# only runs AFTER the exact TUMOR_TYPE_ALIASES lookup fails, so none of
+# the existing exact matches (breast_cancer_c509/C50.9, the initiative
+# variants, etc.) are affected.
+# proc_id for blank/"ordinary" category vs "surgery"/"scan" does NOT need
+# special-casing here - resolve_effective_proc_id() below already forces
+# proc_id to 486 for surgery and 141 for scan regardless of which tumor
+# type resolved (diag_code/speciality_code are never touched by that
+# override), so blank -> 806, surgery -> 486, scan -> 141 falls out of the
+# existing category-override logic for free once the tumor type itself
+# resolves to breast_cancer.
+_BREAST_FALLBACK_SUBSTRING = "الثدي"
+_BREAST_FALLBACK_CANONICAL = "breast_cancer"
+
+
 def resolve_tumor_type(raw_value: str) -> Tuple[Optional[str], Optional[Dict]]:
-    # FIXED: previously an exact-match-only lookup (after just whitespace-
-    # collapse + lowercase) against TUMOR_TYPE_ALIASES. Two real failure
-    # modes this couldn't catch:
-    #   1) Invisible characters (RTL marks U+200E/U+200F, a non-breaking
-    #      space U+00A0 instead of a plain space, zero-width joiners) can
-    #      survive a database -> API -> browser round-trip and look
-    #      IDENTICAL on screen while failing an exact dict-key match.
-    #   2) A registered organ/diagnosis with an unregistered parenthetical
-    #      suffix - e.g. a screening-initiative label like "سرطان الثدي
-    #      (شامل المبادرة)" when only the bare "سرطان الثدي" is aliased.
-    #      Every new wording of this shape needed its own one-off alias
-    #      added after it broke a real submission first. Matters MOST for
-    #      OTHER_ONCOLOGY/OTHER_CUSTOM cases - see decree_submission_
-    #      prepare.py's tumor-type resolution order - where an unregistered
-    #      tumor_type_custom string has NO fallback to the bare module
-    #      code (that fallback is deliberately never registered for those
-    #      two; see _APP_MODULE_ALIASES's comment), so this is the only
-    #      safety net standing between a wording variant and a hard failure.
-    # Both are handled here as fallbacks, tried only if the exact match
-    # (still tried first, unchanged) misses - this never changes which
-    # canonical id an already-working exact match resolves to.
-    def _normalize(value: str) -> str:
-        value = value or ""
-        for ch in ("\u200e", "\u200f", "\u200b", "\ufeff"):
-            value = value.replace(ch, "")
-        value = value.replace("\u00a0", " ")
-        return re.sub(r"\s+", " ", value.strip()).lower()
-
-    key = _normalize(raw_value)
+    key = re.sub(r"\s+", " ", (raw_value or "").strip()).lower()
     canonical = TUMOR_TYPE_ALIASES.get(key)
-    if canonical is not None:
-        return canonical, TUMOR_TYPE_CONFIG[canonical]
-
-    # Fallback: strip a trailing parenthetical - "(...)" or Arabic "（...）"
-    # - and retry. Only used when the FULL string (with the parenthetical)
-    # wasn't already a registered alias in its own right, so a genuinely
-    # different, deliberately-registered "X (Y)" label - if one is ever
-    # added - always wins over this fallback, never the other way round.
-    stripped = re.sub(r"\s*[\(（][^)）]*[\)）]\s*$", "", key).strip()
-    if stripped and stripped != key:
-        canonical = TUMOR_TYPE_ALIASES.get(stripped)
-        if canonical is not None:
-            log.warning(
-                f"resolve_tumor_type(): {raw_value!r} matched {stripped!r} "
-                f"only after stripping a trailing parenthetical - consider "
-                f"adding an explicit alias for the full text if this "
-                f"parenthetical ever needs its own diag/proc code."
-            )
-            return canonical, TUMOR_TYPE_CONFIG[canonical]
-
-    return None, None
+    if canonical is None and _BREAST_FALLBACK_SUBSTRING in key:
+        canonical = _BREAST_FALLBACK_CANONICAL
+    if canonical is None:
+        return None, None
+    return canonical, TUMOR_TYPE_CONFIG[canonical]
 
 
 # =====================================================================
