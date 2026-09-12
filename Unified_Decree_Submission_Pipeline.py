@@ -777,6 +777,16 @@ TUMOR_TYPE_ALIASES = {
     # phrase), never to the separate breast_cancer_c509 entry below,
     # which happens to share the exact same Arabic diagnosis name.
     "سرطان الثدي": "breast_cancer",
+    # Same diagnosis/organ as the plain entry above - just the exact
+    # wording used when this case comes from the (Egyptian) national
+    # breast-cancer screening initiative rather than a standard referral.
+    # Never appeared in this file before this was added - not a spelling
+    # variant of an existing alias, a genuinely new label the last
+    # reconciliation pass against cancer_type_group never saw. Same
+    # proc_id/diag_code/speciality_code as ordinary breast_cancer (806 /
+    # AB45.6) - flag for a quick sanity check if the initiative program
+    # is ever confirmed to need different SMC coding.
+    "سرطان الثدي (شامل المبادرة)": "breast_cancer",
     "blood type tumor": "blood_tumor",
     "blood tumor": "blood_tumor",
     "blood cancer": "blood_tumor",
