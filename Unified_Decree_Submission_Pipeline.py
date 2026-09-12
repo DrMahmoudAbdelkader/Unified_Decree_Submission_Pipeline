@@ -892,11 +892,57 @@ for _alias_key, _alias_target in _EXTRA_ALIASES.items():
 
 
 def resolve_tumor_type(raw_value: str) -> Tuple[Optional[str], Optional[Dict]]:
-    key = re.sub(r"\s+", " ", (raw_value or "").strip()).lower()
+    # FIXED: previously an exact-match-only lookup (after just whitespace-
+    # collapse + lowercase) against TUMOR_TYPE_ALIASES. Two real failure
+    # modes this couldn't catch:
+    #   1) Invisible characters (RTL marks U+200E/U+200F, a non-breaking
+    #      space U+00A0 instead of a plain space, zero-width joiners) can
+    #      survive a database -> API -> browser round-trip and look
+    #      IDENTICAL on screen while failing an exact dict-key match.
+    #   2) A registered organ/diagnosis with an unregistered parenthetical
+    #      suffix - e.g. a screening-initiative label like "سرطان الثدي
+    #      (شامل المبادرة)" when only the bare "سرطان الثدي" is aliased.
+    #      Every new wording of this shape needed its own one-off alias
+    #      added after it broke a real submission first. Matters MOST for
+    #      OTHER_ONCOLOGY/OTHER_CUSTOM cases - see decree_submission_
+    #      prepare.py's tumor-type resolution order - where an unregistered
+    #      tumor_type_custom string has NO fallback to the bare module
+    #      code (that fallback is deliberately never registered for those
+    #      two; see _APP_MODULE_ALIASES's comment), so this is the only
+    #      safety net standing between a wording variant and a hard failure.
+    # Both are handled here as fallbacks, tried only if the exact match
+    # (still tried first, unchanged) misses - this never changes which
+    # canonical id an already-working exact match resolves to.
+    def _normalize(value: str) -> str:
+        value = value or ""
+        for ch in ("\u200e", "\u200f", "\u200b", "\ufeff"):
+            value = value.replace(ch, "")
+        value = value.replace("\u00a0", " ")
+        return re.sub(r"\s+", " ", value.strip()).lower()
+
+    key = _normalize(raw_value)
     canonical = TUMOR_TYPE_ALIASES.get(key)
-    if canonical is None:
-        return None, None
-    return canonical, TUMOR_TYPE_CONFIG[canonical]
+    if canonical is not None:
+        return canonical, TUMOR_TYPE_CONFIG[canonical]
+
+    # Fallback: strip a trailing parenthetical - "(...)" or Arabic "（...）"
+    # - and retry. Only used when the FULL string (with the parenthetical)
+    # wasn't already a registered alias in its own right, so a genuinely
+    # different, deliberately-registered "X (Y)" label - if one is ever
+    # added - always wins over this fallback, never the other way round.
+    stripped = re.sub(r"\s*[\(（][^)）]*[\)）]\s*$", "", key).strip()
+    if stripped and stripped != key:
+        canonical = TUMOR_TYPE_ALIASES.get(stripped)
+        if canonical is not None:
+            log.warning(
+                f"resolve_tumor_type(): {raw_value!r} matched {stripped!r} "
+                f"only after stripping a trailing parenthetical - consider "
+                f"adding an explicit alias for the full text if this "
+                f"parenthetical ever needs its own diag/proc code."
+            )
+            return canonical, TUMOR_TYPE_CONFIG[canonical]
+
+    return None, None
 
 
 # =====================================================================
