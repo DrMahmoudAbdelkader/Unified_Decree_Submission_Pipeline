@@ -71,6 +71,15 @@ jobs:
       - name: Install Amiri font (medical report PDF)
         run: sudo apt-get install -y fonts-hosny-amiri
 
+      # Needed by compress_pdf_under_limit.py (called from decree_common.
+      # run_finalize_stages right before the Stage 6 upload). Its preferred
+      # compression path shells out to the `gs` binary. Without this, every
+      # merged PDF over the ~1MB SMC upload cap falls straight to the
+      # PyMuPDF fallback (rasterizes each page - larger quality loss,
+      # non-selectable text).
+      - name: Install Ghostscript (PDF compression, preferred path)
+        run: sudo apt-get install -y ghostscript
+
       - name: Run finalize (sign + report + merge + upload)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
