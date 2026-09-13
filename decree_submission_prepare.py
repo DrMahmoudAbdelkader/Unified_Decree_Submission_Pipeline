@@ -61,7 +61,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import decree_common as common
 from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, stage_create_mdt, \
     locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id, \
-    render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser
+    render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser, \
+    find_and_verify_reusable_mdt
 import supabase_client as sb
 import r2_client
 
@@ -363,17 +364,56 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
     })
     attempt_id = attempt.get("id")
 
-    try:
-        mdt_out = call_with_reconnect(session, "MDT creation", stage_create_mdt,
-                                       session, national_id, texts["mdt_text"], tumor_cfg)
-    except Exception as exc:
-        log.exception(f"case {case_id}: MDT creation failed")
-        msg = f"فشل إنشاء طلب MDT — حاول مرة أخرى بعد قليل. ({exc})"
-        common.open_requirement(case_id, attempt_id, msg)
-        return {"case_id": case_id, "status": "requirement_opened", "message": msg}
+    # REUSE CHECK: if an EARLIER attempt at this same case already created
+    # an MDT on SMC (recorded in that attempt's pipeline_state) and this
+    # case only came back to READY_TO_SUBMIT because something AFTER MDT
+    # creation failed (signing, the medical report, the merge, or the
+    # final upload — see write_submission_result()'s revert-to-
+    # READY_TO_SUBMIT logic), reuse that same MDT instead of creating a
+    # brand-new, redundant one for the same patient. Confirmed safe via
+    # a live GetPreRequests lookup (find_and_verify_reusable_mdt) right
+    # before trusting it — an MDT already converted/submitted, or one
+    # SMC no longer has, is never reused; this always falls back to a
+    # normal fresh creation in that case, exactly as before this existed.
+    mdt_out = None
+    prior_state = common.find_prior_pre_request_id(case_id, exclude_attempt_id=attempt_id)
+    if prior_state:
+        try:
+            mdt_out = call_with_reconnect(
+                session, "MDT reuse check", find_and_verify_reusable_mdt,
+                session, national_id, prior_state["pre_request_id"],
+            )
+        except Exception:
+            log.exception(f"case {case_id}: MDT reuse check failed — falling back to a fresh MDT creation")
+            mdt_out = None
+        if mdt_out:
+            common.log_event(case_id, attempt_id, "reused_existing_mdt",
+                              {"pre_request_id": mdt_out["pre_request_id"]})
+
+    if not mdt_out:
+        try:
+            mdt_out = call_with_reconnect(session, "MDT creation", stage_create_mdt,
+                                           session, national_id, texts["mdt_text"], tumor_cfg)
+        except Exception as exc:
+            log.exception(f"case {case_id}: MDT creation failed")
+            msg = f"فشل إنشاء طلب MDT — حاول مرة أخرى بعد قليل. ({exc})"
+            common.open_requirement(case_id, attempt_id, msg)
+            return {"case_id": case_id, "status": "requirement_opened", "message": msg}
 
     pre_request_id = mdt_out["pre_request_id"]
     full_name = mdt_out["full_name"]
+
+    # Persisted immediately — independent of whatever happens in the rest
+    # of THIS run — so that if this attempt also fails somewhere further
+    # down (report/merge/upload), the NEXT run's reuse check above always
+    # has something to find. Previously this was only ever saved for the
+    # two human-review paths below; a case that hit the cache (no review
+    # needed) and then failed at the finalize stage left its attempt row
+    # with pipeline_state still empty, which is exactly what was causing
+    # every retry to recreate the MDT from scratch.
+    sb.update(common.ATTEMPTS_TABLE, attempt_id, {
+        "pipeline_state": {"pre_request_id": pre_request_id, "full_name": full_name, "tumor_cfg": tumor_cfg},
+    })
 
     if debug_mode_on():
         return debug_dump_mdt_and_stop(session, case_id, attempt_id, pre_request_id, national_id)
@@ -551,8 +591,21 @@ def main():
                     f"- Unexpected errors (flagged, batch continued): **{summary['unexpected_error']}**\n"
                     f"- Debug-stopped (render only): **{summary['debug_stopped']}**\n")
 
-    if summary["total"] > 0 and summary["submitted"] == 0 and summary["pending_review"] == 0 \
-            and summary["debug_stopped"] == 0:
+    # A run that STOPPED to hand a case to a human for document review is
+    # not a failure — that's exactly what a "prepare" run is supposed to
+    # do for a freshly-extracted document (see this file's module
+    # docstring). "submitted" (finished straight through on a cache hit),
+    # "pending_review" (a new review card opened) and "pending_review_linked"
+    # (the same document, already covered by another case's review card)
+    # are all correct, successful outcomes of THIS run — only mark the
+    # whole run red when every single case in it ended in a genuine error
+    # (requirement_opened / unexpected_error) with nothing else to show
+    # for it.
+    handled_without_error = (
+        summary["submitted"] + summary["pending_review"] + summary["pending_review_linked"]
+        + summary["debug_stopped"]
+    )
+    if summary["total"] > 0 and handled_without_error == 0:
         sys.exit(1)
 
 

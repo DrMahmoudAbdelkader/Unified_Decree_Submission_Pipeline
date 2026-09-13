@@ -16,6 +16,7 @@ Shared between decree_submission_prepare.py and decree_submission_finalize.py:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -218,6 +219,47 @@ def log_event(case_id: int, attempt_id: Optional[int], event_type: str, details:
     })
 
 
+def find_prior_pre_request_id(case_id: int, exclude_attempt_id: Optional[int] = None) -> Optional[Dict]:
+    """Looks for a pre_request_id an EARLIER attempt at this same case
+    already created on SMC, so decree_submission_prepare.py can try to
+    reuse that MDT instead of calling stage_create_mdt() and creating a
+    redundant new one — see Unified_Decree_Submission_Pipeline.
+    find_and_verify_reusable_mdt() for the actual SMC-side confirmation.
+
+    This is only ever relevant for a case that's back at
+    case_status=READY_TO_SUBMIT after already having gone through the
+    pipeline at least once — which, by write_submission_result()'s own
+    logic, only happens after a FAILURE at the sign/report/merge/upload
+    stage (a genuine SUCCESS moves the case to SUBMITTED, out of this
+    query entirely). So any prior attempt found here that carries a
+    pre_request_id represents an MDT that really was created, just never
+    got all the way to a finished submission.
+
+    Checks EVERY prior attempt (most recent first), not just the
+    immediately-previous one, since older attempts can also carry a
+    pre_request_id (e.g. the original attempt that went through human
+    document review) even when the most recent attempt's own
+    pipeline_state is empty. Returns the first (i.e. most recent) prior
+    attempt's full pipeline_state dict, or None if no prior attempt ever
+    recorded one."""
+    rows = sb.select(
+        ATTEMPTS_TABLE, select="id,attempt_number,pipeline_state",
+        filters={"case_id": f"eq.{case_id}"}, order="attempt_number.desc",
+    )
+    for row in rows:
+        if exclude_attempt_id is not None and row.get("id") == exclude_attempt_id:
+            continue
+        state = row.get("pipeline_state")
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except Exception:
+                state = None
+        if state and state.get("pre_request_id"):
+            return state
+    return None
+
+
 def _normalize_plan_name(name: Optional[str]) -> str:
     """MUST match smc-submissions.js's normalizePlanName() exactly (trim,
     lowercase, collapse whitespace) — this is what lets a plan name typed
@@ -411,7 +453,7 @@ def prefetch_national_ids(patient_ids: list) -> None:
 # =====================================================================
 
 def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
-    """The SMC portal rejects uploads over ~2MB. The merged PDF (MDT form +
+    """The SMC portal rejects uploads over ~1MB. The merged PDF (MDT form +
     medical report + patient document, via merge_final_pdf) can end up over
     that cap even when the source patient document alone was under it, so
     this check/compress has to happen on the MERGED file, right before
@@ -424,7 +466,7 @@ def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
     size = os.path.getsize(merged_pdf_path)
     if size <= DEFAULT_TARGET_BYTES:
         return None
-    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~2MB cap — compressing …")
+    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~1MB cap — compressing …")
     if not compress_pdf_to_size(merged_pdf_path, merged_pdf_path, DEFAULT_TARGET_BYTES):
         return (f"Merged PDF is {size / 1e6:.2f} MB and could not be compressed under "
                 f"{DEFAULT_TARGET_BYTES / 1e6:.2f} MB (tried Ghostscript + PyMuPDF fallback) — "

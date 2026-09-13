@@ -1739,21 +1739,38 @@ class SMCSession:
     # FINAL UPLOAD FLOW  (Requests/* endpoints)
     # ------------------------------------------------------------------
 
-    def get_pre_requests(self, pre_request_id: str) -> Optional[dict]:
-        """Best-effort listing lookup — a failure here is non-fatal."""
+    def get_pre_requests(self, pre_request_id: str, national_id: str = "") -> Optional[dict]:
+        """Best-effort listing lookup — a failure here is non-fatal.
+
+        FIXED BUG: this used to call r.json() unconditionally. The
+        endpoint's URL looks like an API/XHR call, but it actually
+        returns a server-rendered HTML table fragment (the module's own
+        "PreRequest" list partial — a <table id="requestTable"> row per
+        matching pre-request), never JSON. r.json() therefore always
+        raised, was swallowed by the except, and this "best-effort
+        lookup" silently returned {} on every single call, forever —
+        meaning nothing anywhere in this file that called
+        get_pre_requests() ever actually saw real data from it. Now
+        parses the real HTML via parse_pre_requests_table() and returns
+        the first matching row as a dict, or None if nothing matched.
+
+        fromDate/toDate are required params but were empirically
+        confirmed NOT to filter results when preRequestId is given — SMC
+        returns the exact matching pre-request regardless of its own
+        registration date vs. these two params, so sending today's date
+        unconditionally (rather than trying to guess the real creation
+        date) is fine."""
         params = {
-            "preRequestId": pre_request_id, "nationalId": "",
-            "fromDate": (datetime.now().replace(day=1)).strftime("%m-%d-%Y"),
+            "preRequestId": pre_request_id, "nationalId": national_id,
+            "fromDate": datetime.now().strftime("%m-%d-%Y"),
             "toDate": datetime.now().strftime("%m-%d-%Y"),
             "page": "1",
         }
         r = self._get(f"{BASE_URL}/smc/PreRequest/GetPreRequests", params=params)
         if r is None:
             return None
-        try:
-            return r.json()
-        except Exception:
-            return {}
+        rows = parse_pre_requests_table(r.text)
+        return rows[0] if rows else None
 
     def get_requests_create_context(self, pre_request_id: str) -> Dict[str, str]:
         url = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
@@ -2691,6 +2708,102 @@ def save_debug_html(patient_id: str, pre_request_id: str, html: str):
 # =====================================================================
 # STAGE 1: MDT CREATION
 # =====================================================================
+
+def parse_pre_requests_table(html: str) -> List[Dict]:
+    """Parses GetPreRequests' real response shape: an HTML fragment with
+    a <table id="requestTable">, one <tr> per matching pre-request (see
+    SMCSession.get_pre_requests()'s docstring for why this is HTML, not
+    JSON, despite the endpoint's XHR-looking URL). Columns, in order:
+    رقم الطلب (pre_request_id, as a link's text), الرقم القومى للمريض
+    (national_id), تاريخ التسجيل (registration_date), اسم المواطن
+    (full_name), جهة الإرسال (sending_entity), جهة العلاج
+    (treatment_entity), حالة تقرير اللجنة الثلاثية (status_text — see
+    REUSABLE_MDT_STATUS_MARKERS below), then an actions cell.
+    Returns [] on anything that doesn't look like this table (empty
+    result set, a login/error page, a layout change on SMC's side) —
+    callers already treat "no rows" as "nothing to reuse / nothing
+    found", not as an error."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    table = soup.find("table", id="requestTable")
+    if table is None:
+        return []
+    rows: List[Dict] = []
+    for tr in table.find_all("tr"):
+        if tr.find("th") is not None:
+            continue  # header row
+        tds = tr.find_all("td")
+        if len(tds) < 8:
+            continue
+        link = tds[0].find("a")
+        pre_request_id = (link.get_text(strip=True) if link else tds[0].get_text(strip=True))
+        if not pre_request_id:
+            continue
+        actions_html = str(tds[7])
+        rows.append({
+            "pre_request_id": pre_request_id,
+            "national_id": tds[1].get_text(strip=True),
+            "registration_date": tds[2].get_text(strip=True),
+            "full_name": re.sub(r"\s+", " ", tds[3].get_text(strip=True)).strip(),
+            "sending_entity": tds[4].get_text(strip=True),
+            "treatment_entity": tds[5].get_text(strip=True),
+            "status_text": tds[6].get_text(strip=True),
+            # "تحويل الى طلب علاج" = "convert to treatment request" — its
+            # presence means this MDT has NOT been converted/submitted
+            # yet, i.e. it's still in the same reusable state a brand
+            # new MDT would be in.
+            "has_convert_link": "HopitalCreateNewRequest" in actions_html,
+        })
+    return rows
+
+
+# A previously-created MDT is safe to reuse only while it's still
+# sitting exactly where a freshly-created one would be: not yet
+# converted into an actual decree/treatment request. This is the exact
+# status text SMC shows for that state (see parse_pre_requests_table's
+# docstring / a live GetPreRequests sample) — anything else (already
+# converted, cancelled, etc.) means don't reuse it.
+REUSABLE_MDT_STATUS_MARKERS = ("لم يتم إرسال طلب العلاج",)
+
+
+def find_and_verify_reusable_mdt(session: SMCSession, national_id: str,
+                                  candidate_pre_request_id: str) -> Optional[Dict]:
+    """Confirms a pre_request_id left over from a PREVIOUS, failed
+    attempt at this same case (see decree_common.find_prior_pre_request_id)
+    still exists on SMC and hasn't already been converted into a real
+    request — i.e. it's safe to reuse instead of calling stage_create_mdt()
+    and creating a brand-new, redundant MDT for the same case/patient.
+
+    Returns a dict shaped exactly like stage_create_mdt()'s return value
+    ({"pre_request_id", "full_name", "warnings"}, plus "reused": True so
+    callers can log/tell the two paths apart) when reuse is confirmed
+    safe, or None when it isn't (not found, belongs to a different
+    patient, already converted/submitted, or no full name to sign
+    with) — callers fall back to creating a fresh MDT in every None
+    case, exactly as before this existed."""
+    if not candidate_pre_request_id:
+        return None
+    row = session.get_pre_requests(candidate_pre_request_id, national_id=national_id)
+    if not row:
+        log.warning(f"    Previous MDT #{candidate_pre_request_id} for {national_id} was not found on "
+                    f"SMC (GetPreRequests) — will create a new MDT instead.")
+        return None
+    if row.get("national_id") and row["national_id"] != national_id:
+        log.warning(f"    Previous MDT #{candidate_pre_request_id} belongs to national id "
+                    f"{row.get('national_id')!r}, not {national_id!r} — will create a new MDT instead.")
+        return None
+    if not any(marker in (row.get("status_text") or "") for marker in REUSABLE_MDT_STATUS_MARKERS):
+        log.warning(f"    Previous MDT #{candidate_pre_request_id} for {national_id} is no longer in a "
+                    f"reusable state (status: {row.get('status_text')!r}) — will create a new MDT instead.")
+        return None
+    full_name = row.get("full_name") or ""
+    if not full_name:
+        log.warning(f"    Previous MDT #{candidate_pre_request_id} for {national_id} matched but had no "
+                    f"parsable name — will create a new MDT instead.")
+        return None
+    log.info(f"    Reusing existing MDT #{candidate_pre_request_id} for {national_id} "
+             f"(created by a previous attempt that failed at a later stage) instead of creating a new one.")
+    return {"pre_request_id": candidate_pre_request_id, "full_name": full_name, "warnings": [], "reused": True}
+
 
 def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tumor_cfg: Dict) -> Dict:
     """
