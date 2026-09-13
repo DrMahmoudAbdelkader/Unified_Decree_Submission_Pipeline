@@ -3,7 +3,7 @@
 """
 compress_pdf_under_limit.py
 ==========================================================================
-Shrinks a PDF under a target byte size (default: just under 1 MB, to fit
+Shrinks a PDF under a target byte size (default: just under 2 MB, to fit
 the SMC portal's upload cap), for both:
 
   1. One-off / bulk cleanup of PDFs you already have (already on
@@ -45,7 +45,7 @@ from typing import Optional
 
 log = logging.getLogger("compress_pdf_under_limit")
 
-DEFAULT_TARGET_BYTES = int(0.97 * 1024 * 1024)  # a hair under 1 MB for safety margin
+DEFAULT_TARGET_BYTES = int(1.95 * 1024 * 1024)  # a hair under 2 MB for safety margin
 
 
 def _gs_available() -> bool:
@@ -183,7 +183,7 @@ def _bulk_cli():
 
     Usage:
         python3 compress_pdf_under_limit.py --input-dir ./patient_pdfs \\
-            [--output-dir ./patient_pdfs_compressed] [--target-mb 0.97]
+            [--output-dir ./patient_pdfs_compressed] [--target-mb 1.95]
     """
     import argparse
 
@@ -191,7 +191,7 @@ def _bulk_cli():
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-dir", default=None,
                          help="If omitted, compresses in place (overwrites originals).")
-    parser.add_argument("--target-mb", type=float, default=0.97)
+    parser.add_argument("--target-mb", type=float, default=1.95)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")

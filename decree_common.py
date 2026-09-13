@@ -411,7 +411,7 @@ def prefetch_national_ids(patient_ids: list) -> None:
 # =====================================================================
 
 def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
-    """The SMC portal rejects uploads over ~1MB. The merged PDF (MDT form +
+    """The SMC portal rejects uploads over ~2MB. The merged PDF (MDT form +
     medical report + patient document, via merge_final_pdf) can end up over
     that cap even when the source patient document alone was under it, so
     this check/compress has to happen on the MERGED file, right before
@@ -424,7 +424,7 @@ def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
     size = os.path.getsize(merged_pdf_path)
     if size <= DEFAULT_TARGET_BYTES:
         return None
-    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~1MB cap — compressing …")
+    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~2MB cap — compressing …")
     if not compress_pdf_to_size(merged_pdf_path, merged_pdf_path, DEFAULT_TARGET_BYTES):
         return (f"Merged PDF is {size / 1e6:.2f} MB and could not be compressed under "
                 f"{DEFAULT_TARGET_BYTES / 1e6:.2f} MB (tried Ghostscript + PyMuPDF fallback) — "
