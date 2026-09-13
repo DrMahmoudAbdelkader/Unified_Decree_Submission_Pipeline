@@ -1168,6 +1168,32 @@ class MaxRequestsReachedError(RowProcessingError):
     have cleared, not a UHI fix."""
 
 
+class PatientRequestAlreadyExistsError(RowProcessingError):
+    """Raised when Requests/SearchSSN (final-upload stage) returns the
+    literal string "PatientRequestAlreadyExist" instead of patient data.
+
+    CONFIRMED NOT a session/network blip, same evidence pattern as
+    MaxRequestsReachedError above (unified_run 2026-09-13 22:25 log):
+    call_with_reconnect retried this 5 times, re-logging in each time,
+    and got the exact same "PatientRequestAlreadyExist" string back every
+    single time before giving up - a fresh login does not clear it. This
+    means an actual Request record ALREADY exists on the SMC side tied to
+    this patient/pre-request — most likely this exact MDT was already
+    successfully converted into a submitted request in an earlier run
+    (or by a human, directly on the site) and this attempt's own records
+    (Supabase) just never got updated to reflect that, for whatever
+    reason that earlier run didn't finish cleanly.
+
+    Deliberately NOT auto-resolved here (no attempt to guess or scrape
+    the existing request number and mark this case SUBMITTED on its
+    behalf) — doing that on a guess risks recording the WRONG request
+    number against this case. Fails the row immediately with a message
+    telling a human to check this patient's request list on the SMC site
+    for MDT #<pre_request_id> before retrying, exactly the same
+    "distinct, actionable, no blind retry" treatment as
+    MaxRequestsReachedError."""
+
+
 NETWORK_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
@@ -1305,6 +1331,43 @@ class SMCSession:
             raise
         except Exception as exc:
             log.error(f"GET {url}: {exc}")
+            return None
+
+    def _post_query(self, url: str, params: dict, ajax: bool = True,
+                     referer: Optional[str] = None) -> Optional[requests.Response]:
+        """POST with the payload carried entirely as URL query params and
+        an EMPTY body — matches how the module's own JS calls this exact
+        style of endpoint (see PreRequest/GetPreRequests's own pagination
+        click handler: `$.ajax({url: this.href, type: 'POST', ...})`,
+        where `this.href` already has preRequestId/nationalId/fromDate/
+        toDate/page in its query string and no separate `data` is ever
+        given to $.ajax). CONFIRMED this route is NOT interchangeable
+        with a plain GET carrying the same query params — a live run's
+        log shows a GET to this exact URL/params returning a flat 404,
+        while the site's own JS only ever hits it with POST."""
+        short = url.split("?")[0].split("/smc/")[-1]
+        headers = {}
+        if ajax:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            if referer:
+                headers["Referer"] = referer
+        try:
+            r = self.s.post(url, params=params, timeout=30, headers=headers or None)
+            log.info(f"    POST {short}  params={params}  -> {r.status_code}")
+            if self._session_expired(r):
+                log.warning("Session expired — re-logging in …")
+                if self.login():
+                    r = self.s.post(url, params=params, timeout=30, headers=headers or None)
+                else:
+                    return None
+            if r.status_code != 200:
+                log.error(f"    POST {short} returned {r.status_code}. Body: {r.text[:300]!r}")
+                return None
+            return r
+        except NETWORK_EXCEPTIONS:
+            raise
+        except Exception as exc:
+            log.error(f"POST {url}: {exc}")
             return None
 
     def _post_ajax(self, url: str, data: dict, **kw) -> Optional[requests.Response]:
@@ -1759,14 +1822,22 @@ class SMCSession:
         returns the exact matching pre-request regardless of its own
         registration date vs. these two params, so sending today's date
         unconditionally (rather than trying to guess the real creation
-        date) is fine."""
+        date) is fine.
+
+        FIXED BUG #2: this also used to call self._get() (a plain GET),
+        which a live run confirmed gets a flat 404 back from this exact
+        URL+params — SMC only serves this route via POST (see
+        SMCSession._post_query()'s docstring: the module's own JS calls
+        it that way too, via $.ajax({..., type: 'POST'})). Fixed to use
+        _post_query() instead, which keeps the same params in the query
+        string but sends them as a POST with an empty body."""
         params = {
             "preRequestId": pre_request_id, "nationalId": national_id,
             "fromDate": datetime.now().strftime("%m-%d-%Y"),
             "toDate": datetime.now().strftime("%m-%d-%Y"),
             "page": "1",
         }
-        r = self._get(f"{BASE_URL}/smc/PreRequest/GetPreRequests", params=params)
+        r = self._post_query(f"{BASE_URL}/smc/PreRequest/GetPreRequests", params=params)
         if r is None:
             return None
         rows = parse_pre_requests_table(r.text)
@@ -1801,7 +1872,7 @@ class SMCSession:
 
         FALLBACK LOGIC: this endpoint has been observed to return HTTP 200
         with a valid-JSON body that is just a short plain string instead
-        of the expected {"patient": {...}, ...} object. Two distinct
+        of the expected {"patient": {...}, ...} object. THREE distinct
         cases, handled differently:
 
         1. The literal string "MaxNumberOfRequestsReached" - a genuine
@@ -1811,7 +1882,14 @@ class SMCSession:
            string back). Raised here as MaxRequestsReachedError so
            process_row()/run_finalize_stages() fail the row distinctly
            instead of uselessly retrying the same call.
-        2. Any OTHER non-dict payload - genuinely unexplained, previously
+        2. The literal string "PatientRequestAlreadyExist" - same shape
+           of business rule, CONFIRMED not a session issue the same way
+           (5 identical retries, identical string every time — see
+           PatientRequestAlreadyExistsError's docstring). Means a Request
+           already exists for this patient/pre-request; raised distinctly
+           so the row fails fast with an actionable message instead of
+           burning through 5 pointless reconnect attempts first.
+        3. Any OTHER non-dict payload - genuinely unexplained, previously
            crashed the caller with AttributeError: 'str' object has no
            attribute 'get'. Raised as UHIASessionDesyncError, which IS
            retried via call_with_reconnect (re-login + redo the stage),
@@ -1834,6 +1912,17 @@ class SMCSession:
                 f"patient {patient_id}, prid={pre_request_id} — this pre-request "
                 "has hit the UHIA max-requests limit; needs the PreRequest/Edit + "
                 "re-print fallback, not a plain retry."
+            )
+        if isinstance(parsed, str) and parsed.strip() == "PatientRequestAlreadyExist":
+            raise PatientRequestAlreadyExistsError(
+                f"Requests/SearchSSN returned 'PatientRequestAlreadyExist' for "
+                f"patient {patient_id}, prid={pre_request_id} — an actual Request "
+                "already exists for this patient tied to this MDT. It may already "
+                "have been submitted successfully in an earlier run (or manually on "
+                "the site) without this case's own record being updated to match. "
+                "Check this patient's request list on the SMC site for MDT "
+                f"#{pre_request_id} before retrying — do NOT just re-run this case "
+                "blindly, to avoid creating a second, duplicate request."
             )
         if not isinstance(parsed, dict):
             raise UHIASessionDesyncError(
@@ -2994,6 +3083,16 @@ def is_max_requests_reached_error(exc: Exception) -> bool:
     return isinstance(exc, MaxRequestsReachedError)
 
 
+def is_patient_request_already_exists_error(exc: Exception) -> bool:
+    """True for PatientRequestAlreadyExistsError - the
+    "PatientRequestAlreadyExist" site-side signal that a Request already
+    exists for this patient/pre-request (NOT a UHI/insurance issue, and
+    NOT a session desync - see that class's docstring). Callers should
+    fail the row immediately and point a human at the site rather than
+    routing it through the UHI-exclusion fallback or retrying blindly."""
+    return isinstance(exc, PatientRequestAlreadyExistsError)
+
+
 def stage_fix_uhi_exclusion_and_reprint_mdt(session: SMCSession, patient_id: str,
                                              pre_request_id: str) -> bytes:
     """
@@ -3049,7 +3148,7 @@ def stage_fix_uhi_exclusion_and_reprint_mdt(session: SMCSession, patient_id: str
 
 def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id: str, merged_pdf_path: str,
                              tumor_cfg: Optional[Dict] = None) -> str:
-    pr_data = session.get_pre_requests(pre_request_id)
+    pr_data = session.get_pre_requests(pre_request_id, national_id=patient_id)
     if pr_data is None:
         log.warning("    GetPreRequests best-effort call failed — proceeding anyway.")
 

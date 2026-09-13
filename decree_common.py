@@ -31,6 +31,7 @@ from Unified_Decree_Submission_Pipeline import (
     stage_fix_uhi_exclusion_and_reprint_mdt,
     is_deep_uhi_upload_error,
     is_max_requests_reached_error,
+    is_patient_request_already_exists_error,
     RowProcessingError,
     merge_final_pdf,
     call_with_reconnect,
@@ -526,6 +527,28 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                     "concurrent-request cap, NOT a UHI/insurance issue - the MDT itself "
                     "was created fine and was left untouched. Retry this case on its own "
                     "later, once this patient's other open request(s) have cleared."
+                ) from upload_exc
+
+            if is_patient_request_already_exists_error(upload_exc):
+                # A Request record already exists on SMC for this patient
+                # tied to this exact MDT — most likely this same MDT was
+                # already successfully converted/submitted before (an
+                # earlier run that didn't finish cleanly, or a manual
+                # click on the site) and this case's own Supabase record
+                # just never got updated to match. NOT a UHI issue and NOT
+                # a session desync (confirmed: identical string on every
+                # one of 5 reconnect retries) — fail distinctly rather
+                # than routing through the UHI-exclusion fallback below,
+                # and rather than quietly retrying again next run, which
+                # would risk creating a second, duplicate request instead
+                # of fixing anything.
+                raise RowProcessingError(
+                    f"Patient {national_id} already has a Request on the SMC site tied to "
+                    f"MDT #{pre_request_id} (Requests/SearchSSN returned "
+                    "'PatientRequestAlreadyExist'). This MDT was very likely already submitted "
+                    "successfully before — check this patient's request list on the SMC site for "
+                    f"MDT #{pre_request_id} before retrying. Do NOT just re-run this case blindly, "
+                    "to avoid creating a second, duplicate request."
                 ) from upload_exc
 
             if not is_deep_uhi_upload_error(upload_exc):
