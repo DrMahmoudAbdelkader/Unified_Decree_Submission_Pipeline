@@ -154,6 +154,31 @@ def pending_review_url(national_id: str, expires_in: int = 60 * 60 * 24 * 7) -> 
         return None
 
 
+def list_permanent_doc_keys() -> list:
+    """Lists every key in the PERMANENT cache (root-level <id>.pdf files),
+    explicitly excluding the pending/ prefix — used by one-off maintenance
+    scripts (e.g. recompress_r2_backlog.py) that need to walk the whole
+    approved archive rather than look up one national_id at a time.
+    Paginates since the bucket can hold well over 1000 objects (the boto3
+    default page size)."""
+    if not _configured():
+        return []
+    client = _get_client()
+    keys = []
+    paginator = client.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.startswith("pending/"):
+                    continue
+                if key.endswith(".pdf"):
+                    keys.append(key)
+    except ClientError as e:
+        log.error(f"R2 list_objects_v2 failed: {e}")
+    return keys
+
+
 def upload(national_id: str, local_path: str) -> bool:
     """Promotes a now-approved document into the permanent cache, so the
     NEXT decree request for this same patient is a cache hit and skips

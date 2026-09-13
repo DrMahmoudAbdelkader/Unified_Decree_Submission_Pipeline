@@ -36,6 +36,7 @@ from Unified_Decree_Submission_Pipeline import (
 )
 import medical_report_overlay as _report_module
 from medical_report_overlay import build_medical_report_pdf
+from compress_pdf_under_limit import compress_pdf_to_size, DEFAULT_TARGET_BYTES
 
 import supabase_client as sb
 import supabase_storage
@@ -409,6 +410,30 @@ def prefetch_national_ids(patient_ids: list) -> None:
 # of whether the document was a cache hit or a freshly-approved review.
 # =====================================================================
 
+def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
+    """The SMC portal rejects uploads over ~1MB. The merged PDF (MDT form +
+    medical report + patient document, via merge_final_pdf) can end up over
+    that cap even when the source patient document alone was under it, so
+    this check/compress has to happen on the MERGED file, right before
+    Stage 6's upload — compressing only the patient doc earlier would not
+    be enough. Compresses merged_pdf_path in place (same path in and out,
+    same convention compress_pdf_to_size already supports) only if it's
+    actually over target; leaves it untouched otherwise. Returns an error
+    string on failure (caller should treat this exactly like any other
+    pre-upload failure), or None on success."""
+    size = os.path.getsize(merged_pdf_path)
+    if size <= DEFAULT_TARGET_BYTES:
+        return None
+    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~1MB cap — compressing …")
+    if not compress_pdf_to_size(merged_pdf_path, merged_pdf_path, DEFAULT_TARGET_BYTES):
+        return (f"Merged PDF is {size / 1e6:.2f} MB and could not be compressed under "
+                f"{DEFAULT_TARGET_BYTES / 1e6:.2f} MB (tried Ghostscript + PyMuPDF fallback) — "
+                "upload to the SMC portal would be rejected.")
+    new_size = os.path.getsize(merged_pdf_path)
+    log.info(f"  Compressed merged PDF: {size / 1e6:.2f} MB -> {new_size / 1e6:.2f} MB")
+    return None
+
+
 def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
                          pipeline_state: dict, patient_pdf_path: str) -> dict:
     """pipeline_state must contain: pre_request_id, full_name, tumor_cfg
@@ -434,6 +459,10 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
 
         if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
             return {"status": "FAILED", "error": f"Merged PDF write failed or suspiciously small: {merged_pdf_path}"}
+
+        compress_err = _ensure_under_upload_limit(merged_pdf_path)
+        if compress_err:
+            return {"status": "FAILED", "error": compress_err}
 
         log.info("  [Stage 6] Uploading merged PDF to the website …")
         try:
@@ -482,6 +511,11 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
             if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
                 return {"status": "FAILED",
                         "error": f"Re-merged PDF (post-UHI-fix) write failed or suspiciously small: {merged_pdf_path}"}
+
+            compress_err = _ensure_under_upload_limit(merged_pdf_path)
+            if compress_err:
+                return {"status": "FAILED", "error": f"(post-UHI-fix) {compress_err}"}
+
             log.info("  Retrying upload with the corrected merged PDF …")
             final_request_no = call_with_reconnect(
                 session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,
