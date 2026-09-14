@@ -1,34 +1,35 @@
 # .github/workflows/submit-decree-prepare.yml
 # ============================================================================
-# Triggered by the Supabase Edge Function `submit-decree-requests` (phase=
-# "prepare") when a user clicks "إرسال" in the module's "الإرسال إلى SMC"
-# tab. Creates the MDT request and locates the patient document; if the
-# document is already in the permanent R2 cache (previously reviewed and
-# approved), this run continues straight through to a full submission. If
-# it's freshly extracted, this run stops and opens a review item instead.
+# Same trigger and same secrets as before. The ONLY structural change: this
+# workflow now runs in two jobs instead of one.
 #
-# Required repository secrets:
-#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-#   SMC_USERNAME, SMC_PASSWORD
-#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
-#   HMIS_USERNAME, HMIS_PASSWORD   (only if the CMIS archive fallback is
-#                                    reachable from a GitHub-hosted runner)
+#   plan     - resolves the READY_TO_SUBMIT case list (identical filter to
+#              decree_submission_prepare.main()) and splits it into batches
+#              of CHUNK_SIZE (default 10), keeping every case of one patient
+#              inside one batch. See chunk_cases.py for WHY that grouping is
+#              not optional.
+#   prepare  - a matrix job, one run per batch, each invoked with an
+#              explicit CASE_IDS list. Never blank.
 #
-# One-time manual setup (not part of this workflow):
-#   Upload signatures/sig1.png..sig4.png, signatures/stamp.png,
-#   medical_report_template.pdf, and fonts/mdt_form_font.ttf +
-#   fonts/mdt_form_font_bold.ttf to the Supabase Storage bucket
-#   "decree-assets" (private). See supabase_storage.py's docstring.
+# WHAT DID NOT CHANGE: decree_submission_prepare.py, decree_common.py,
+# Unified_Decree_Submission_Pipeline.py, the edge function, and the finalize
+# workflow are all untouched. Each batch job is byte-for-byte the same
+# `python decree_submission_prepare.py` invocation you run today, just with
+# a shorter CASE_IDS. Every requirement message, every log_event, every
+# error classifier and every exit-code rule behaves exactly as before,
+# per batch.
 #
-# NOTE: the MDT-form font is deliberately NOT installed via a GitHub
-# Actions secret. A GitHub secret caps out at 64 KB — far smaller than a
-# real .ttf file — so the previous "install font from base64 secret" step
-# could never actually work (that's why you saw the "secret not set"
-# warning even after trying to set it). The font now lives in the private
-# Supabase Storage "decree-assets" bucket and is downloaded + registered
-# with fontconfig at runtime by decree_common.fetch_and_configure_assets()
-# -> supabase_storage.fetch_mdt_form_font(), inside the Python run step
-# below. No sudo, no separate workflow step, nothing to base64-encode.
+# START AT max-parallel: 1. It gives you the isolation benefit (one bad
+# batch can no longer eat the whole queue's 60-minute budget, and a crash
+# after batch 3 leaves batches 4..N untouched and still READY_TO_SUBMIT)
+# with zero new risk. Only raise it to 2 after you have confirmed the SMC
+# account tolerates two simultaneous logins — see the comment on
+# max-parallel below.
+#
+# One-time manual setup (unchanged): upload signatures/sig1.png..sig4.png,
+# signatures/stamp.png, medical_report_template.pdf, fonts/mdt_form_font.ttf
+# and fonts/mdt_form_font_bold.ttf to the private Supabase Storage bucket
+# "decree-assets". See supabase_storage.py's docstring.
 # ============================================================================
 
 name: Submit Decree Requests (Prepare)
@@ -50,11 +51,21 @@ on:
         required: false
         type: boolean
         default: false
+      chunk_size:
+        description: "Cases per batch run (default 10). A patient's cases are never split across batches, so a batch can exceed this."
+        required: false
+        default: "10"
 
 jobs:
-  prepare:
+  # ==========================================================================
+  # JOB 1 — PLAN. Cheap: one SELECT, no Playwright, no PDF libs, ~20s.
+  # ==========================================================================
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.chunk.outputs.matrix }}
+      count: ${{ steps.chunk.outputs.count }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -64,13 +75,62 @@ jobs:
         with:
           python-version: "3.11"
 
-      # SUPERSEDES the old wkhtmltopdf install: wkhtmltopdf's own frozen
-      # WebKit engine (not just its cookie handling) was producing a
-      # disrupted/disoriented MDT form compared to a manual browser print -
-      # see render_print_page_to_pdf()'s docstring. A real, current
-      # Chromium via Playwright renders the page's actual @media print
-      # stylesheet and paints CSS backgrounds by default, matching a
-      # manual print far more closely.
+      # chunk_cases.py imports supabase_client only — requests is its whole
+      # dependency tree. Deliberately NOT `pip install -r requirements.txt`:
+      # this job has no reason to pay for PyMuPDF/reportlab/boto3.
+      - name: Install planner dependency
+        run: pip install --disable-pip-version-check --quiet requests
+
+      - name: Plan batches
+        id: chunk
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CASE_IDS: ${{ github.event.inputs.case_ids }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '10' }}
+          DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
+        run: python chunk_cases.py
+
+  # ==========================================================================
+  # JOB 2 — one run per batch of 10.
+  # ==========================================================================
+  prepare:
+    needs: plan
+    # An empty matrix is a hard error in Actions, so skip the whole job when
+    # there is nothing READY_TO_SUBMIT. The old single-job workflow handled
+    # this by just running and reporting 0 cases.
+    if: ${{ needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    # Was 60 for the entire queue; each batch is ~10 cases now.
+    timeout-minutes: 30
+    strategy:
+      # One batch failing must never cancel the others. Without this, a
+      # single batch exiting 1 (which prepare.py does when EVERY case in it
+      # errored) would cancel batches that are mid-submission — potentially
+      # after an MDT was created on SMC but before the upload.
+      fail-fast: false
+      # 1 = batches run one after another. Same total wall-clock as today,
+      # but full crash isolation between batches.
+      #
+      # Before raising this to 2, confirm on a quiet day that two runs
+      # logged in as the same SMC_USERNAME at once do not invalidate each
+      # other's session. If the site enforces one session per account, the
+      # second login silently kills the first, and the victim's
+      # call_with_reconnect() will re-login in a loop (5 retries, 5s apart,
+      # per stage) and eventually fail cases that were otherwise fine.
+      # Nothing in this repo can detect that for you in advance.
+      max-parallel: 1
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Set up pip cache
         uses: actions/cache@v4
         with:
@@ -80,32 +140,59 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt
 
-      - name: Install Playwright's Chromium
+      # Chromium (via Playwright) replaced wkhtmltopdf because wkhtmltopdf's
+      # frozen WebKit engine was the actual source of the disrupted MDT form
+      # — see render_print_page_to_pdf()'s docstring. Unchanged.
+      #
+      # NEW: the downloaded browser is cached. `playwright install` re-
+      # downloads ~130 MB otherwise, and with N batch runs you were paying
+      # that N times. The cache key pins the Playwright version so a version
+      # bump in requirements.txt invalidates it automatically.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      # --with-deps is an apt-get of Chromium's shared libraries and is the
+      # slow half of this step. GitHub's ubuntu-latest image already ships
+      # almost all of them. Kept ONLY for the cold-cache run, so the very
+      # first run after a cache miss still self-heals if a library really is
+      # missing; warm runs skip straight to the binary.
+      - name: Install Playwright's Chromium (cold cache)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
 
-      # fonts-hosny-amiri stays - it's what medical_report_overlay.py uses
-      # to draw the SEPARATE medical-report PDF (already calibrated, not
-      # the thing that was broken). The MDT FORM itself is server-rendered
-      # HTML styled by the SMC site's OWN CSS, which almost certainly asks
-      # for Tahoma. That font is fetched from Supabase Storage and
-      # installed at runtime by fetch_and_configure_assets() in the Python
-      # step below — see supabase_storage.py's fetch_mdt_form_font() for
-      # the one-time upload instructions.
-      - name: Install Amiri font (medical report PDF)
-        run: sudo apt-get install -y fonts-hosny-amiri
+      - name: Install Playwright's Chromium (warm cache, no-op if present)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install chromium
 
-      # Needed by compress_pdf_under_limit.py (called from decree_common.
-      # run_finalize_stages right before the Stage 6 upload, since prepare
-      # runs Stages 2-6 itself on a cache hit) — its preferred compression
-      # path shells out to the `gs` binary. Without this, every merged PDF
-      # over the ~1MB SMC upload cap falls straight to the PyMuPDF fallback
-      # (rasterizes each page - larger quality loss, non-selectable text).
-      - name: Install Ghostscript (PDF compression, preferred path)
-        run: sudo apt-get install -y ghostscript
+      # fonts-hosny-amiri is what medical_report_overlay.py draws the
+      # SEPARATE medical-report PDF with, and decree_common.
+      # fetch_and_configure_assets() hard-fails if it's missing — so it
+      # stays. Ghostscript is compress_pdf_under_limit.py's preferred path;
+      # without it every oversized merged PDF falls to the slower, lossier
+      # PyMuPDF rasterizer.
+      #
+      # NEW: both in one apt transaction, guarded so an image that already
+      # has them skips the install entirely, and with a retry so a flaky
+      # mirror doesn't fail the batch before a single case is touched.
+      - name: Install Ghostscript + Amiri font (skipped if already present)
+        run: |
+          need=""
+          command -v gs >/dev/null 2>&1 || need="$need ghostscript"
+          fc-list 2>/dev/null | grep -qi amiri || need="$need fonts-hosny-amiri"
+          if [ -n "$need" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq -o Acquire::Retries=3 $need
+          else
+            echo "ghostscript and fonts-hosny-amiri already present — skipping apt."
+          fi
 
-      - name: Run prepare (MDT creation + document lookup)
+      - name: Run prepare (MDT creation + document lookup) — ${{ matrix.batch.name }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -117,15 +204,29 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          CASE_IDS: ${{ github.event.inputs.case_ids }}
+          # ALWAYS an explicit list from the planner — never blank, or this
+          # batch would process the entire READY_TO_SUBMIT queue.
+          CASE_IDS: ${{ matrix.batch.case_ids }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python decree_submission_prepare.py
 
-      - name: Upload run artifacts (logs, debug dumps, if any)
-        if: always()
+      # CHANGED: was `if: always()`. /tmp/decree_merged holds the MERGED
+      # PATIENT SUBMISSION PDFs — real patient documents. Uploading them on
+      # every successful run costs upload time and parks patient data in
+      # GitHub's artifact storage for 14 days for no diagnostic reason:
+      # everything you actually triage on lives in decree_request_
+      # requirements / decree_request_events, which this does not touch.
+      # Now kept only when the batch failed, which is the only time anyone
+      # has ever opened it.
+      #
+      # NOTE the artifact name now includes the batch name — actions/
+      # upload-artifact@v4 ERRORS on a duplicate artifact name within one
+      # run, so with a matrix this is mandatory, not cosmetic.
+      - name: Upload run artifacts (only on failure)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: decree-prepare-run-${{ github.run_id }}
+          name: decree-prepare-run-${{ github.run_id }}-${{ matrix.batch.name }}
           path: |
             /tmp/decree_merged/**
           if-no-files-found: ignore
@@ -133,16 +234,13 @@ jobs:
 
       # Only populated when debug_render_mdt_and_stop is true (see
       # decree_submission_prepare.debug_dump_mdt_and_stop) — a SEPARATE
-      # artifact, on purpose, from the one above, so a real run's merged
-      # submission PDFs and a debug run's isolated MDT renders never mix
-      # in the same download. Short retention since this is meant to be
-      # inspected once and thrown away — delete it yourself from this
-      # run's page whenever you're done with it, no need to wait.
+      # artifact, on purpose, so a real run's merged submission PDFs and a
+      # debug run's isolated MDT renders never mix in the same download.
       - name: Upload MDT debug render (only if debug_render_mdt_and_stop was on)
-        if: always()
+        if: always() && github.event.inputs.debug_render_mdt_and_stop == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: decree-mdt-debug-${{ github.run_id }}
+          name: decree-mdt-debug-${{ github.run_id }}-${{ matrix.batch.name }}
           path: |
             /tmp/decree_mdt_debug/**
           if-no-files-found: ignore
