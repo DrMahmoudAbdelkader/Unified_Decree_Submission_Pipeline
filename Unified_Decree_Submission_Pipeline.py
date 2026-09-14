@@ -434,7 +434,7 @@ TUMOR_TYPE_CONFIG = {
     "blood_tumor": {
         "label": "Blood Type Tumor",
         "arabic_name": "لوكيميا ليمفاويه حاده",
-        "speciality_code": "9",
+        "speciality_code": "11",
         "diag_code": "C95",
         "proc_id": "10",
         "opening_statement": "المريض يعاني من لوكيميا ليمفاويه حاده ويحتاج الي",
@@ -443,7 +443,7 @@ TUMOR_TYPE_CONFIG = {
 
 
 def _add_generic_tumor_type(canonical_id: str, english_label: str, arabic_name: str,
-                             diag_code: str, speciality_code: str = "9", proc_id: str = "10",
+                             diag_code: str, speciality_code: str = "11", proc_id: str = "10",
                              extra_aliases: Optional[List[str]] = None):
     """Registers a tumor type that uses the uniform generic report format
     ("A patient of <english_label> for <treatment plan>") rather than a
@@ -3228,7 +3228,7 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
         # actually returned for this pre-request (the value the server
         # itself stored at creation time), falling back to the tumor
         # type's own speciality_code only if the server didn't return one.
-        "DIAGNOSISGROUP": str(pre_req.get("DIAGNOSISGROUP") or (tumor_cfg or {}).get("speciality_code") or "9"),
+        "DIAGNOSISGROUP": str(pre_req.get("DIAGNOSISGROUP") or (tumor_cfg or {}).get("speciality_code") or "11"),
         "DEPARTMENTIDFK": str(pre_req.get("DEPARTMENTIDFK") or ""),
         "TREATMENTPLAN": pre_req.get("TREATMENTPLAN") or "",
         "CANCERPLACEID": "",
