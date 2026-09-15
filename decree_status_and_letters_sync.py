@@ -312,13 +312,89 @@ def load_status_map() -> Dict[str, dict]:
 def load_open_attempts() -> List[dict]:
     """Every attempt with a request number that hasn't reached a final
     status yet. status_is_final is tracked directly on the attempt row so
-    this query never re-checks something already resolved. Requires
-    schema_additions_phase1b_status_tracking.sql to have been run."""
-    return sb.select(
-        ATTEMPTS_TABLE,
-        select="id,case_id,website_request_id,attempt_status,response_text,status_is_final",
-        filters={"website_request_id": "not.is.null", "status_is_final": "is.false"},
-    )
+    this query never re-checks something already resolved — that is the
+    mechanism by which a قرار نهائى / خطاب ادارى request drops out of the
+    live sweep forever once it lands. Requires
+    schema_additions_phase1b_status_tracking.sql to have been run.
+
+    FIXED BUG #1 — the reason attempts appeared frozen. The filter used to
+    be status_is_final=is.false, and in PostgREST (as in SQL) `is.false`
+    matches ONLY literal false: a NULL is not false, it is unknown, and
+    NULL rows were silently excluded from the result set. Every attempt
+    created BEFORE schema_additions_phase1b_status_tracking.sql added the
+    column — and every attempt inserted by any code path that doesn't set
+    it explicitly — has status_is_final = NULL, so this sweep has never
+    once looked at them. They are not stuck at an SMC status; they were
+    never asked about. `or=(...is.false,...is.null)` includes both.
+
+    FIXED BUG #2 — no paging. PostgREST caps a response at db-max-rows
+    (1000 by default on Supabase) and returns the first page SILENTLY,
+    with no error. Past ~1000 open attempts the sweep would quietly only
+    ever process the same first page, so the tail of the queue would never
+    be checked no matter how many nights it ran. `offset` is a standard
+    PostgREST query param, so it rides along in the filters dict without
+    needing a change to supabase_client.select()."""
+    page_size = 500
+    offset = 0
+    rows: List[dict] = []
+    while True:
+        page = sb.select(
+            ATTEMPTS_TABLE,
+            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final",
+            filters={
+                "website_request_id": "not.is.null",
+                "or": "(status_is_final.is.false,status_is_final.is.null)",
+                "offset": str(offset),
+            },
+            # Deterministic paging needs a stable sort; without an explicit
+            # order, offset-based paging can skip or repeat rows.
+            order="id.asc",
+            limit=page_size,
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        offset += page_size
+
+
+# Set to False the first time a write including last_status_checked_at is
+# rejected, so a missing column degrades to "everything else still works"
+# instead of failing every single attempt in the run. See _mark_checked().
+_LAST_CHECKED_COLUMN_AVAILABLE = True
+
+
+def _mark_checked(attempt_id, extra_fields: Optional[Dict[str, object]] = None):
+    """Writes update_fields PLUS a last_status_checked_at stamp.
+
+    Why the stamp matters: without it there is no way to tell "this request
+    was checked last night and SMC genuinely still has no recommendation
+    for it" apart from "this request was never looked at". That ambiguity
+    is exactly what made the tracker look broken. The module can now show
+    the real last-checked time per row.
+
+    last_status_checked_at is an OPTIONAL column (add it with the migration
+    shipped alongside this change). If it isn't there yet, the first write
+    fails, this flags it off, retries without it, and every later write in
+    the run skips it — so deploying the script before the migration costs
+    you the stamp, not the sync."""
+    global _LAST_CHECKED_COLUMN_AVAILABLE
+    fields = dict(extra_fields or {})
+    if _LAST_CHECKED_COLUMN_AVAILABLE:
+        attempt_fields = dict(fields)
+        attempt_fields["last_status_checked_at"] = datetime.now().astimezone().isoformat()
+        try:
+            return sb.update(ATTEMPTS_TABLE, attempt_id, attempt_fields)
+        except RuntimeError as e:
+            if "last_status_checked_at" not in str(e):
+                raise
+            _LAST_CHECKED_COLUMN_AVAILABLE = False
+            log.warning(
+                "decree_request_attempts.last_status_checked_at does not exist — continuing without "
+                "the last-checked stamp. Run the status-sync migration to enable it."
+            )
+    if not fields:
+        return None
+    return sb.update(ATTEMPTS_TABLE, attempt_id, fields)
 
 
 def _get_smc_credentials():
@@ -356,6 +432,8 @@ def main():
     log.info(f"{len(attempts)} open attempt(s) to check.")
 
     checked = updated = letters_fetched = pre_recommendation_skipped = 0
+    popup_failed = 0
+    reached_final = 0
     unmapped_statuses = set()
 
     for attempt in attempts:
@@ -372,11 +450,17 @@ def main():
             # not implemented, not silently skipped by accident.
             _check_pre_recommendation_status(session, request_number)
             pre_recommendation_skipped += 1
+            # Stamp it anyway: "asked SMC, no recommendation exists yet" is
+            # a real, useful result and must be distinguishable from "never
+            # asked". Nothing else about the row changes.
+            _mark_checked(attempt["id"])
             continue
 
         html = get_letter_popup_html(session, rec_id)
         time.sleep(REQUEST_DELAY)
         if not html:
+            popup_failed += 1
+            _mark_checked(attempt["id"])
             continue
 
         extracted = extract_status_and_response(html)
@@ -394,6 +478,12 @@ def main():
             update_fields["smc_status_raw"] = extracted["status_raw"]
             update_fields["smc_status_normalized"] = bucket_info["english_bucket"]
             update_fields["status_is_final"] = bool(bucket_info["is_final"])
+            if bucket_info["is_final"]:
+                # This attempt drops out of every future sweep from here on
+                # (load_open_attempts filters status_is_final out), which is
+                # what "reached قرار نهائى / خطاب ادارى, stop re-checking it"
+                # means in practice.
+                reached_final += 1
             if bucket_info["english_bucket"] == "Unknown":
                 unmapped_statuses.add(extracted["status_raw"])
         else:
@@ -405,8 +495,13 @@ def main():
             log.warning(f"  request {request_number}: recommendation {rec_id} found but no status label "
                         f"matched any candidate — logging raw popup for review, not updating status.")
 
+        if not update_fields:
+            # Recommendation exists but nothing new was extracted — still a
+            # completed check, so stamp it and move on.
+            _mark_checked(attempt["id"])
+
         if update_fields:
-            sb.update(ATTEMPTS_TABLE, attempt["id"], update_fields)
+            _mark_checked(attempt["id"], update_fields)
             sb.insert(EVENTS_TABLE, {
                 "case_id": attempt["case_id"],
                 "attempt_id": attempt["id"],
@@ -439,10 +534,39 @@ def main():
                                     "via_bucket": bucket_info["english_bucket"]},
                     })
 
-    log.info(f"Done. Checked {checked}, updated {updated}, letters fetched {letters_fetched}, "
-             f"pre-recommendation (not yet checkable) {pre_recommendation_skipped}.")
+    log.info(f"Done. Checked {checked}, updated {updated}, reached a final status {reached_final}, "
+             f"letters fetched {letters_fetched}, pre-recommendation (not yet checkable) "
+             f"{pre_recommendation_skipped}, popup unreadable {popup_failed}.")
     if unmapped_statuses:
         log.warning(f"Unmapped statuses seen — add these to smc_status_map: {sorted(unmapped_statuses)}")
+
+    # A scheduled job nobody watches needs to say what it did somewhere
+    # visible. This puts the numbers on the workflow run's own summary page,
+    # so "did last night's sync actually move anything?" is one click, not a
+    # log dive. No-op outside GitHub Actions.
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"## Decree status sync\n"
+                f"- Open attempts checked: **{checked}**\n"
+                f"- Rows updated: **{updated}**\n"
+                f"- Reached a final status this run (now excluded from future sweeps): **{reached_final}**\n"
+                f"- Letter texts newly captured: **{letters_fetched}**\n"
+                f"- No recommendation on SMC yet (still pre-committee): **{pre_recommendation_skipped}**\n"
+                f"- Recommendation found but popup unreadable: **{popup_failed}**\n"
+            )
+            if unmapped_statuses:
+                f.write(f"- ⚠️ Unmapped statuses — add to `smc_status_map`: "
+                        f"{', '.join(sorted(unmapped_statuses))}\n")
+            if pre_recommendation_skipped and not updated:
+                f.write(
+                    "\n> Every open attempt came back with no recommendation yet. If that stays true "
+                    "night after night while the SMC site clearly shows statuses, the cause is the "
+                    "known gap documented at the top of this script: pre-recommendation statuses "
+                    "(تم التسجيل / لجنة طبية / تحويل الي طبيب اخر) need a different endpoint that "
+                    "`_check_pre_recommendation_status()` is still a stub for.\n"
+                )
 
 
 if __name__ == "__main__":
