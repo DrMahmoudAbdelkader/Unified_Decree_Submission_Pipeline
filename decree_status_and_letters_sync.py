@@ -133,9 +133,17 @@ SYSTEM_CREATED_BY = "9b8fa9a6-0567-4a93-8e21-d0f8bc098394"
 # english_bucket (from smc_status_map) -> decree_request_cases.case_status.
 # Unmapped/non-final buckets are deliberately absent — case_status is left
 # as whatever it already is rather than guessed at.
+#
+# Admin_Letter (خطاب ادارى) -> FINAL_DECLINED, not "ADMIN_LETTER": this is
+# a terminal SMC response (a refusal), same as an approval or a
+# cancellation, so it belongs on a terminal case_status. Stamping it
+# "ADMIN_LETTER" left it reading as an in-progress status downstream. The
+# raw response is not lost by this — smc_status_raw/smc_status_normalized
+# on the attempt row still record "خطاب ادارى"/"Admin_Letter" exactly as
+# before; only the denormalized case_status changes.
 BUCKET_TO_CASE_STATUS = {
     "Approved": "FINAL_APPROVED",
-    "Admin_Letter": "ADMIN_LETTER",
+    "Admin_Letter": "FINAL_DECLINED",
     "Cancelled": "CANCELLED",
     "Cancelled_For_Edit": "CANCELLED",
     "Cancelled_By_Request": "CANCELLED",
