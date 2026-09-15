@@ -3,73 +3,84 @@
 """
 decree_status_and_letters_sync.py
 ==========================================================================
-Phase 3 daily sync — runs as a GitHub Actions scheduled job (see
-.github/workflows/decree-status-sync.yml). Confirmed via HAR capture:
-`/smc/Decrees/SearchRecommendationRequest` accepts a `requestID` param
-directly — no date-range sweep needed to find a request's recommendation.
+Daily status sweep — REBUILT to use the confirmed-working status
+mechanism from request_status_sync.py (a sibling repo's script, supplied
+2026-09-15), instead of the SearchRecommendationRequest + _PrintLetters
+popup-scraping this file used before.
 
-WHAT CHANGED IN THIS REWRITE
+WHY THE REBUILD
 --------------------------------------------------------------------------
-1. Dropped the `smc_session` module dependency. That module was never
-   supplied in any session and its SMCSession(username=, password=)
-   constructor shape doesn't match the pipeline's actual SMCSession()
-   (no-arg, module-level USERNAME/PASSWORD read at login() time — see
-   Unified_Decree_Submission_Pipeline.py). This script now reuses THAT
-   SMCSession, the exact same class decree_submission_service.py uses,
-   overriding USERNAME/PASSWORD from SMC_USERNAME_2/SMC_PASSWORD_2 first
-   (a separate account, so a long-running status sweep never fights the
-   submission job for the same session) falling back to SMC_USERNAME/
-   SMC_PASSWORD if no dedicated secondary account is configured.
+The previous version's status source was find_recommendation_id_for_request()
+— it asked "does a recommendation/letter exist yet for this request?" and,
+if not, gave up (that was the explicit "_check_pre_recommendation_status
+is a stub" gap documented in every earlier version of this file). That
+meant every request still at تم التسجيل / لجنة طبية / تحويل الي طبيب اخر
+— i.e. most open requests, most of the time — was invisible to this
+script no matter how many nights it ran.
 
-2. Dropped the dependency on request_status_sync.py for status
-   normalization. That file was never supplied in any session, and per
-   the workflow's own comments it only ever wrote to a *reporting* table
-   (decree_request_status_daily_export), never to attempt_status/
-   case_status — so relying on it meant Phase 3's actual "auto-update
-   the status" requirement was never implemented anywhere. This version
-   implements it directly (see STEP B below) using the ONE endpoint this
-   script already confirmed works — the _PrintLetters popup — which
-   carries both the response text AND a status label whenever a
-   recommendation/letter already exists for the request.
+request_status_sync.py hits a different, better endpoint:
+POST /smc/Reports/SendRequestStatusJson, which is the JSON backing call
+for the site's own "SendRequestStatus" report page. It returns EVERY
+request's current status directly (STATUSARABICNAME), regardless of
+whether a recommendation exists — because it's driven by the report
+page, not the recommendation/letters workflow. That closes the gap
+entirely; there is no more pre-recommendation stub in this file.
 
-3. Actually WIRES UP smc_status_map. The previous version loaded it and
-   defined resolve_status_bucket() but never called it — this rewrite
-   calls it for every raw status label found and writes the result to
-   decree_request_attempts.smc_status_raw / smc_status_normalized /
-   status_is_final (added by schema_additions_phase1b_status_tracking.sql
-   — run that migration before this script, or every query against
-   decree_request_attempts will fail with "column does not exist").
-   When the resolved bucket is final, it also stamps
-   decree_request_cases.case_status using BUCKET_TO_CASE_STATUS below.
-
-KNOWN REMAINING GAP — please read before assuming this is complete
+WHAT DID NOT CHANGE
 --------------------------------------------------------------------------
-The _PrintLetters popup only exists once SMC has generated a
-recommendation/letter for a request — which covers Admin_Letter and the
-various final/recommendation statuses. It does NOT cover the *earlier*
-statuses that precede any recommendation at all: "تم التسجيل" (just
-registered), "لجنة طبية" (in medical committee), "تحويل الي طبيب اخر"
-(reassigned). For those, find_recommendation_id_for_request() below
-correctly returns None (no recommendation exists yet) and the attempt is
-left exactly as it is — nothing is guessed. Detecting those specific
-in-between statuses needs a genuinely different endpoint (the old
-request_status_sync.py apparently called one — SendRequestStatusJson —
-but its actual request/response shape was never supplied to me in any
-session, so I'm not going to fabricate a call against an endpoint I've
-never seen a real response from). _check_pre_recommendation_status()
-below is a clearly-marked stub for exactly this — one function to fill
-in once you can supply either request_status_sync.py's real
-implementation of that call, or a fresh HAR capture of it.
+This script still writes to THIS app's own schema —
+decree_request_attempts.smc_status_raw / smc_status_normalized /
+status_is_final / last_status_checked_at, and
+decree_request_cases.case_status via BUCKET_TO_CASE_STATUS — the exact
+tables this app's "decree status tracker" module and request-entry module
+read. request_status_sync.py writes to a DIFFERENT pair of tables
+(decree_request_status_daily_export / decree_admin_letter_details) that
+belong to a separate reporting pipeline in the other repo; those are not
+touched here and are not what feeds this app.
 
-CONFIG NEEDED FROM YOU before this runs for real:
-    SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   — your project's, service role
-    SMC_USERNAME_2 / SMC_PASSWORD_2           — dedicated secondary SMC
-        account for this sync (recommended so it never shares a login
-        session with a concurrent submission run). Falls back to
-        SMC_USERNAME / SMC_PASSWORD if not set.
-    SMC_SENDING_SITE                          — facility id used in the
-        SearchRecommendationRequest payload (102233 in the captured HAR;
-        confirm this is your facility's real site id before trusting it)
+THE TWO-TIER LOOKUP (ported from request_status_sync.py's own design)
+--------------------------------------------------------------------------
+1. BULK WINDOW (cheap): one POST to SendRequestStatusJson for a rolling
+   LOOKBACK_DAYS-day window (default 15) returns the current status of
+   every request submitted in that window in ONE call — covers the large
+   majority of open attempts without a single per-attempt round trip.
+2. STALE FALLBACK (targeted): any open attempt whose website_request_id
+   did NOT come back in the bulk window (submitted longer ago than
+   LOOKBACK_DAYS but still open) gets ONE targeted SendRequestStatusJson
+   call, filtered by RequestNumber alone with a wide start date — same
+   technique request_status_sync.refresh_stale_open_requests() uses.
+   Capped per run at MAX_SINGLE_STATUS_LOOKUPS (default 300) to bound
+   run time; anything past the cap is picked up on a later run, and
+   load_open_attempts() orders by staleness (oldest-checked first) so the
+   cap never starves the same tail of the queue night after night.
+
+LETTER TEXT (نص الخطاب) — narrowed, not removed
+--------------------------------------------------------------------------
+The old SearchRecommendationRequest + _PrintLetters popup call is KEPT,
+but only as a second step, fired only for attempts whose status this run
+resolved to the Admin_Letter bucket and which don't already have
+response_text saved. Previously this round trip ran for every single open
+attempt regardless of status; now it only runs for the ones that actually
+need a letter body, which is both faster and lighter on the SMC site.
+
+CONFIG NEEDED FROM YOU
+--------------------------------------------------------------------------
+    SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+    SMC_USERNAME_2 / SMC_PASSWORD_2   — dedicated secondary account,
+        falls back to SMC_USERNAME / SMC_PASSWORD if unset.
+    SMC_SENDING_SITE                  — only used for the admin-letter
+        text lookup (SearchRecommendationRequest still needs it);
+        SendRequestStatusJson itself does not take a sending-site param.
+    LOOKBACK_DAYS                     — default 15.
+    MAX_SINGLE_STATUS_LOOKUPS         — default 300.
+
+BEFORE TRUSTING THIS FOR REAL: smc_status_map now needs a row for every
+raw status SendRequestStatusJson can return — including the early ones
+(تم التسجيل, لجنة طبية, تحويل الي طبيب اخر, توصية مبدئية, ...) that the
+old popup-based version never saw at all. Any status text that comes back
+without a matching row falls into the "Unknown" bucket (never guessed as
+final) and is logged — check the run summary's "Unmapped statuses" line
+after the first real run and add rows for whatever shows up there.
 """
 
 from __future__ import annotations
@@ -79,6 +90,7 @@ import os
 import re
 import sys
 import time
+import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -86,8 +98,6 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Reused verbatim — same SMCSession class decree_submission_service.py
-# uses, not a separate smc_session.py module (which was never supplied).
 import Unified_Decree_Submission_Pipeline as _pipeline_module
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
@@ -99,35 +109,30 @@ BASE_URL = _pipeline_module.BASE_URL
 REQUEST_DELAY = 0.3
 MAX_POPUP_ATTEMPTS = 3
 
-# CONFIG — confirm SENDING_SITE against your real facility id before trusting
+# Only used by the admin-letter text lookup (SearchRecommendationRequest) —
+# SendRequestStatusJson itself takes no sending-site parameter.
 SENDING_SITE = os.environ.get("SMC_SENDING_SITE", "102233")
+
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "15"))
+MAX_SINGLE_STATUS_LOOKUPS = int(os.environ.get("MAX_SINGLE_STATUS_LOOKUPS", "300"))
 
 ATTEMPTS_TABLE = "decree_request_attempts"
 CASES_TABLE = "decree_request_cases"
 EVENTS_TABLE = "decree_request_events"
 STATUS_MAP_TABLE = "smc_status_map"
 
-# decree_request_events.created_by is NOT NULL — it has no default, so any
-# insert that omits it is rejected outright (23502) rather than silently
-# leaving it blank. decree_common.log_event(), used by every OTHER writer
-# in this pipeline (prepare/finalize), already covers this with the same
-# fixed "system" UUID; this script writes to decree_request_events directly
-# instead of through that helper, and had simply never set it — that omission
-# is what crashed the very first insert of every run, before a single one of
-# the 934 open attempts got a result recorded. Reusing the identical UUID
-# here (rather than inventing a second "system" identity) keeps every
-# automated row in decree_request_events attributable to the same account
-# regardless of which script wrote it.
+# decree_request_events.created_by is NOT NULL with no default. Every OTHER
+# writer in this pipeline goes through decree_common.log_event(), which
+# already sets this fixed "system" UUID; this script writes to
+# decree_request_events directly and had simply never set it — that
+# omission crashed every run of the previous version on its very first
+# insert. Reusing the identical UUID keeps every automated row
+# attributable to the same account regardless of which script wrote it.
 SYSTEM_CREATED_BY = "9b8fa9a6-0567-4a93-8e21-d0f8bc098394"
 
-# english_bucket (from smc_status_map, seeded by schema_additions_phase1.sql)
-# -> decree_request_cases.case_status. Only buckets that map cleanly onto
-# the table's fixed CHECK constraint values are listed; anything else
-# (Under_Medical_Review, Reassigned_To_Doctor, Preliminary_Recommendation,
-# Final_Recommendation, Registered, Unknown) is intentionally NOT in here —
-# those are non-final per smc_status_map's own is_final flag, so case_status
-# is deliberately left as whatever it already is (normally 'SUBMITTED' or
-# 'PENDING') rather than guessed at.
+# english_bucket (from smc_status_map) -> decree_request_cases.case_status.
+# Unmapped/non-final buckets are deliberately absent — case_status is left
+# as whatever it already is rather than guessed at.
 BUCKET_TO_CASE_STATUS = {
     "Approved": "FINAL_APPROVED",
     "Admin_Letter": "ADMIN_LETTER",
@@ -138,21 +143,185 @@ BUCKET_TO_CASE_STATUS = {
 
 
 # =====================================================================
-# Helpers ported verbatim from Extract_Admin_Letters_By_Time_Frame.py
-# (not reimplemented — same functions, so this can never quietly drift
-# out of sync with the already-tested parsing logic)
+# Cairo local time — no extra dependency: zoneinfo is stdlib (3.9+) and
+# Linux runners carry the system tz database, so Africa/Cairo (including
+# Egypt's 2023-reinstated DST) resolves correctly with no pip install.
+# Falls back to a fixed UTC+2 offset (logging once) only if the platform
+# genuinely has no tz database at all — that fallback will be off by an
+# hour during Egypt's Apr-Oct DST window, which only affects which
+# calendar day a request near local midnight is filed under, never
+# whether it's found at all.
+# =====================================================================
+try:
+    from zoneinfo import ZoneInfo
+    CAIRO_TZ = ZoneInfo("Africa/Cairo")
+except Exception:
+    from datetime import timezone
+    CAIRO_TZ = timezone(timedelta(hours=2))
+    log.warning("Africa/Cairo tz data not available on this runner — falling back to a fixed "
+                "UTC+2 offset (will be off by 1 hour during Egypt's Apr-Oct DST window).")
+
+
+def cairo_today_iso() -> str:
+    return datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+
+
+# =====================================================================
+# STEP 1 — SendRequestStatusJson (ported from request_status_sync.py,
+# confirmed working against the real site). Pure parsing helpers first.
 # =====================================================================
 
-_AR2EN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+def _smc_datetime_str(date_iso: str, end_of_day: bool = False) -> str:
+    """'2026-08-08' -> '8/8/2026 12:00:00 AM' — the exact format the site's
+    own JS sends (no zero-padding). end_of_day=True gives '... 11:59:59 PM'
+    so a same-day request isn't excluded by an exact-midnight boundary."""
+    d = datetime.strptime(date_iso, "%Y-%m-%d")
+    if end_of_day:
+        return f"{d.month}/{d.day}/{d.year} 11:59:59 PM"
+    return f"{d.month}/{d.day}/{d.year} 12:00:00 AM"
 
 
-def ar2en(text: str) -> str:
-    return (text or "").translate(_AR2EN_DIGITS)
+_DOTNET_DATE_RE = re.compile(r"/Date\((-?\d+)\)/")
 
 
-def cell_text(tag) -> str:
-    return tag.get_text(strip=True) if tag else ""
+def _parse_dotnet_date(value, fallback_iso: Optional[str] = None) -> Optional[str]:
+    """ASP.NET serializes DateTime as '/Date(1699999999000)/' (epoch ms).
+    Converts to 'YYYY-MM-DD' in Cairo local time. Never raises."""
+    if not value:
+        return fallback_iso
+    m = _DOTNET_DATE_RE.search(str(value))
+    if not m:
+        return fallback_iso
+    try:
+        epoch_ms = int(m.group(1))
+        dt = datetime.fromtimestamp(epoch_ms / 1000, tz=CAIRO_TZ)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, OSError, OverflowError):
+        return fallback_iso
 
+
+def _clean_id(value) -> str:
+    """SendRequestStatusJson's serializer emits numeric IDs as JSON floats
+    (e.g. 67227949.0). Strips a trailing '.0' off any whole-number
+    float/string before it's used anywhere — confirmed via the sibling
+    script that the site's own pages 404 on the '.0'-suffixed form."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
+        return text[:-2]
+    return text
+
+
+def _parse_send_request_status_json(raw):
+    """Unwraps the response regardless of whether the server sent a real
+    JSON array or a JSON-encoded string containing one — the report page's
+    own JS unconditionally does a second JSON.parse, so this mirrors that."""
+    data = raw
+    for _ in range(2):
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (ValueError, TypeError):
+                return []
+        else:
+            break
+    return data if isinstance(data, list) else []
+
+
+def _row_from_record(rec: dict, fallback_date_iso: Optional[str] = None) -> Optional[dict]:
+    request_number = _clean_id(rec.get("REQUESTID"))
+    if not request_number:
+        return None
+    return {
+        "request_number": request_number,
+        "patient_name": (rec.get("CITIZENFULLNAMEARABIC") or "").strip() or None,
+        "patient_id": _clean_id(rec.get("CITIZENSSN")) or None,
+        "request_status": (rec.get("STATUSARABICNAME") or "").strip() or None,
+        "request_date": _parse_dotnet_date(rec.get("REQUESTDATE"), fallback_iso=fallback_date_iso),
+    }
+
+
+def fetch_status_window(session, start_date_iso: str, end_date_iso: str) -> Dict[str, dict]:
+    """ONE call covering every request submitted in [start, end]. Returns a
+    dict keyed by request_number so process_one_attempt() can look an
+    attempt's status up with no further network call for anything inside
+    the window."""
+    url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
+    payload = {
+        "CitizenName": "",
+        "StartDate": _smc_datetime_str(start_date_iso),
+        "EndDate": _smc_datetime_str(end_date_iso, end_of_day=True),
+        "SsnNumber": "",
+        "RequestNumber": "",
+        "RequestStatusId": "",
+        "SystemUserId": "",
+    }
+    log.info(f"Fetching SendRequestStatusJson window {start_date_iso}..{end_date_iso} …")
+    try:
+        resp = session.post(url, data=payload, timeout=30)
+    except Exception as e:
+        log.error(f"SendRequestStatusJson (bulk window) failed: {e}")
+        return {}
+    if resp.status_code != 200:
+        log.error(f"SendRequestStatusJson (bulk window) returned HTTP {resp.status_code}")
+        return {}
+
+    try:
+        raw = resp.json()
+    except ValueError:
+        raw = resp.text
+
+    out: Dict[str, dict] = {}
+    for rec in _parse_send_request_status_json(raw):
+        row = _row_from_record(rec, fallback_date_iso=end_date_iso)
+        if row:
+            out[row["request_number"]] = row
+    log.info(f"  {len(out)} request(s) returned in the window.")
+    return out
+
+
+def fetch_single_status(session, request_number: str, today_iso: str) -> Optional[dict]:
+    """Targeted re-check for ONE request_number, bypassing the rolling
+    window entirely (StartDate pinned far in the past) — for attempts
+    submitted longer ago than LOOKBACK_DAYS that are still open. Returns
+    None if the site no longer returns anything for this number (never
+    raises)."""
+    url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
+    payload = {
+        "CitizenName": "",
+        "StartDate": _smc_datetime_str("2015-01-01"),
+        "EndDate": _smc_datetime_str(today_iso, end_of_day=True),
+        "SsnNumber": "",
+        "RequestNumber": request_number,
+        "RequestStatusId": "",
+        "SystemUserId": "",
+    }
+    try:
+        resp = session.post(url, data=payload, timeout=30)
+    except Exception as e:
+        log.error(f"  [stale] {request_number}: request failed ({e})")
+        return None
+    if resp.status_code != 200:
+        log.warning(f"  [stale] {request_number}: HTTP {resp.status_code}")
+        return None
+    try:
+        raw = resp.json()
+    except ValueError:
+        raw = resp.text
+    for rec in _parse_send_request_status_json(raw):
+        if _clean_id(rec.get("REQUESTID")) == request_number:
+            return _row_from_record(rec)
+    return None
+
+
+# =====================================================================
+# Letter text (نص الخطاب) — narrowed to Admin_Letter-bucket attempts only.
+# Endpoints/parsing kept from the previous version of this file (already
+# confirmed working for response_text extraction).
+# =====================================================================
 
 def pipe_field(pipe_text: str, label: str) -> str:
     parts = pipe_text.split("|")
@@ -166,20 +335,7 @@ def popup_looks_valid(pipe_text: str) -> bool:
     return "رقم الطلب" in pipe_text or "الرقم القومي" in pipe_text
 
 
-# Candidate Arabic field labels for the status shown on the _PrintLetters
-# popup, tried in order. This popup's exact label wasn't confirmed in any
-# HAR capture supplied so far (only "نص الخطاب" was) — these are the most
-# plausible labels given the terminology you supplied for the status list
-# itself. If none of these match, extract_status_and_response() falls back
-# to returning None for the status (never guesses) and logs the raw popup
-# text into the event record so you can tell me the right label from a
-# real example and I fix this in one line.
-_STATUS_LABEL_CANDIDATES = ["حالة الطلب", "الحالة", "حاله الطلب", "نوع القرار", "القرار"]
-
-
 def _extract_labeled_field(html: str, label: str) -> Optional[str]:
-    """Same tag-aware pattern already used for نص الخطاب, generalized to any
-    <b>label</b><br>value block."""
     pattern = rf"{re.escape(label)}\s*</b>\s*<br\s*/?>\s*(.*?)(?:<b>|</td>|</tr>|$)"
     m = re.search(pattern, html, re.DOTALL)
     if m:
@@ -189,40 +345,23 @@ def _extract_labeled_field(html: str, label: str) -> Optional[str]:
     return None
 
 
-def extract_status_and_response(html: str) -> Dict[str, Optional[str]]:
-    """Pulls BOTH the response text (نص الخطاب — confirmed working) and a
-    best-effort raw status label from the same _PrintLetters popup HTML.
-    Never raises; missing pieces come back as None."""
-    response_text = _extract_labeled_field(html, "نص الخطاب")
-    if response_text is None:
-        pipe = BeautifulSoup(html, "html.parser").get_text(separator="|", strip=True)
-        response_text = pipe_field(pipe, "نص الخطاب") or None
+def extract_response_text(html: str) -> Optional[str]:
+    """Pulls نص الخطاب from the _PrintLetters popup HTML. The status label
+    this function used to also try to extract is gone — status now comes
+    from SendRequestStatusJson, which is both more complete and doesn't
+    depend on guessing which Arabic label a popup uses."""
+    text = _extract_labeled_field(html, "نص الخطاب")
+    if text is not None:
+        return text
+    pipe = BeautifulSoup(html, "html.parser").get_text(separator="|", strip=True)
+    return pipe_field(pipe, "نص الخطاب") or None
 
-    status_raw = None
-    for label in _STATUS_LABEL_CANDIDATES:
-        status_raw = _extract_labeled_field(html, label)
-        if status_raw:
-            break
-    if status_raw is None:
-        pipe = BeautifulSoup(html, "html.parser").get_text(separator="|", strip=True)
-        for label in _STATUS_LABEL_CANDIDATES:
-            status_raw = pipe_field(pipe, label) or None
-            if status_raw:
-                break
-
-    return {"response_text": response_text, "status_raw": status_raw}
-
-
-# =====================================================================
-# STEP A — direct-by-request-number lookup (replaces the date sweep)
-# =====================================================================
 
 def find_recommendation_id_for_request(session, request_number: str) -> Optional[str]:
-    """POST SearchRecommendationRequest with requestID=<request_number>.
-    Confirmed via HAR capture: this returns the exact matching row (if a
-    recommendation/letter exists for that request) without needing any
-    date-range sweep — dateFrom/dateTo are still required form fields but
-    do not narrow the requestID match, so a fixed wide window is fine."""
+    """POST SearchRecommendationRequest with requestID=<request_number> —
+    only called now for attempts already known (via SendRequestStatusJson)
+    to be at an Admin_Letter status, purely to locate the recommendation id
+    needed to fetch the letter's body text."""
     url = f"{BASE_URL}/smc/Decrees/SearchRecommendationRequest"
     today = datetime.now()
     data = {
@@ -253,6 +392,7 @@ def find_recommendation_id_for_request(session, request_number: str) -> Optional
     table = soup.find("table", id="RecommendationTable")
     if not table:
         return None
+    ar2en_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
     for tbody in table.find_all("tbody"):
         row = tbody.find("tr")
         if not row:
@@ -261,15 +401,14 @@ def find_recommendation_id_for_request(session, request_number: str) -> Optional
         if len(cells) < 2:
             continue
         span = cells[1].find("span", {"id": "RecommendationId"})
-        rec_id = ar2en(cell_text(span) if span else cell_text(cells[1])).strip()
+        cell = span if span else cells[1]
+        rec_id = cell.get_text(strip=True).translate(ar2en_map).strip()
         if rec_id:
             return rec_id
     return None
 
 
 def get_letter_popup_html(session, rec_id: str) -> Optional[str]:
-    """GET _PrintLetters?RecommIDs=<rec_id> and return the raw popup HTML,
-    or None if it never comes back looking like a real popup."""
     url = f"{BASE_URL}/smc/Requests/_PrintLetters"
     for attempt in range(1, MAX_POPUP_ATTEMPTS + 1):
         try:
@@ -286,36 +425,33 @@ def get_letter_popup_html(session, rec_id: str) -> Optional[str]:
     return None
 
 
-def _check_pre_recommendation_status(session, request_number: str) -> Optional[str]:
-    """STUB — deliberately not implemented. Requests still at 'تم التسجيل' /
-    'لجنة طبية' / 'تحويل الي طبيب اخر' have no recommendation yet, so
-    find_recommendation_id_for_request() correctly returns None for them
-    and the caller skips straight past this function. Filling this in
-    needs the real request/response shape of whatever endpoint
-    request_status_sync.py used (referenced in its docstring as
-    SendRequestStatusJson) — not fabricated here since it was never
-    actually supplied. Returns None unconditionally until then."""
-    return None
+def fetch_admin_letter_text(session, request_number: str) -> Optional[str]:
+    """The two-call letter-text fetch, only ever invoked for an attempt
+    already confirmed (via SendRequestStatusJson) to be at Admin_Letter."""
+    rec_id = find_recommendation_id_for_request(session, request_number)
+    time.sleep(REQUEST_DELAY)
+    if not rec_id:
+        log.warning(f"  {request_number}: status is Admin_Letter but no recommendation id found — "
+                    f"letter text not fetched this run.")
+        return None
+    html = get_letter_popup_html(session, rec_id)
+    time.sleep(REQUEST_DELAY)
+    if not html:
+        return None
+    return extract_response_text(html)
 
 
 # =====================================================================
-# STEP B — status normalization, now actually wired to smc_status_map
+# Status normalization — unchanged mechanism, now fed a far more complete
+# and reliable set of raw status strings.
 # =====================================================================
 
 def resolve_status_bucket(status_map: Dict[str, dict], arabic_status: str) -> dict:
-    """Look up a raw Arabic status in the cached smc_status_map. Falls back
-    to a non-final, non-actionable bucket for anything unrecognized instead
-    of guessing — an unmapped status should surface for a human to add,
-    not silently get treated as final or as final-cancelled."""
     return status_map.get(
         arabic_status,
         {"arabic_status": arabic_status, "english_bucket": "Unknown", "is_final": False, "requires_action": False},
     )
 
-
-# =====================================================================
-# MAIN
-# =====================================================================
 
 def load_status_map() -> Dict[str, dict]:
     rows = sb.select(STATUS_MAP_TABLE, select="arabic_status,english_bucket,is_final,requires_action")
@@ -324,44 +460,38 @@ def load_status_map() -> Dict[str, dict]:
 
 def load_open_attempts() -> List[dict]:
     """Every attempt with a request number that hasn't reached a final
-    status yet. status_is_final is tracked directly on the attempt row so
-    this query never re-checks something already resolved — that is the
-    mechanism by which a قرار نهائى / خطاب ادارى request drops out of the
-    live sweep forever once it lands. Requires
-    schema_additions_phase1b_status_tracking.sql to have been run.
+    status yet, oldest-checked first.
 
-    FIXED BUG #1 — the reason attempts appeared frozen. The filter used to
-    be status_is_final=is.false, and in PostgREST (as in SQL) `is.false`
-    matches ONLY literal false: a NULL is not false, it is unknown, and
-    NULL rows were silently excluded from the result set. Every attempt
-    created BEFORE schema_additions_phase1b_status_tracking.sql added the
-    column — and every attempt inserted by any code path that doesn't set
-    it explicitly — has status_is_final = NULL, so this sweep has never
-    once looked at them. They are not stuck at an SMC status; they were
-    never asked about. `or=(...is.false,...is.null)` includes both.
+    Two fixes carried over from the previous version, both still load-
+    bearing:
+      - `or=(status_is_final.is.false,status_is_final.is.null)` — PostgREST's
+        `is.false` matches ONLY literal false; a NULL (every attempt from
+        before status_is_final existed) is neither true nor false and was
+        silently excluded by the old `is.false`-only filter.
+      - Paging (500/page) — PostgREST caps unpaged responses at db-max-rows
+        with no error, so past ~1000 open attempts the old unpaged query
+        would silently only ever see the first page forever.
 
-    FIXED BUG #2 — no paging. PostgREST caps a response at db-max-rows
-    (1000 by default on Supabase) and returns the first page SILENTLY,
-    with no error. Past ~1000 open attempts the sweep would quietly only
-    ever process the same first page, so the tail of the queue would never
-    be checked no matter how many nights it ran. `offset` is a standard
-    PostgREST query param, so it rides along in the filters dict without
-    needing a change to supabase_client.select()."""
+    NEW: ordered by last_status_checked_at ascending, nulls first, rather
+    than by id. This matters now that a per-run cap
+    (MAX_SINGLE_STATUS_LOOKUPS) can mean not every stale attempt gets its
+    single-lookup budget spent on it every night — ordering by staleness
+    means the budget always goes to whichever attempts have gone longest
+    without a check, instead of the same id-ordered prefix winning (and
+    the same tail starving) every single run."""
     page_size = 500
     offset = 0
     rows: List[dict] = []
     while True:
         page = sb.select(
             ATTEMPTS_TABLE,
-            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final",
+            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final,last_status_checked_at",
             filters={
                 "website_request_id": "not.is.null",
                 "or": "(status_is_final.is.false,status_is_final.is.null)",
                 "offset": str(offset),
             },
-            # Deterministic paging needs a stable sort; without an explicit
-            # order, offset-based paging can skip or repeat rows.
-            order="id.asc",
+            order="last_status_checked_at.asc.nullsfirst,id.asc",
             limit=page_size,
         )
         rows.extend(page)
@@ -370,26 +500,15 @@ def load_open_attempts() -> List[dict]:
         offset += page_size
 
 
-# Set to False the first time a write including last_status_checked_at is
-# rejected, so a missing column degrades to "everything else still works"
-# instead of failing every single attempt in the run. See _mark_checked().
 _LAST_CHECKED_COLUMN_AVAILABLE = True
 
 
 def _mark_checked(attempt_id, extra_fields: Optional[Dict[str, object]] = None):
-    """Writes update_fields PLUS a last_status_checked_at stamp.
-
-    Why the stamp matters: without it there is no way to tell "this request
-    was checked last night and SMC genuinely still has no recommendation
-    for it" apart from "this request was never looked at". That ambiguity
-    is exactly what made the tracker look broken. The module can now show
-    the real last-checked time per row.
-
-    last_status_checked_at is an OPTIONAL column (add it with the migration
-    shipped alongside this change). If it isn't there yet, the first write
-    fails, this flags it off, retries without it, and every later write in
-    the run skips it — so deploying the script before the migration costs
-    you the stamp, not the sync."""
+    """Writes update_fields PLUS a last_status_checked_at stamp, so "SMC was
+    asked and genuinely had nothing new" is distinguishable from "never
+    asked" — and now also drives load_open_attempts()'s staleness order.
+    Degrades gracefully (logs once, keeps going without the stamp) if the
+    column doesn't exist yet in this database."""
     global _LAST_CHECKED_COLUMN_AVAILABLE
     fields = dict(extra_fields or {})
     if _LAST_CHECKED_COLUMN_AVAILABLE:
@@ -403,7 +522,8 @@ def _mark_checked(attempt_id, extra_fields: Optional[Dict[str, object]] = None):
             _LAST_CHECKED_COLUMN_AVAILABLE = False
             log.warning(
                 "decree_request_attempts.last_status_checked_at does not exist — continuing without "
-                "the last-checked stamp. Run the status-sync migration to enable it."
+                "the last-checked stamp (and without staleness-based ordering). Run the status-sync "
+                "migration to enable both."
             )
     if not fields:
         return None
@@ -411,96 +531,75 @@ def _mark_checked(attempt_id, extra_fields: Optional[Dict[str, object]] = None):
 
 
 def _get_smc_credentials():
-    """Prefers a dedicated secondary account (so this long daily sweep never
-    shares a login session with a concurrent submission run) but falls back
-    to the primary account if no secondary one is configured."""
     username = os.environ.get("SMC_USERNAME_2") or os.environ.get("SMC_USERNAME")
     password = os.environ.get("SMC_PASSWORD_2") or os.environ.get("SMC_PASSWORD")
     return username, password
 
 
-def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict) -> Dict[str, int]:
-    """Everything that happens for ONE open attempt. Pulled out of main()'s
-    loop into its own function for exactly one reason: on 2026-09-15 an
-    unhandled RuntimeError from a single sb.insert() call (missing
-    created_by — now fixed, see SYSTEM_CREATED_BY) propagated all the way
-    out of main() and killed the process outright. Of 934 open attempts
-    that night, everything from the failing row onward never got checked,
-    and the only trace of it was a stack trace in the Actions log — no
-    per-attempt error is recorded anywhere queryable.
+# =====================================================================
+# Per-attempt processing
+# =====================================================================
 
-    Returns a dict of counters for the single attempt processed (each 0 or
-    1); main() sums these across the run. Never raises — the caller wraps
-    the call in try/except as a second layer of defense, but every
-    predictable failure path here already returns cleanly instead of
-    raising, so that except should only ever catch a genuinely unexpected
-    error (a network blip, a schema surprise, etc.), and it takes down
-    only that one attempt, not the run."""
+def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
+                         bulk_window: Dict[str, dict], lookup_budget: Dict[str, int],
+                         today_iso: str) -> Dict[str, object]:
+    """Everything that happens for ONE open attempt. Isolated in its own
+    function (and wrapped in try/except by the caller) so an unexpected
+    error on one attempt can never again take down the whole run — that is
+    exactly what happened on 2026-09-15 when a missing created_by field
+    propagated an unhandled exception out of main() and silently dropped
+    every attempt after the failing one for the night.
+
+    Never raises for a predictable failure — every expected path returns
+    cleanly; the caller's except should only ever catch a genuinely
+    unexpected error."""
     counters = {"checked": 1, "updated": 0, "letters_fetched": 0,
-                "pre_recommendation_skipped": 0, "popup_failed": 0, "reached_final": 0}
+                "reached_final": 0, "used_bulk": 0, "used_single_lookup": 0,
+                "budget_exhausted": 0, "not_found": 0, "unmapped_status": None}
     request_number = attempt["website_request_id"]
 
-    rec_id = find_recommendation_id_for_request(session, request_number)
-    time.sleep(REQUEST_DELAY)
-
-    if not rec_id:
-        # No recommendation/letter exists yet — this request is still at
-        # an earlier step (تم التسجيل / لجنة طبية / تحويل الي طبيب اخر).
-        # See _check_pre_recommendation_status()'s docstring: genuinely
-        # not implemented, not silently skipped by accident.
-        _check_pre_recommendation_status(session, request_number)
-        counters["pre_recommendation_skipped"] = 1
-        # Stamp it anyway: "asked SMC, no recommendation exists yet" is
-        # a real, useful result and must be distinguishable from "never
-        # asked". Nothing else about the row changes.
-        _mark_checked(attempt["id"])
-        return counters
-
-    html = get_letter_popup_html(session, rec_id)
-    time.sleep(REQUEST_DELAY)
-    if not html:
-        counters["popup_failed"] = 1
-        _mark_checked(attempt["id"])
-        return counters
-
-    extracted = extract_status_and_response(html)
-    if extracted["response_text"] and not attempt.get("response_text"):
-        counters["letters_fetched"] = 1
-
-    update_fields: Dict[str, object] = {}
-    if extracted["response_text"] and not attempt.get("response_text"):
-        update_fields["response_text"] = extracted["response_text"]
-
-    bucket_info = None
-    unmapped = None
-    if extracted["status_raw"]:
-        bucket_info = resolve_status_bucket(status_map, extracted["status_raw"])
-        update_fields["smc_status_raw"] = extracted["status_raw"]
-        update_fields["smc_status_normalized"] = bucket_info["english_bucket"]
-        update_fields["status_is_final"] = bool(bucket_info["is_final"])
-        if bucket_info["is_final"]:
-            # This attempt drops out of every future sweep from here on
-            # (load_open_attempts filters status_is_final out), which is
-            # what "reached قرار نهائى / خطاب ادارى, stop re-checking it"
-            # means in practice.
-            counters["reached_final"] = 1
-        if bucket_info["english_bucket"] == "Unknown":
-            unmapped = extracted["status_raw"]
+    row = bulk_window.get(request_number)
+    if row is not None:
+        counters["used_bulk"] = 1
+    elif lookup_budget["remaining"] > 0:
+        lookup_budget["remaining"] -= 1
+        row = fetch_single_status(session, request_number, today_iso)
+        time.sleep(REQUEST_DELAY)
+        counters["used_single_lookup"] = 1
     else:
-        # No status label confidently extracted from the popup — record
-        # that a recommendation exists so this isn't silently invisible,
-        # but don't guess at is_final. See _STATUS_LABEL_CANDIDATES'
-        # docstring: send me a real popup example and this becomes a
-        # one-line fix.
-        log.warning(f"  request {request_number}: recommendation {rec_id} found but no status label "
-                    f"matched any candidate — logging raw popup for review, not updating status.")
-
-    if not update_fields:
-        # Recommendation exists but nothing new was extracted — still a
-        # completed check, so stamp it and move on.
-        _mark_checked(attempt["id"])
-        counters["unmapped_status"] = unmapped
+        # Budget exhausted this run — leave the attempt untouched (no
+        # _mark_checked call) so it's neither stamped as freshly checked
+        # nor loses its place at the front of tomorrow's staleness order.
+        counters["budget_exhausted"] = 1
         return counters
+
+    if row is None or not row.get("request_status"):
+        # SendRequestStatusJson returned nothing for this request number at
+        # all (removed request, or a transient site issue) — stamp it as
+        # checked (this WAS a real attempt, not a skip) but don't touch the
+        # stored status.
+        counters["not_found"] = 1
+        _mark_checked(attempt["id"])
+        return counters
+
+    status_raw = row["request_status"]
+    bucket_info = resolve_status_bucket(status_map, status_raw)
+
+    update_fields: Dict[str, object] = {
+        "smc_status_raw": status_raw,
+        "smc_status_normalized": bucket_info["english_bucket"],
+        "status_is_final": bool(bucket_info["is_final"]),
+    }
+    if bucket_info["is_final"]:
+        counters["reached_final"] = 1
+    if bucket_info["english_bucket"] == "Unknown":
+        counters["unmapped_status"] = status_raw
+
+    if (bucket_info["english_bucket"] == "Admin_Letter" and not attempt.get("response_text")):
+        letter_text = fetch_admin_letter_text(session, request_number)
+        if letter_text:
+            update_fields["response_text"] = letter_text
+            counters["letters_fetched"] = 1
 
     _mark_checked(attempt["id"], update_fields)
     sb.insert(EVENTS_TABLE, {
@@ -509,20 +608,16 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict) -> 
         "event_type": "status_sync_checked",
         "created_by": SYSTEM_CREATED_BY,
         "details": {
-            "recommendation_id": rec_id,
             "request_number": request_number,
-            "status_raw": extracted["status_raw"],
-            "resolved_bucket": bucket_info["english_bucket"] if bucket_info else None,
-            "response_text_captured": bool(extracted["response_text"]),
+            "status_raw": status_raw,
+            "resolved_bucket": bucket_info["english_bucket"],
+            "source": "bulk_window" if counters["used_bulk"] else "single_lookup",
+            "response_text_captured": bool(update_fields.get("response_text")),
         },
     })
     counters["updated"] = 1
 
-    # Only stamp case_status for buckets with an unambiguous mapping onto
-    # the CHECK-constrained enum, and only move a case FORWARD from
-    # SUBMITTED/PENDING — never overwrite a status a human (or the
-    # submission service) already set to something else.
-    if bucket_info and bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:
+    if bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:
         case_rows = sb.select(CASES_TABLE, select="case_status", filters={"id": f"eq.{attempt['case_id']}"})
         current_case_status = case_rows[0]["case_status"] if case_rows else None
         if current_case_status in ("SUBMITTED", "PENDING", "ADMIN_LETTER", "RESUBMISSION"):
@@ -537,9 +632,12 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict) -> 
                             "via_bucket": bucket_info["english_bucket"]},
             })
 
-    counters["unmapped_status"] = unmapped
     return counters
 
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 def main():
     username, password = _get_smc_credentials()
@@ -547,8 +645,6 @@ def main():
         log.error("Neither SMC_USERNAME_2/SMC_PASSWORD_2 nor SMC_USERNAME/SMC_PASSWORD are set — aborting.")
         sys.exit(1)
 
-    # Override the pipeline's module-level credentials, same pattern as
-    # decree_submission_service.py — never edits the pipeline file itself.
     _pipeline_module.USERNAME = username
     _pipeline_module.PASSWORD = password
 
@@ -563,25 +659,27 @@ def main():
         log.error("smc_status_map is empty — run schema_additions_phase1.sql first. Aborting.")
         sys.exit(1)
 
-    attempts = load_open_attempts()
-    log.info(f"{len(attempts)} open attempt(s) to check.")
+    today_iso = cairo_today_iso()
+    start_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    bulk_window = fetch_status_window(session, start_iso, today_iso)
 
-    checked = updated = letters_fetched = pre_recommendation_skipped = 0
-    popup_failed = 0
-    reached_final = 0
-    crashed = 0
+    attempts = load_open_attempts()
+    log.info(f"{len(attempts)} open attempt(s) to check "
+             f"(bulk window covers submissions {start_iso}..{today_iso}).")
+
+    lookup_budget = {"remaining": MAX_SINGLE_STATUS_LOOKUPS}
+
+    checked = updated = letters_fetched = reached_final = 0
+    used_bulk = used_single = budget_exhausted = not_found = crashed = 0
     unmapped_statuses = set()
 
     for attempt in attempts:
         try:
-            result = process_one_attempt(session, status_map, attempt)
+            result = process_one_attempt(session, status_map, attempt, bulk_window, lookup_budget, today_iso)
         except Exception as exc:
-            # This is the fix for what happened on 2026-09-15: a single
-            # unexpected error (that run: a missing NOT NULL column on an
-            # events insert) used to propagate out of the loop and kill the
-            # whole process, silently dropping every attempt after the
-            # failing one for the night. Now it's recorded against exactly
-            # this attempt and the sweep moves on to the next one.
+            # Second layer of defense against exactly what happened on
+            # 2026-09-15: one attempt's unexpected error is recorded and the
+            # sweep continues instead of the whole process dying.
             crashed += 1
             checked += 1
             log.error(f"  attempt {attempt.get('id')} (request {attempt.get('website_request_id')}) "
@@ -595,62 +693,54 @@ def main():
                     "details": {"error": f"{type(exc).__name__}: {exc}"},
                 })
             except Exception:
-                # If even logging the failure fails (e.g. Supabase itself is
-                # down), fall through — the log.error above already put it
-                # somewhere a human will see it.
                 pass
+            continue
+
+        if result["budget_exhausted"]:
+            budget_exhausted += 1
             continue
 
         checked += result["checked"]
         updated += result["updated"]
         letters_fetched += result["letters_fetched"]
-        pre_recommendation_skipped += result["pre_recommendation_skipped"]
-        popup_failed += result["popup_failed"]
         reached_final += result["reached_final"]
+        used_bulk += result["used_bulk"]
+        used_single += result["used_single_lookup"]
+        not_found += result["not_found"]
         if result.get("unmapped_status"):
             unmapped_statuses.add(result["unmapped_status"])
 
-    log.info(f"Done. Checked {checked}, updated {updated}, reached a final status {reached_final}, "
-             f"letters fetched {letters_fetched}, pre-recommendation (not yet checkable) "
-             f"{pre_recommendation_skipped}, popup unreadable {popup_failed}, crashed {crashed}.")
+    log.info(f"Done. Checked {checked} (bulk {used_bulk}, single-lookup {used_single}), "
+             f"updated {updated}, reached a final status {reached_final}, letters fetched "
+             f"{letters_fetched}, not found on site {not_found}, budget-exhausted "
+             f"(deferred to next run) {budget_exhausted}, crashed {crashed}.")
     if unmapped_statuses:
         log.warning(f"Unmapped statuses seen — add these to smc_status_map: {sorted(unmapped_statuses)}")
 
-    # A scheduled job nobody watches needs to say what it did somewhere
-    # visible. This puts the numbers on the workflow run's own summary page,
-    # so "did last night's sync actually move anything?" is one click, not a
-    # log dive. No-op outside GitHub Actions.
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write(
                 f"## Decree status sync\n"
-                f"- Open attempts checked: **{checked}**\n"
+                f"- Bulk window: **{start_iso} → {today_iso}** ({len(bulk_window)} request(s) returned)\n"
+                f"- Open attempts checked: **{checked}** "
+                f"(from bulk window: {used_bulk}, via targeted single lookup: {used_single})\n"
                 f"- Rows updated: **{updated}**\n"
                 f"- Reached a final status this run (now excluded from future sweeps): **{reached_final}**\n"
                 f"- Letter texts newly captured: **{letters_fetched}**\n"
-                f"- No recommendation on SMC yet (still pre-committee): **{pre_recommendation_skipped}**\n"
-                f"- Recommendation found but popup unreadable: **{popup_failed}**\n"
+                f"- Not found on SMC at all this run: **{not_found}**\n"
+                f"- Deferred to next run (single-lookup budget exhausted): **{budget_exhausted}**\n"
                 f"- Crashed on an individual attempt (see decree_request_events, "
                 f"event_type=status_sync_error): **{crashed}**\n"
             )
             if unmapped_statuses:
                 f.write(f"- ⚠️ Unmapped statuses — add to `smc_status_map`: "
                         f"{', '.join(sorted(unmapped_statuses))}\n")
-            if pre_recommendation_skipped and not updated:
-                f.write(
-                    "\n> Every open attempt came back with no recommendation yet. If that stays true "
-                    "night after night while the SMC site clearly shows statuses, the cause is the "
-                    "known gap documented at the top of this script: pre-recommendation statuses "
-                    "(تم التسجيل / لجنة طبية / تحويل الي طبيب اخر) need a different endpoint that "
-                    "`_check_pre_recommendation_status()` is still a stub for.\n"
-                )
+            if budget_exhausted:
+                f.write(f"\n> {budget_exhausted} stale attempt(s) were deferred rather than skipped silently — "
+                        f"they'll be prioritized first on tomorrow's run (oldest-checked-first ordering). "
+                        f"Raise MAX_SINGLE_STATUS_LOOKUPS if this number stays large night after night.\n")
 
-    # A handful of per-attempt crashes shouldn't fail the whole scheduled
-    # run (they're already isolated and logged) — but if MOST of tonight's
-    # attempts crashed, something systemic is wrong (a schema change, a
-    # Supabase outage partway through) and the run should show red rather
-    # than a quiet green tick.
     if attempts and crashed > len(attempts) / 2:
         log.error(f"More than half of tonight's attempts crashed ({crashed}/{len(attempts)}) — "
                   f"treating this run as failed.")
