@@ -107,6 +107,19 @@ CASES_TABLE = "decree_request_cases"
 EVENTS_TABLE = "decree_request_events"
 STATUS_MAP_TABLE = "smc_status_map"
 
+# decree_request_events.created_by is NOT NULL — it has no default, so any
+# insert that omits it is rejected outright (23502) rather than silently
+# leaving it blank. decree_common.log_event(), used by every OTHER writer
+# in this pipeline (prepare/finalize), already covers this with the same
+# fixed "system" UUID; this script writes to decree_request_events directly
+# instead of through that helper, and had simply never set it — that omission
+# is what crashed the very first insert of every run, before a single one of
+# the 934 open attempts got a result recorded. Reusing the identical UUID
+# here (rather than inventing a second "system" identity) keeps every
+# automated row in decree_request_events attributable to the same account
+# regardless of which script wrote it.
+SYSTEM_CREATED_BY = "9b8fa9a6-0567-4a93-8e21-d0f8bc098394"
+
 # english_bucket (from smc_status_map, seeded by schema_additions_phase1.sql)
 # -> decree_request_cases.case_status. Only buckets that map cleanly onto
 # the table's fixed CHECK constraint values are listed; anything else
@@ -406,6 +419,128 @@ def _get_smc_credentials():
     return username, password
 
 
+def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict) -> Dict[str, int]:
+    """Everything that happens for ONE open attempt. Pulled out of main()'s
+    loop into its own function for exactly one reason: on 2026-09-15 an
+    unhandled RuntimeError from a single sb.insert() call (missing
+    created_by — now fixed, see SYSTEM_CREATED_BY) propagated all the way
+    out of main() and killed the process outright. Of 934 open attempts
+    that night, everything from the failing row onward never got checked,
+    and the only trace of it was a stack trace in the Actions log — no
+    per-attempt error is recorded anywhere queryable.
+
+    Returns a dict of counters for the single attempt processed (each 0 or
+    1); main() sums these across the run. Never raises — the caller wraps
+    the call in try/except as a second layer of defense, but every
+    predictable failure path here already returns cleanly instead of
+    raising, so that except should only ever catch a genuinely unexpected
+    error (a network blip, a schema surprise, etc.), and it takes down
+    only that one attempt, not the run."""
+    counters = {"checked": 1, "updated": 0, "letters_fetched": 0,
+                "pre_recommendation_skipped": 0, "popup_failed": 0, "reached_final": 0}
+    request_number = attempt["website_request_id"]
+
+    rec_id = find_recommendation_id_for_request(session, request_number)
+    time.sleep(REQUEST_DELAY)
+
+    if not rec_id:
+        # No recommendation/letter exists yet — this request is still at
+        # an earlier step (تم التسجيل / لجنة طبية / تحويل الي طبيب اخر).
+        # See _check_pre_recommendation_status()'s docstring: genuinely
+        # not implemented, not silently skipped by accident.
+        _check_pre_recommendation_status(session, request_number)
+        counters["pre_recommendation_skipped"] = 1
+        # Stamp it anyway: "asked SMC, no recommendation exists yet" is
+        # a real, useful result and must be distinguishable from "never
+        # asked". Nothing else about the row changes.
+        _mark_checked(attempt["id"])
+        return counters
+
+    html = get_letter_popup_html(session, rec_id)
+    time.sleep(REQUEST_DELAY)
+    if not html:
+        counters["popup_failed"] = 1
+        _mark_checked(attempt["id"])
+        return counters
+
+    extracted = extract_status_and_response(html)
+    if extracted["response_text"] and not attempt.get("response_text"):
+        counters["letters_fetched"] = 1
+
+    update_fields: Dict[str, object] = {}
+    if extracted["response_text"] and not attempt.get("response_text"):
+        update_fields["response_text"] = extracted["response_text"]
+
+    bucket_info = None
+    unmapped = None
+    if extracted["status_raw"]:
+        bucket_info = resolve_status_bucket(status_map, extracted["status_raw"])
+        update_fields["smc_status_raw"] = extracted["status_raw"]
+        update_fields["smc_status_normalized"] = bucket_info["english_bucket"]
+        update_fields["status_is_final"] = bool(bucket_info["is_final"])
+        if bucket_info["is_final"]:
+            # This attempt drops out of every future sweep from here on
+            # (load_open_attempts filters status_is_final out), which is
+            # what "reached قرار نهائى / خطاب ادارى, stop re-checking it"
+            # means in practice.
+            counters["reached_final"] = 1
+        if bucket_info["english_bucket"] == "Unknown":
+            unmapped = extracted["status_raw"]
+    else:
+        # No status label confidently extracted from the popup — record
+        # that a recommendation exists so this isn't silently invisible,
+        # but don't guess at is_final. See _STATUS_LABEL_CANDIDATES'
+        # docstring: send me a real popup example and this becomes a
+        # one-line fix.
+        log.warning(f"  request {request_number}: recommendation {rec_id} found but no status label "
+                    f"matched any candidate — logging raw popup for review, not updating status.")
+
+    if not update_fields:
+        # Recommendation exists but nothing new was extracted — still a
+        # completed check, so stamp it and move on.
+        _mark_checked(attempt["id"])
+        counters["unmapped_status"] = unmapped
+        return counters
+
+    _mark_checked(attempt["id"], update_fields)
+    sb.insert(EVENTS_TABLE, {
+        "case_id": attempt["case_id"],
+        "attempt_id": attempt["id"],
+        "event_type": "status_sync_checked",
+        "created_by": SYSTEM_CREATED_BY,
+        "details": {
+            "recommendation_id": rec_id,
+            "request_number": request_number,
+            "status_raw": extracted["status_raw"],
+            "resolved_bucket": bucket_info["english_bucket"] if bucket_info else None,
+            "response_text_captured": bool(extracted["response_text"]),
+        },
+    })
+    counters["updated"] = 1
+
+    # Only stamp case_status for buckets with an unambiguous mapping onto
+    # the CHECK-constrained enum, and only move a case FORWARD from
+    # SUBMITTED/PENDING — never overwrite a status a human (or the
+    # submission service) already set to something else.
+    if bucket_info and bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:
+        case_rows = sb.select(CASES_TABLE, select="case_status", filters={"id": f"eq.{attempt['case_id']}"})
+        current_case_status = case_rows[0]["case_status"] if case_rows else None
+        if current_case_status in ("SUBMITTED", "PENDING", "ADMIN_LETTER", "RESUBMISSION"):
+            new_case_status = BUCKET_TO_CASE_STATUS[bucket_info["english_bucket"]]
+            sb.update(CASES_TABLE, attempt["case_id"], {"case_status": new_case_status})
+            sb.insert(EVENTS_TABLE, {
+                "case_id": attempt["case_id"],
+                "attempt_id": attempt["id"],
+                "event_type": "case_status_advanced",
+                "created_by": SYSTEM_CREATED_BY,
+                "details": {"from": current_case_status, "to": new_case_status,
+                            "via_bucket": bucket_info["english_bucket"]},
+            })
+
+    counters["unmapped_status"] = unmapped
+    return counters
+
+
 def main():
     username, password = _get_smc_credentials()
     if not username or not password:
@@ -434,109 +569,50 @@ def main():
     checked = updated = letters_fetched = pre_recommendation_skipped = 0
     popup_failed = 0
     reached_final = 0
+    crashed = 0
     unmapped_statuses = set()
 
     for attempt in attempts:
-        request_number = attempt["website_request_id"]
-        checked += 1
-
-        rec_id = find_recommendation_id_for_request(session, request_number)
-        time.sleep(REQUEST_DELAY)
-
-        if not rec_id:
-            # No recommendation/letter exists yet — this request is still at
-            # an earlier step (تم التسجيل / لجنة طبية / تحويل الي طبيب اخر).
-            # See _check_pre_recommendation_status()'s docstring: genuinely
-            # not implemented, not silently skipped by accident.
-            _check_pre_recommendation_status(session, request_number)
-            pre_recommendation_skipped += 1
-            # Stamp it anyway: "asked SMC, no recommendation exists yet" is
-            # a real, useful result and must be distinguishable from "never
-            # asked". Nothing else about the row changes.
-            _mark_checked(attempt["id"])
+        try:
+            result = process_one_attempt(session, status_map, attempt)
+        except Exception as exc:
+            # This is the fix for what happened on 2026-09-15: a single
+            # unexpected error (that run: a missing NOT NULL column on an
+            # events insert) used to propagate out of the loop and kill the
+            # whole process, silently dropping every attempt after the
+            # failing one for the night. Now it's recorded against exactly
+            # this attempt and the sweep moves on to the next one.
+            crashed += 1
+            checked += 1
+            log.error(f"  attempt {attempt.get('id')} (request {attempt.get('website_request_id')}) "
+                      f"raised {type(exc).__name__}: {exc}")
+            try:
+                sb.insert(EVENTS_TABLE, {
+                    "case_id": attempt.get("case_id"),
+                    "attempt_id": attempt.get("id"),
+                    "event_type": "status_sync_error",
+                    "created_by": SYSTEM_CREATED_BY,
+                    "details": {"error": f"{type(exc).__name__}: {exc}"},
+                })
+            except Exception:
+                # If even logging the failure fails (e.g. Supabase itself is
+                # down), fall through — the log.error above already put it
+                # somewhere a human will see it.
+                pass
             continue
 
-        html = get_letter_popup_html(session, rec_id)
-        time.sleep(REQUEST_DELAY)
-        if not html:
-            popup_failed += 1
-            _mark_checked(attempt["id"])
-            continue
-
-        extracted = extract_status_and_response(html)
-        response_text = attempt.get("response_text") or extracted["response_text"]
-        if extracted["response_text"] and not attempt.get("response_text"):
-            letters_fetched += 1
-
-        update_fields: Dict[str, object] = {}
-        if extracted["response_text"] and not attempt.get("response_text"):
-            update_fields["response_text"] = extracted["response_text"]
-
-        bucket_info = None
-        if extracted["status_raw"]:
-            bucket_info = resolve_status_bucket(status_map, extracted["status_raw"])
-            update_fields["smc_status_raw"] = extracted["status_raw"]
-            update_fields["smc_status_normalized"] = bucket_info["english_bucket"]
-            update_fields["status_is_final"] = bool(bucket_info["is_final"])
-            if bucket_info["is_final"]:
-                # This attempt drops out of every future sweep from here on
-                # (load_open_attempts filters status_is_final out), which is
-                # what "reached قرار نهائى / خطاب ادارى, stop re-checking it"
-                # means in practice.
-                reached_final += 1
-            if bucket_info["english_bucket"] == "Unknown":
-                unmapped_statuses.add(extracted["status_raw"])
-        else:
-            # No status label confidently extracted from the popup — record
-            # that a recommendation exists so this isn't silently invisible,
-            # but don't guess at is_final. See _STATUS_LABEL_CANDIDATES'
-            # docstring: send me a real popup example and this becomes a
-            # one-line fix.
-            log.warning(f"  request {request_number}: recommendation {rec_id} found but no status label "
-                        f"matched any candidate — logging raw popup for review, not updating status.")
-
-        if not update_fields:
-            # Recommendation exists but nothing new was extracted — still a
-            # completed check, so stamp it and move on.
-            _mark_checked(attempt["id"])
-
-        if update_fields:
-            _mark_checked(attempt["id"], update_fields)
-            sb.insert(EVENTS_TABLE, {
-                "case_id": attempt["case_id"],
-                "attempt_id": attempt["id"],
-                "event_type": "status_sync_checked",
-                "details": {
-                    "recommendation_id": rec_id,
-                    "request_number": request_number,
-                    "status_raw": extracted["status_raw"],
-                    "resolved_bucket": bucket_info["english_bucket"] if bucket_info else None,
-                    "response_text_captured": bool(extracted["response_text"]),
-                },
-            })
-            updated += 1
-
-            # Only stamp case_status for buckets with an unambiguous mapping
-            # onto the CHECK-constrained enum, and only move a case FORWARD
-            # from SUBMITTED/PENDING — never overwrite a status a human (or
-            # the submission service) already set to something else.
-            if bucket_info and bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:
-                case_rows = sb.select(CASES_TABLE, select="case_status", filters={"id": f"eq.{attempt['case_id']}"})
-                current_case_status = case_rows[0]["case_status"] if case_rows else None
-                if current_case_status in ("SUBMITTED", "PENDING", "ADMIN_LETTER", "RESUBMISSION"):
-                    new_case_status = BUCKET_TO_CASE_STATUS[bucket_info["english_bucket"]]
-                    sb.update(CASES_TABLE, attempt["case_id"], {"case_status": new_case_status})
-                    sb.insert(EVENTS_TABLE, {
-                        "case_id": attempt["case_id"],
-                        "attempt_id": attempt["id"],
-                        "event_type": "case_status_advanced",
-                        "details": {"from": current_case_status, "to": new_case_status,
-                                    "via_bucket": bucket_info["english_bucket"]},
-                    })
+        checked += result["checked"]
+        updated += result["updated"]
+        letters_fetched += result["letters_fetched"]
+        pre_recommendation_skipped += result["pre_recommendation_skipped"]
+        popup_failed += result["popup_failed"]
+        reached_final += result["reached_final"]
+        if result.get("unmapped_status"):
+            unmapped_statuses.add(result["unmapped_status"])
 
     log.info(f"Done. Checked {checked}, updated {updated}, reached a final status {reached_final}, "
              f"letters fetched {letters_fetched}, pre-recommendation (not yet checkable) "
-             f"{pre_recommendation_skipped}, popup unreadable {popup_failed}.")
+             f"{pre_recommendation_skipped}, popup unreadable {popup_failed}, crashed {crashed}.")
     if unmapped_statuses:
         log.warning(f"Unmapped statuses seen — add these to smc_status_map: {sorted(unmapped_statuses)}")
 
@@ -555,6 +631,8 @@ def main():
                 f"- Letter texts newly captured: **{letters_fetched}**\n"
                 f"- No recommendation on SMC yet (still pre-committee): **{pre_recommendation_skipped}**\n"
                 f"- Recommendation found but popup unreadable: **{popup_failed}**\n"
+                f"- Crashed on an individual attempt (see decree_request_events, "
+                f"event_type=status_sync_error): **{crashed}**\n"
             )
             if unmapped_statuses:
                 f.write(f"- ⚠️ Unmapped statuses — add to `smc_status_map`: "
@@ -567,6 +645,16 @@ def main():
                     "(تم التسجيل / لجنة طبية / تحويل الي طبيب اخر) need a different endpoint that "
                     "`_check_pre_recommendation_status()` is still a stub for.\n"
                 )
+
+    # A handful of per-attempt crashes shouldn't fail the whole scheduled
+    # run (they're already isolated and logged) — but if MOST of tonight's
+    # attempts crashed, something systemic is wrong (a schema change, a
+    # Supabase outage partway through) and the run should show red rather
+    # than a quiet green tick.
+    if attempts and crashed > len(attempts) / 2:
+        log.error(f"More than half of tonight's attempts crashed ({crashed}/{len(attempts)}) — "
+                  f"treating this run as failed.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
