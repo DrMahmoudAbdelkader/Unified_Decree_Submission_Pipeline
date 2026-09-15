@@ -1,0 +1,99 @@
+# .github/workflows/decree-status-sync.yml
+# ============================================================================
+# The daily status sweep that decree_status_and_letters_sync.py's docstring
+# has always referred to. Note that this file did NOT exist in the set of
+# workflows you have — which means the sync has only ever run when someone
+# ran it by hand. That alone explains a tracker page that looked frozen.
+#
+# WHAT IT DOES
+#   Re-checks every decree_request_attempts row that has a website_request_id
+#   and has NOT yet reached a final status, pulls its current SMC status (and
+#   the letter text, for خطاب ادارى), normalizes it through smc_status_map,
+#   and stamps decree_request_cases.case_status when the status is final.
+#   Once an attempt reaches a final status, status_is_final flips to true and
+#   it is never re-checked again — that is what keeps a nightly sweep from
+#   growing without bound, and what takes a finished request out of the
+#   tracker's live list.
+#
+# SCHEDULE — 23:00 UTC
+#   GitHub cron is UTC only; it has no notion of Africa/Cairo. Egypt is
+#   UTC+2 in winter and UTC+3 during DST (Apr–Oct), so 23:00 UTC lands at
+#   01:00 local in winter and 02:00 local in summer. Both are comfortably
+#   inside "start of a new day" and well clear of working hours, which is
+#   what actually matters here. Chasing an exact 01:00 year-round would mean
+#   two crons plus an in-script hour guard, for no practical gain.
+#
+#   GitHub also delays scheduled runs under platform load — a few minutes,
+#   occasionally longer, and on rare occasions a scheduled run is dropped
+#   entirely. That is normal and harmless for this job: nothing here is
+#   date-windowed, so a missed night simply means tomorrow's run picks up
+#   two nights' worth of changes. The manual trigger below is there for when
+#   you don't want to wait.
+#
+# REQUIRED REPOSITORY SECRETS
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME_2 / SMC_PASSWORD_2   — strongly recommended. The script
+#       prefers this dedicated account precisely so a long sweep never
+#       shares a login session with a submission run. Falls back to
+#       SMC_USERNAME / SMC_PASSWORD when unset, which is functional but
+#       means an overlapping submission run can fight it for the session.
+#   SMC_SENDING_SITE                  — optional, defaults to 102233.
+# ============================================================================
+
+name: Decree Status & Letters Sync (daily)
+
+# A second copy of this sweep running while the first is mid-flight would
+# re-check the same attempts and write the same rows twice. Queue instead.
+concurrency:
+  group: decree-status-sync
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # The sweep is one SearchRecommendationRequest + one _PrintLetters per
+    # open attempt, with a 0.3s delay between calls — roughly 1s per attempt.
+    # 600 open attempts is ~10 minutes; 60 gives a wide margin as the backlog
+    # grows without letting a hung session burn a whole hour.
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # This script needs requests + beautifulsoup4 only. It imports
+      # Unified_Decree_Submission_Pipeline for SMCSession, which pulls that
+      # module's own imports in at import time, so the full requirements file
+      # is the safe choice — but there is NO Playwright, Ghostscript, font or
+      # asset setup here on purpose: this job never renders an MDT, never
+      # builds a report PDF and never uploads anything to SMC. It only reads.
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt
+
+      - name: Run status & letters sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SMC_SENDING_SITE: ${{ secrets.SMC_SENDING_SITE }}
+        run: python decree_status_and_letters_sync.py
