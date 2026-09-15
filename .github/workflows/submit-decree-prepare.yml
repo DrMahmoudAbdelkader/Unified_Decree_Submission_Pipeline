@@ -1,30 +1,63 @@
 # .github/workflows/submit-decree-prepare.yml
 # ============================================================================
-# Same trigger and same secrets as before. The ONLY structural change: this
-# workflow now runs in two jobs instead of one.
+# Same trigger, same secrets. Structural change: two jobs instead of one.
 #
-#   plan     - resolves the READY_TO_SUBMIT case list (identical filter to
-#              decree_submission_prepare.main()) and splits it into batches
-#              of CHUNK_SIZE (default 10), keeping every case of one patient
-#              inside one batch. See chunk_cases.py for WHY that grouping is
-#              not optional.
-#   prepare  - a matrix job, one run per batch, each invoked with an
-#              explicit CASE_IDS list. Never blank.
+#   plan     - one SELECT (~20s), splits the READY_TO_SUBMIT queue into
+#              batches of CHUNK_SIZE, keeping every case of one patient in
+#              one batch. See chunk_cases.py for why that grouping is not
+#              optional.
+#   prepare  - a matrix job that runs ALL BATCHES SIMULTANEOUSLY, each on
+#              its own runner, each with an explicit CASE_IDS list.
+#
+# 100 cases, chunk size 10 -> 10 runners start at the same moment. Wall
+# clock is (slowest single batch + ~2 min setup), not the sum of the
+# batches.
 #
 # WHAT DID NOT CHANGE: decree_submission_prepare.py, decree_common.py,
 # Unified_Decree_Submission_Pipeline.py, the edge function, and the finalize
-# workflow are all untouched. Each batch job is byte-for-byte the same
+# workflow are untouched. Each batch job is the same
 # `python decree_submission_prepare.py` invocation you run today, just with
-# a shorter CASE_IDS. Every requirement message, every log_event, every
-# error classifier and every exit-code rule behaves exactly as before,
-# per batch.
+# a shorter CASE_IDS. Every requirement message, log_event, error classifier
+# and exit-code rule behaves exactly as before, per batch.
 #
-# START AT max-parallel: 1. It gives you the isolation benefit (one bad
-# batch can no longer eat the whole queue's 60-minute budget, and a crash
-# after batch 3 leaves batches 4..N untouched and still READY_TO_SUBMIT)
-# with zero new risk. Only raise it to 2 after you have confirmed the SMC
-# account tolerates two simultaneous logins — see the comment on
-# max-parallel below.
+# ---------------------------------------------------------------------------
+# THE ONE THING TO GET RIGHT BEFORE RAISING max_batches: SMC LOGINS
+# ---------------------------------------------------------------------------
+# Every batch calls SMCSession.login() with whatever SMC_USERNAME it is
+# given. Your own decree_status_and_letters_sync._get_smc_credentials()
+# already documents the hazard: it asks for a dedicated SMC_USERNAME_2
+# "so it never shares a login session with a concurrent submission run".
+# That is the same hazard, multiplied by the number of runners.
+#
+# If smc.smcegy.com keeps one session per account, runner #2's login
+# invalidates runner #1's cookie. Runner #1 then hits an unexpected login
+# page mid-stage; call_with_reconnect() re-logs in (5 retries, 5s apart),
+# which invalidates runner #2, and so on. Ten runners can livelock each
+# other and burn MDTs that were already created on SMC. Nothing in this
+# repo can detect that in advance.
+#
+# So pick one of these before going wide:
+#
+#   A. YOU HAVE N SMC ACCOUNTS (best). Add secrets SMC_USERNAME_2 /
+#      SMC_PASSWORD_2, SMC_USERNAME_3 / SMC_PASSWORD_3, ... and set the
+#      smc_account_count input to N. The planner assigns each batch a slot
+#      and the run step below picks that slot's secret. Set max_batches to
+#      N and you get genuinely independent sessions — full speed, no
+#      interference.
+#
+#   B. YOU HAVE ONE ACCOUNT AND HAVE NOT TESTED IT. Run once with
+#      max_batches=2 on a small queue. Watch both runs' logs for
+#      "network interruption" / "re-logging in" lines from
+#      call_with_reconnect, and for any "Upload response looks like a login
+#      page". Clean? Try 4, then 10.
+#
+#   C. YOU HAVE ONE ACCOUNT AND IT IS SESSION-EXCLUSIVE. Then parallelism
+#      across logins is not available and max_batches must stay at 1. The
+#      fix is more accounts, not more runners.
+#
+# The default below is max_batches=10, which is what you asked for. It is
+# the right setting for case A and for case B once tested.
+# ---------------------------------------------------------------------------
 #
 # One-time manual setup (unchanged): upload signatures/sig1.png..sig4.png,
 # signatures/stamp.png, medical_report_template.pdf, fonts/mdt_form_font.ttf
@@ -33,6 +66,18 @@
 # ============================================================================
 
 name: Submit Decree Requests (Prepare)
+
+# Two overlapping runs of THIS workflow would each plan from the same
+# READY_TO_SUBMIT queue — a case stays READY_TO_SUBMIT until its batch
+# actually processes it, so a second dispatch a minute later would hand the
+# same case to a second runner and create a duplicate MDT. Queue them
+# instead. cancel-in-progress is deliberately FALSE: cancelling a run
+# mid-flight would kill batches between "MDT created on SMC" and "result
+# written to Supabase", which is the one state this pipeline cannot clean
+# up after itself.
+concurrency:
+  group: submit-decree-prepare
+  cancel-in-progress: false
 
 on:
   workflow_dispatch:
@@ -46,19 +91,26 @@ on:
           DEBUG: creates the MDT for ONE case (case_ids must be exactly
           one id), renders it, uploads the raw + signed PDFs as this
           run's own artifact, and stops — no report/merge/upload happens
-          and the case is left as READY_TO_SUBMIT. Use this to check a
-          font/layout fix before letting a run submit for real.
+          and the case is left as READY_TO_SUBMIT.
         required: false
         type: boolean
         default: false
       chunk_size:
-        description: "Cases per batch run (default 10). A patient's cases are never split across batches, so a batch can exceed this."
+        description: "Cases per parallel batch (default 10). A patient's cases are never split across batches, so a batch can exceed this."
         required: false
         default: "10"
+      max_batches:
+        description: "Max runners in parallel (default 10). If the queue needs more batches than this, batch size grows instead. See the SMC LOGINS note in this file."
+        required: false
+        default: "10"
+      smc_account_count:
+        description: "How many SMC logins you have as secrets (SMC_USERNAME, SMC_USERNAME_2, ...). Default 1 = every batch shares the primary account."
+        required: false
+        default: "1"
 
 jobs:
   # ==========================================================================
-  # JOB 1 — PLAN. Cheap: one SELECT, no Playwright, no PDF libs, ~20s.
+  # JOB 1 — PLAN. Cheap: one SELECT, no Playwright, no PDF libs.
   # ==========================================================================
   plan:
     runs-on: ubuntu-latest
@@ -75,9 +127,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # chunk_cases.py imports supabase_client only — requests is its whole
-      # dependency tree. Deliberately NOT `pip install -r requirements.txt`:
-      # this job has no reason to pay for PyMuPDF/reportlab/boto3.
+      # chunk_cases.py imports supabase_client only. Deliberately NOT
+      # `pip install -r requirements.txt` — this job has no reason to pay
+      # for PyMuPDF/reportlab/boto3.
       - name: Install planner dependency
         run: pip install --disable-pip-version-check --quiet requests
 
@@ -88,38 +140,35 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
           CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '10' }}
+          MAX_BATCHES: ${{ github.event.inputs.max_batches || '10' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python chunk_cases.py
 
   # ==========================================================================
-  # JOB 2 — one run per batch of 10.
+  # JOB 2 — every batch at once, one runner each.
   # ==========================================================================
   prepare:
     needs: plan
     # An empty matrix is a hard error in Actions, so skip the whole job when
-    # there is nothing READY_TO_SUBMIT. The old single-job workflow handled
-    # this by just running and reporting 0 cases.
+    # nothing is READY_TO_SUBMIT.
     if: ${{ needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
-    # Was 60 for the entire queue; each batch is ~10 cases now.
+    # Per BATCH, not per queue. ~10 cases each; was 60 for everything.
     timeout-minutes: 30
     strategy:
-      # One batch failing must never cancel the others. Without this, a
-      # single batch exiting 1 (which prepare.py does when EVERY case in it
-      # errored) would cancel batches that are mid-submission — potentially
-      # after an MDT was created on SMC but before the upload.
-      fail-fast: false
-      # 1 = batches run one after another. Same total wall-clock as today,
-      # but full crash isolation between batches.
+      # THE PARALLELISM. No max-parallel key at all = GitHub starts every
+      # matrix entry simultaneously, bounded only by your plan's concurrent-
+      # job limit (20 on Free/Pro, higher on Team/Enterprise). The planner's
+      # MAX_BATCHES ceiling is what actually throttles this, so the limit
+      # lives in one place instead of two.
       #
-      # Before raising this to 2, confirm on a quiet day that two runs
-      # logged in as the same SMC_USERNAME at once do not invalidate each
-      # other's session. If the site enforces one session per account, the
-      # second login silently kills the first, and the victim's
-      # call_with_reconnect() will re-login in a loop (5 retries, 5s apart,
-      # per stage) and eventually fail cases that were otherwise fine.
-      # Nothing in this repo can detect that for you in advance.
-      max-parallel: 1
+      # fail-fast: false is MANDATORY here. The default (true) cancels every
+      # sibling batch the moment one fails — and prepare.py deliberately
+      # exits 1 when every case in a batch errored. One bad batch would
+      # otherwise abort nine healthy ones mid-submission, possibly between
+      # "MDT created on SMC" and "result written to Supabase".
+      fail-fast: false
       matrix:
         batch: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
@@ -142,14 +191,16 @@ jobs:
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt
 
-      # Chromium (via Playwright) replaced wkhtmltopdf because wkhtmltopdf's
-      # frozen WebKit engine was the actual source of the disrupted MDT form
-      # — see render_print_page_to_pdf()'s docstring. Unchanged.
+      # Chromium via Playwright replaced wkhtmltopdf because wkhtmltopdf's
+      # frozen WebKit engine was the source of the disrupted MDT form — see
+      # render_print_page_to_pdf()'s docstring. Unchanged.
       #
-      # NEW: the downloaded browser is cached. `playwright install` re-
-      # downloads ~130 MB otherwise, and with N batch runs you were paying
-      # that N times. The cache key pins the Playwright version so a version
-      # bump in requirements.txt invalidates it automatically.
+      # NEW: the browser download is cached. Without this, ten parallel
+      # runners each re-download ~130 MB of Chromium every single run. The
+      # key pins the Playwright version, so a bump in requirements.txt
+      # invalidates it automatically. (The first run after a bump has all
+      # runners miss at once and each download — unavoidable and harmless;
+      # they are warm from then on.)
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v4
@@ -158,10 +209,9 @@ jobs:
           key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
 
       # --with-deps is an apt-get of Chromium's shared libraries and is the
-      # slow half of this step. GitHub's ubuntu-latest image already ships
-      # almost all of them. Kept ONLY for the cold-cache run, so the very
-      # first run after a cache miss still self-heals if a library really is
-      # missing; warm runs skip straight to the binary.
+      # slow half of this step; ubuntu-latest already ships nearly all of
+      # them. Kept only on a cold cache so a genuinely missing library still
+      # self-heals.
       - name: Install Playwright's Chromium (cold cache)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
@@ -172,14 +222,14 @@ jobs:
 
       # fonts-hosny-amiri is what medical_report_overlay.py draws the
       # SEPARATE medical-report PDF with, and decree_common.
-      # fetch_and_configure_assets() hard-fails if it's missing — so it
-      # stays. Ghostscript is compress_pdf_under_limit.py's preferred path;
-      # without it every oversized merged PDF falls to the slower, lossier
-      # PyMuPDF rasterizer.
+      # fetch_and_configure_assets() hard-fails without it — so it stays.
+      # Ghostscript is compress_pdf_under_limit.py's preferred path; without
+      # it every oversized merged PDF falls to the slower, lossier PyMuPDF
+      # rasterizer.
       #
-      # NEW: both in one apt transaction, guarded so an image that already
-      # has them skips the install entirely, and with a retry so a flaky
-      # mirror doesn't fail the batch before a single case is touched.
+      # NEW: one apt transaction instead of two, skipped entirely when the
+      # runner image already has them, with a retry so a flaky mirror can't
+      # fail a batch before a single case is touched.
       - name: Install Ghostscript + Amiri font (skipped if already present)
         run: |
           need=""
@@ -192,36 +242,49 @@ jobs:
             echo "ghostscript and fonts-hosny-amiri already present — skipping apt."
           fi
 
+      # Runners finish setup within a second or two of each other, so
+      # without this every batch would fire its SMC login at the same
+      # instant. A few seconds of offset per slot costs nothing against a
+      # 30-minute batch and keeps the portal from seeing N simultaneous
+      # authentications from one IP range.
+      - name: Stagger login (slot ${{ matrix.batch.slot }})
+        run: sleep $(( (${{ matrix.batch.slot }} - 1) * 5 ))
+
       - name: Run prepare (MDT creation + document lookup) — ${{ matrix.batch.name }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
-          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          # Slot 1 uses SMC_USERNAME; slots 2..N use SMC_USERNAME_<slot> if
+          # that secret exists, else fall back to the primary. decree_common.
+          # configure_smc_credentials() reads SMC_USERNAME/SMC_PASSWORD from
+          # the environment exactly as it does today — no Python change, this
+          # just decides which credential is sitting in those two variables.
+          SMC_USERNAME: ${{ secrets[format('SMC_USERNAME_{0}', matrix.batch.slot)] || secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets[format('SMC_PASSWORD_{0}', matrix.batch.slot)] || secrets.SMC_PASSWORD }}
           HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
           HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          # ALWAYS an explicit list from the planner — never blank, or this
-          # batch would process the entire READY_TO_SUBMIT queue.
+          # ALWAYS an explicit list from the planner. Never blank, or this
+          # batch would process the entire READY_TO_SUBMIT queue alongside
+          # nine others doing the same.
           CASE_IDS: ${{ matrix.batch.case_ids }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python decree_submission_prepare.py
 
       # CHANGED: was `if: always()`. /tmp/decree_merged holds the MERGED
       # PATIENT SUBMISSION PDFs — real patient documents. Uploading them on
-      # every successful run costs upload time and parks patient data in
-      # GitHub's artifact storage for 14 days for no diagnostic reason:
-      # everything you actually triage on lives in decree_request_
-      # requirements / decree_request_events, which this does not touch.
-      # Now kept only when the batch failed, which is the only time anyone
-      # has ever opened it.
+      # every successful run costs upload time on every runner and parks
+      # patient data in GitHub artifact storage for 14 days for no
+      # diagnostic reason: everything you triage on lives in
+      # decree_request_requirements / decree_request_events, which this does
+      # not touch. Now kept only when the batch failed.
       #
-      # NOTE the artifact name now includes the batch name — actions/
-      # upload-artifact@v4 ERRORS on a duplicate artifact name within one
-      # run, so with a matrix this is mandatory, not cosmetic.
+      # The artifact name MUST include the batch name — upload-artifact@v4
+      # errors on a duplicate artifact name within one run, so with a matrix
+      # this is required, not cosmetic.
       - name: Upload run artifacts (only on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -234,8 +297,8 @@ jobs:
 
       # Only populated when debug_render_mdt_and_stop is true (see
       # decree_submission_prepare.debug_dump_mdt_and_stop) — a SEPARATE
-      # artifact, on purpose, so a real run's merged submission PDFs and a
-      # debug run's isolated MDT renders never mix in the same download.
+      # artifact on purpose, so a real run's merged submission PDFs and a
+      # debug run's isolated MDT renders never mix in one download.
       - name: Upload MDT debug render (only if debug_render_mdt_and_stop was on)
         if: always() && github.event.inputs.debug_render_mdt_and_stop == 'true'
         uses: actions/upload-artifact@v4
