@@ -203,7 +203,37 @@ def load_cancer_type_aliases() -> Dict[str, str]:
     return {r["module_cancer_code"]: r["pipeline_tumor_key"] for r in rows}
 
 
+def _close_prior_open_requirements(case_id: int) -> None:
+    """Marks every existing OPEN decree_request_requirements row for this
+    case as COMPLETED before a new one is opened, so at most one OPEN
+    requirement ever exists per case at a time — the one for the most
+    recently received error. Previously nothing ever closed these rows,
+    so every failed attempt just added another OPEN row on top of the
+    old ones; the module's tab classification then had multiple OPEN
+    requirements to pick from per case and could end up keying off a
+    stale, superseded error instead of the latest one. One row's lookup
+    or update failing here should never block logging the new failure,
+    so any error is swallowed with a warning rather than raised."""
+    try:
+        prior_open = sb.select(
+            REQUIREMENTS_TABLE, select="id",
+            filters={"case_id": f"eq.{case_id}", "status": "eq.OPEN"},
+        )
+    except Exception as e:
+        log.warning(f"could not look up prior OPEN requirements for case {case_id} ({e}) — leaving them as-is.")
+        return
+    for row in prior_open or []:
+        try:
+            sb.update(REQUIREMENTS_TABLE, row["id"], {
+                "status": "COMPLETED",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            log.warning(f"could not close prior OPEN requirement {row.get('id')} for case {case_id} ({e}).")
+
+
 def open_requirement(case_id: int, attempt_id: Optional[int], message: str):
+    _close_prior_open_requirements(case_id)
     sb.insert(REQUIREMENTS_TABLE, {
         "case_id": case_id, "attempt_id": attempt_id,
         "requirement_text": message, "status": "OPEN",
