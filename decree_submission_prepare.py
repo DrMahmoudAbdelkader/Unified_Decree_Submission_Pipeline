@@ -23,14 +23,21 @@ For each READY_TO_SUBMIT case:
          and finishes the submission in the SAME run.
        - NOT CACHED (genuinely new, or R2 not configured): falls through
          to the live SMC-website / CMIS-archive fallback extraction,
-         same as before. Because this is freshly extracted, per the
-         two-phase decision, this run STOPS here — uploads the extracted
-         PDF to R2's pending/<national_id>.pdf key (see r2_client.py;
-         same bucket as the permanent cache, different prefix — NOT
-         Supabase Storage), saves everything decree_submission_finalize.py
-         will need to resume, and opens a requirement asking a human to
-         review it in the module before the actual signing/merging/upload
-         happens.
+         same as before. If the SMC-website fallback finds it, this ALSO
+         merges in the last 30 days of DMS/CMIS archive pages onto that
+         freshly-downloaded file (see resolve_patient_document() /
+         PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK below) — so the
+         human review that follows sees the fully merged document, not
+         the bare extraction. Because this is freshly extracted, per the
+         two-phase decision, this run STOPS here — uploads the (already
+         merged) PDF to R2's pending/<national_id>.pdf key (see
+         r2_client.py; same bucket as the permanent cache, different
+         prefix — NOT Supabase Storage), saves everything decree_
+         submission_finalize.py will need to resume, and opens a
+         requirement asking a human to review it in the module before the
+         actual signing/merging/upload happens. decree_submission_
+         finalize.py never re-merges archive pages — that already
+         happened here, before the human ever saw the file.
        - SAME-PATIENT SIBLINGS: if another case for this same national_id
          already has an attempt sitting at pending_review earlier in THIS
          run, this case is never uploaded/reviewed a second time — see
@@ -62,9 +69,22 @@ import decree_common as common
 from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, stage_create_mdt, \
     locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id, \
     render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser, \
-    find_and_verify_reusable_mdt
+    find_and_verify_reusable_mdt, RECENT_ARCHIVE_DAYS_BACK
+from patient_pdf_website_fallback import download_patient_pdf_from_website
+from patient_pdf_dms_archive_fallback import refresh_local_pdf_with_recent_archive_docs
 import supabase_client as sb
 import r2_client
+
+# How far back to look in the DMS/CMIS archive when a patient's document
+# had to be freshly EXTRACTED this run (not an R2 cache hit) — widened
+# from the pipeline's normal RECENT_ARCHIVE_DAYS_BACK (7, unchanged, still
+# used for a cache-hit patient exactly as before) per your instruction,
+# so the human reviewing the freshly-extracted file sees it WITH the last
+# month of archive pages already merged in, not just the bare extraction.
+# This merge now happens here, during prepare, BEFORE the file is staged
+# to pending/ for review — not during finalize — so decree_common.
+# run_finalize_stages() never has to re-merge (see its own docstring).
+PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 30
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_submission_prepare")
@@ -256,11 +276,58 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
     slow fallback search running twice for nothing). doc_cache is a plain
     dict scoped to this run, keyed by national_id, so every case for the
     same patient after the first one reuses the already-resolved result
-    instead of hitting the network again."""
+    instead of hitting the network again.
+
+    ARCHIVE MERGE WINDOW, per your latest instruction:
+      - R2 CACHE HIT ("local" — this patient's document was already
+        reviewed/approved on some earlier run): UNCHANGED. find_local_fn
+        below is the only override on this path; locate_patient_document_
+        pdf() calls the real refresh_local_pdf_with_recent_archive_docs()
+        with its own default RECENT_ARCHIVE_DAYS_BACK (7) exactly as it
+        always has, and finishes straight through to submission in this
+        same run — no human review needed.
+      - NEWLY EXTRACTED (not cached — had to be pulled from the SMC
+        website, or failing that the full CMIS archive): the website-
+        fallback branch now ALSO merges in the last
+        PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK (30) days of DMS/
+        CMIS archive pages, so the human review that happens next (via
+        the app's document-review edge function) sees the fully merged
+        document, not just the bare extraction. This is the ONLY thing
+        that changed on this path — everything else (staging to
+        pending/, opening the review requirement, moving to the next
+        case) is untouched.
+
+      _extraction_state is a plain closure flag, not a global: it's
+      created fresh for every call, so it can only ever reflect THIS
+      patient's resolution, never leak across patients or runs. It gets
+      set to True only if _website_fn below actually returns a path (a
+      genuine extraction) — never for a cache hit, and never for the
+      full-CMIS-archive fallback (which locate_patient_document_pdf never
+      calls refresh_fn for at all — that fallback already pulls every
+      archived page there is, so a 'last N days' merge on top of it would
+      be a no-op by construction, same as before this change).
+    """
     if national_id in doc_cache:
         return doc_cache[national_id]
+
+    extraction_state = {"newly_extracted": False}
+
+    def _website_fn(session_, base_url, patient_id, output_dir):
+        path = download_patient_pdf_from_website(session_, base_url, patient_id, output_dir)
+        if path:
+            extraction_state["newly_extracted"] = True
+        return path
+
+    def _refresh_fn(patient_id, pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK):
+        if extraction_state["newly_extracted"]:
+            days_back = PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK
+        return refresh_local_pdf_with_recent_archive_docs(patient_id, pdf_path, days_back=days_back)
+
     result = locate_patient_document_pdf(
-        session, national_id, find_local_fn=make_r2_aware_finder(national_id),
+        session, national_id,
+        find_local_fn=make_r2_aware_finder(national_id),
+        website_fn=_website_fn,
+        refresh_fn=_refresh_fn,
     )
     doc_cache[national_id] = result
     return result

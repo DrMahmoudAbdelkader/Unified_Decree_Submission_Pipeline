@@ -42,7 +42,6 @@ from compress_pdf_under_limit import compress_pdf_to_size, DEFAULT_TARGET_BYTES
 
 import supabase_client as sb
 import supabase_storage
-import r2_client
 
 log = logging.getLogger("decree_common")
 
@@ -488,6 +487,19 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
     medical_report_text = pipeline_state["medical_report_text"]
 
     try:
+        # NOTE: no DMS/CMIS archive merge happens here anymore. Per your
+        # latest instruction, that merge now happens during PREPARE, for
+        # a freshly-extracted document, BEFORE it's staged to pending/ for
+        # human review — see decree_submission_prepare.py's
+        # resolve_patient_document() (30-day window for a document that
+        # had to be extracted; the existing 7-day window is untouched for
+        # an R2-cache-hit document, exactly as it ran before). So by the
+        # time finalize resumes here, whatever the human reviewed/approved
+        # (via the document-review edge function, which uploads straight
+        # to the permanent R2 key) is already the fully-merged document —
+        # re-merging it a second time here would be redundant and would
+        # bypass the very review the human just did. This function only
+        # ever does: sign, build the report, merge, upload — nothing else.
         log.info(f"  [Stage 2] Rendering + signing MDT form for pre_request_id={pre_request_id} …")
         mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign", stage_render_and_sign,
                                                 session, pre_request_id, broad=True)
@@ -587,14 +599,13 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                 session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
             )
 
-        # NOT re-uploaded to R2 here, on purpose — per your instruction,
-        # the script never needs to keep a copy of the PDF it just used.
-        # R2 population is entirely the labeling step's job now (see
-        # decree_submission_prepare.py's stage_and_flag_for_review): a
-        # human reviews/cleans a freshly-extracted document and saves the
-        # result to R2 themselves, which is what makes the NEXT request
-        # for that same patient a cache hit. This script only ever reads
-        # from R2, never writes to it.
+        # No R2 write happens here for either path. A cache-hit patient's
+        # permanent copy was already correct before this run started. A
+        # freshly-extracted patient's document was already merged (30-day
+        # DMS window, see decree_submission_prepare.py) and promoted to
+        # the permanent R2 key by the document-review edge function the
+        # moment the human approved/labeled it — well before finalize
+        # ever runs. Either way, nothing left to write back here.
         return {"status": "SUCCESS", "final_request_no": final_request_no, "pre_request_id": pre_request_id}
 
     except Exception as exc:
