@@ -38,6 +38,16 @@ For each READY_TO_SUBMIT case:
          actual signing/merging/upload happens. decree_submission_
          finalize.py never re-merges archive pages — that already
          happened here, before the human ever saw the file.
+       - R2 CACHE HIT BUT OVERSIZED AFTER THE DMS MERGE: a cache hit is
+         normally submitted straight through with no review. The one
+         exception: if merging the recent DMS/CMIS archive pages into that
+         cached document actually appended pages AND the resulting file is
+         larger than ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES (default 4 MB,
+         env ARCHIVE_MERGE_REVIEW_MB), it is treated EXACTLY like a
+         freshly-extracted document: staged to R2 pending/<national_id>.pdf,
+         a review requirement is opened, and finalize resumes only after a
+         human approves it. See resolve_patient_document() (detection) and
+         OVERSIZE_DOC_SOURCE below.
        - SAME-PATIENT SIBLINGS: if another case for this same national_id
          already has an attempt sitting at pending_review earlier in THIS
          run, this case is never uploaded/reviewed a second time — see
@@ -85,6 +95,25 @@ import r2_client
 # to pending/ for review — not during finalize — so decree_common.
 # run_finalize_stages() never has to re-merge (see its own docstring).
 PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 30
+
+# Archive window used for an R2 CACHE-HIT document. Defaults to the
+# pipeline's RECENT_ARCHIVE_DAYS_BACK (7) — i.e. UNCHANGED behavior. Set to
+# 30 here if you want cache hits merged with the same 30-day window that
+# newly-extracted documents get.
+CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK = RECENT_ARCHIVE_DAYS_BACK
+
+# If merging DMS archive pages into an R2-cached document produces a file
+# bigger than this, the document is routed to human review (as if it had
+# been missing from R2 and freshly extracted) instead of being submitted
+# straight through. 4 MiB by default; override with ARCHIVE_MERGE_REVIEW_MB.
+ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES = int(
+    float(os.environ.get("ARCHIVE_MERGE_REVIEW_MB", "4") or 4) * 1024 * 1024
+)
+
+# doc_source value for a cache-hit document that was diverted to review
+# because of the size rule above. Only ever written into pipeline_state /
+# event details — nothing in the module UI or finalize branches on it.
+OVERSIZE_DOC_SOURCE = "local+archive_oversize"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_submission_prepare")
@@ -214,12 +243,23 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
     })
     sb.update(common.CASES_TABLE, case_id, {"case_status": "PENDING"})
 
-    msg = ("تم إنشاء طلب MDT بنجاح (رقم مبدئي: {pre}) وتم استخراج مستند مريض جديد يحتاج مراجعة "
-           "قبل المتابعة. راجع المستند ثم اضغط \"موافقة ومتابعة\" لإكمال التوقيع وإنشاء التقرير الطبي "
-           "ورفع الطلب.{link}").format(
-        pre=pre_request_id,
-        link=f"\nرابط المراجعة: {review_url}" if review_url else "",
-    )
+    if doc_source == OVERSIZE_DOC_SOURCE:
+        size_mb = os.path.getsize(extracted_pdf_path) / (1024 * 1024)
+        limit_mb = ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES / (1024 * 1024)
+        msg = ("تم إنشاء طلب MDT بنجاح (رقم مبدئي: {pre}). بعد دمج مستند المريض المحفوظ مع صفحات أرشيف DMS "
+               "الحديثة أصبح حجم الملف {size:.1f} ميجابايت (أكبر من {limit:.0f} ميجابايت)، لذلك تم تحويله "
+               "للمراجعة قبل المتابعة. راجع المستند ثم اضغط \"موافقة ومتابعة\" لإكمال التوقيع وإنشاء "
+               "التقرير الطبي ورفع الطلب.{link}").format(
+            pre=pre_request_id, size=size_mb, limit=limit_mb,
+            link=f"\nرابط المراجعة: {review_url}" if review_url else "",
+        )
+    else:
+        msg = ("تم إنشاء طلب MDT بنجاح (رقم مبدئي: {pre}) وتم استخراج مستند مريض جديد يحتاج مراجعة "
+               "قبل المتابعة. راجع المستند ثم اضغط \"موافقة ومتابعة\" لإكمال التوقيع وإنشاء التقرير الطبي "
+               "ورفع الطلب.{link}").format(
+            pre=pre_request_id,
+            link=f"\nرابط المراجعة: {review_url}" if review_url else "",
+        )
     common.log_event(case_id, attempt_id, "extraction_pending_review",
                       {"pre_request_id": pre_request_id, "doc_source": doc_source, "review_url": review_url})
     sb.insert(common.REQUIREMENTS_TABLE, {"case_id": case_id, "attempt_id": attempt_id,
@@ -297,6 +337,11 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
         pending/, opening the review requirement, moving to the next
         case) is untouched.
 
+      SIZE RULE (added): an R2 cache hit that the DMS merge grew past
+      ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES is returned as
+      (path, OVERSIZE_DOC_SOURCE, True) — i.e. flagged as newly extracted so
+      it takes the review path below rather than the straight-through one.
+
       _extraction_state is a plain closure flag, not a global: it's
       created fresh for every call, so it can only ever reflect THIS
       patient's resolution, never leak across patients or runs. It gets
@@ -310,7 +355,7 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
     if national_id in doc_cache:
         return doc_cache[national_id]
 
-    extraction_state = {"newly_extracted": False}
+    extraction_state = {"newly_extracted": False, "archive_merged": False}
 
     def _website_fn(session_, base_url, patient_id, output_dir):
         path = download_patient_pdf_from_website(session_, base_url, patient_id, output_dir)
@@ -321,7 +366,15 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
     def _refresh_fn(patient_id, pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK):
         if extraction_state["newly_extracted"]:
             days_back = PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK
-        return refresh_local_pdf_with_recent_archive_docs(patient_id, pdf_path, days_back=days_back)
+        else:
+            days_back = CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK
+        refreshed = refresh_local_pdf_with_recent_archive_docs(patient_id, pdf_path, days_back=days_back)
+        if refreshed:
+            # locate_patient_document_pdf() swallows this return value, so
+            # remember it here — the size rule below only applies when
+            # archive pages were ACTUALLY appended this run.
+            extraction_state["archive_merged"] = True
+        return refreshed
 
     result = locate_patient_document_pdf(
         session, national_id,
@@ -329,6 +382,25 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
         website_fn=_website_fn,
         refresh_fn=_refresh_fn,
     )
+
+    # SIZE RULE: an R2 cache hit (source "local", newly_extracted False) is
+    # normally submitted straight through with no review. But if the DMS
+    # archive merge just appended pages and the file is now over the review
+    # threshold, divert it to human review — same as a document that was
+    # missing from R2 and freshly extracted (newly_extracted=True flows into
+    # stage_and_flag_for_review / sibling-linking in prepare_one_case()).
+    pdf_path, doc_source, newly_extracted = result
+    if pdf_path and doc_source == "local" and not newly_extracted and extraction_state["archive_merged"]:
+        try:
+            merged_size = os.path.getsize(pdf_path)
+        except OSError:
+            merged_size = 0
+        if merged_size > ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES:
+            log.info(f"  [size rule] {national_id}: {merged_size / (1024 * 1024):.2f} MB after the DMS archive "
+                     f"merge (limit {ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES / (1024 * 1024):.0f} MB) — "
+                     f"routing to human review instead of submitting straight through.")
+            result = (pdf_path, OVERSIZE_DOC_SOURCE, True)
+
     doc_cache[national_id] = result
     return result
 
