@@ -35,6 +35,7 @@ from Unified_Decree_Submission_Pipeline import (
     is_patient_request_already_exists_error,
     RowProcessingError,
     MDTPrintPageNotFoundError,
+    OpenRequestSameDiagnosisError,
     merge_final_pdf,
     call_with_reconnect,
 )
@@ -505,7 +506,8 @@ def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
     size = os.path.getsize(merged_pdf_path)
     if size <= DEFAULT_TARGET_BYTES:
         return None
-    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the SMC portal's ~1MB cap — compressing …")
+    log.info(f"  Merged PDF is {size / 1e6:.2f} MB, over the {DEFAULT_TARGET_BYTES / 1e6:.2f} MB target "
+             f"(SMC's own GetFileSize reports a limit of 2) — compressing …")
     if not compress_pdf_to_size(merged_pdf_path, merged_pdf_path, DEFAULT_TARGET_BYTES):
         return (f"Merged PDF is {size / 1e6:.2f} MB and could not be compressed under "
                 f"{DEFAULT_TARGET_BYTES / 1e6:.2f} MB (tried Ghostscript + PyMuPDF fallback) — "
@@ -515,86 +517,174 @@ def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
     return None
 
 
-def _recreate_mdt_after_print_404(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
-                                   pipeline_state: dict, old_pre_request_id: str):
-    """FALLBACK for an MDT whose print page returns HTTP 404 (typically an
-    MDT created by an earlier attempt, most likely for a UHI patient).
+# ---------------------------------------------------------------------
+# OPEN-REQUEST-SAME-DIAGNOSIS FALLBACK  (site rule introduced Sept 2026)
+#
+# SMC refuses to file a new request for a patient who still has an earlier
+# request under review with the SAME diagnosis code (see
+# Unified_Decree_Submission_Pipeline.OpenRequestSameDiagnosisError). SMC
+# agreed we must still be able to file such requests, and a new MDT coded
+# with a different diagnosis is accepted, so the agreed workaround is:
+# re-create the MDT under a fallback code and upload again.
+#
+#   OPEN_REQUEST_FALLBACK_DIAG_CODES  Codes to try, in order, for the
+#       replacement MDT. Only C80 today. If the patient ALSO already has an
+#       open C80 request the retry is refused too and the case fails with a
+#       clear message; adding another code here is the whole change needed
+#       to give it a further option.
+#   OPEN_REQUEST_EXEMPT_DIAG_CODES    Codes that never take this fallback.
+#       Breast Cancer (AB45.6) does not hit the rule and keeps its code, so
+#       a rejection on it is left to fail visibly rather than be re-coded.
+#
+# ONLY the diagnosis code of the new MDT changes. Treatment plan, procedure
+# id, diagnosis group (always 11), report and patient document are the same
+# as a normal run, so the case looks exactly like an ordinary submission.
+# ---------------------------------------------------------------------
+OPEN_REQUEST_FALLBACK_DIAG_CODES = ["C80"]
+OPEN_REQUEST_EXEMPT_DIAG_CODES = {"AB45.6"}
 
-    1. Creates a brand-new MDT with the same treatment text / tumor config
-       (stage_create_mdt). The MDT text is read from this attempt's
-       website_submission_treatment_plan column (written by prepare.py),
-       since pipeline_state itself does not carry it.
-    2. Immediately saves the NEW pre_request_id into this attempt's
-       pipeline_state (before printing anything), so if a later step fails
-       the next retry reuses this MDT instead of creating yet another one.
-    3. Prints + signs the new MDT, applying the deep UHI fallback
-       (PreRequest/Edit with HASINSURANCE=N/UHIEXCLUDED=Y, then re-print):
-         - straight away when creation itself only succeeded through the
-           UHI-exclusion resubmission (SMC flagged the patient as UHI), or
-         - after a plain print of the new MDT ALSO 404s.
-       A plain print that works is used as-is, no UHI edit.
 
-    Returns (new_pre_request_id, new_full_name, mdt_signed_bytes). The old
-    MDT is left untouched on SMC. Raises on any failure; the caller
-    (run_finalize_stages) turns that into a normal FAILED result."""
+def _build_merged_pdf(national_id: str, pre_request_id: str, mdt_signed_bytes: bytes,
+                      report_pdf_bytes: bytes, patient_pdf_path: str) -> str:
+    """Stage 5 (+ the size compression): MDT form + report + patient
+    document -> one PDF under the SMC upload limit. Raises RowProcessingError
+    on failure. Used for the first upload AND for every retry that swaps in
+    a different MDT form (UHI re-print, re-created MDT), so they cannot drift."""
+    os.makedirs(MERGED_PDF_DIR, exist_ok=True)
+    merged_pdf_path = os.path.join(MERGED_PDF_DIR, f"{national_id}_{pre_request_id}.pdf")
+    try:
+        os.remove(merged_pdf_path)
+    except OSError:
+        pass
+    merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, patient_pdf_path, merged_pdf_path)
+    if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
+        raise RowProcessingError(f"Merged PDF write failed or suspiciously small: {merged_pdf_path}")
+    compress_err = _ensure_under_upload_limit(merged_pdf_path)
+    if compress_err:
+        raise RowProcessingError(compress_err)
+    return merged_pdf_path
+
+
+def _recreate_mdt(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
+                  pipeline_state: dict, *, reason: str, diag_code_override: Optional[str] = None):
+    """Creates a brand-new MDT for this case, saves it as the attempt's MDT,
+    and prints + signs it. Used by two fallbacks (see their callers):
+      - reason "print page 404": the earlier MDT has no printable form; the
+        replacement is identical to a normal creation.
+      - reason "open request with same diagnosis": same, except the
+        diagnosis code is diag_code_override (every derived lookup - ICD
+        name, department, treatment-proc list - follows that code, exactly
+        as for any tumor type that natively uses it).
+
+    The MDT text comes from this attempt's website_submission_treatment_plan
+    column (written by prepare.py); pipeline_state does not carry it. The
+    new pre_request_id is written to pipeline_state IMMEDIATELY, before any
+    further step, so a failure later leaves the retry reusing this MDT
+    instead of creating yet another. The old MDT is left as-is on SMC.
+
+    Returns (new_pre_request_id, new_full_name, mdt_signed_bytes, new_state).
+    pipeline_state["tumor_cfg"] is NOT modified: the medical report keeps
+    describing the ORIGINAL cancer type; only the MDT carries the new code."""
+    old_pre_request_id = pipeline_state["pre_request_id"]
     rows = sb.select(ATTEMPTS_TABLE, select="website_submission_treatment_plan", filters={"id": f"eq.{attempt_id}"})
     mdt_text = ((rows[0].get("website_submission_treatment_plan") if rows else "") or "").strip()
     if not mdt_text:
         raise RowProcessingError(
-            f"MDT #{old_pre_request_id} has no printable form (HTTP 404) and a new MDT cannot be created: "
-            f"attempt {attempt_id} has no saved treatment-plan text."
+            f"MDT #{old_pre_request_id} cannot be replaced ({reason}): attempt {attempt_id} has no saved "
+            f"treatment-plan text to build a new MDT from."
         )
 
-    log.warning(f"  case {case_id}: MDT #{old_pre_request_id} print page returned 404 — "
-                f"creating a NEW MDT for this case instead.")
-    new_out = call_with_reconnect(session, "MDT re-creation (print page 404)", stage_create_mdt,
-                                   session, national_id, mdt_text, pipeline_state["tumor_cfg"])
-    new_id = new_out["pre_request_id"]
-    new_full_name = new_out["full_name"]
-    uhi_flagged = bool(new_out.get("uhi_excluded"))
+    cfg = dict(pipeline_state["tumor_cfg"])
+    if diag_code_override:
+        cfg["diag_code"] = diag_code_override
+    log.warning(f"  case {case_id}: MDT #{old_pre_request_id} — {reason}. Creating a NEW MDT "
+                f"(diagnosis code {cfg['diag_code']}).")
+
+    new_out = call_with_reconnect(session, f"MDT re-creation ({reason})", stage_create_mdt,
+                                   session, national_id, mdt_text, cfg)
+    new_id, new_full_name = new_out["pre_request_id"], new_out["full_name"]
 
     new_state = dict(pipeline_state)
     new_state["pre_request_id"] = new_id
     new_state["full_name"] = new_full_name
+    new_state["mdt_diag_code"] = cfg["diag_code"]   # informational; SMC's own value is what decisions use
     new_state["replaced_pre_request_ids"] = list(pipeline_state.get("replaced_pre_request_ids") or []) + [old_pre_request_id]
     try:
         sb.update(ATTEMPTS_TABLE, attempt_id, {"pipeline_state": new_state})
     except Exception as exc:
-        log.warning(f"  case {case_id}: could not save the new pre_request_id {new_id} to pipeline_state ({exc}) — "
+        log.warning(f"  case {case_id}: could not save new MDT #{new_id} to pipeline_state ({exc}) — "
                     f"continuing, but a retry may create another MDT.")
-    log_event(case_id, attempt_id, "mdt_recreated_after_print_404",
-              {"old_pre_request_id": old_pre_request_id, "new_pre_request_id": new_id,
-               "uhi_flagged_at_creation": uhi_flagged})
+    log_event(case_id, attempt_id, "mdt_recreated",
+              {"reason": reason, "old_pre_request_id": old_pre_request_id,
+               "new_pre_request_id": new_id, "diag_code": cfg["diag_code"]})
 
-    def _uhi_fix_and_reprint():
-        return call_with_reconnect(session, "UHI edit + MDT reprint (after MDT re-creation)",
-                                    stage_fix_uhi_exclusion_and_reprint_mdt,
-                                    session, national_id, new_id, broad=True)
+    mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign (new MDT)", stage_render_and_sign,
+                                            session, new_id, broad=True)
+    return new_id, new_full_name, mdt_signed_bytes, new_state
 
-    if uhi_flagged:
-        log.info(f"  case {case_id}: new MDT #{new_id} needed the UHI exclusion at creation — "
-                 f"applying the UHI fallback (edit + re-print) now.")
-        mdt_signed_bytes = _uhi_fix_and_reprint()
-    else:
+
+def _retry_upload_after_open_request_error(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
+                                           pipeline_state: dict, first_exc: OpenRequestSameDiagnosisError,
+                                           report_pdf_bytes: bytes, patient_pdf_path: str, tumor_cfg: dict):
+    """The upload was refused with "patient has an open request with the same
+    diagnosis". Re-create the MDT under the next fallback code and upload
+    again; repeat while codes remain. Returns
+    (final_request_no, pre_request_id, full_name); raises RowProcessingError
+    when the fallback is not allowed or is exhausted (no endless loop: every
+    code is tried at most once, starting from the code the refused MDT had)."""
+    exc, state = first_exc, pipeline_state
+    tried = {exc.mdt_diag_code}
+    while True:
+        current = (exc.mdt_diag_code or "").strip().upper()
+        if current in OPEN_REQUEST_EXEMPT_DIAG_CODES:
+            raise RowProcessingError(
+                f"{exc} — diagnosis code {current} is exempt from the re-coding fallback (it is not expected "
+                f"to hit this rule), so nothing was re-created. Check this patient's open requests on SMC."
+            ) from exc
+        candidates = [c for c in OPEN_REQUEST_FALLBACK_DIAG_CODES if c not in tried]
+        if not candidates:
+            raise RowProcessingError(
+                f"{exc} — no fallback diagnosis code left to try (MDT code {exc.mdt_diag_code or 'unknown'}; "
+                f"already tried {sorted(c for c in tried if c)}; configured {OPEN_REQUEST_FALLBACK_DIAG_CODES}). "
+                f"The patient likely has open requests under those codes too: retry once one is closed, or add "
+                f"another code to OPEN_REQUEST_FALLBACK_DIAG_CODES in decree_common.py."
+            ) from exc
+        code = candidates[0]
+        tried.add(code)
+        new_id, new_full_name, mdt_signed_bytes, state = _recreate_mdt(
+            session, case_id, attempt_id, national_id, state,
+            reason="open request with same diagnosis", diag_code_override=code)
+        merged_pdf_path = _build_merged_pdf(national_id, new_id, mdt_signed_bytes, report_pdf_bytes, patient_pdf_path)
+        log.info(f"  Retrying upload with MDT #{new_id} (diagnosis code {code}) …")
         try:
-            mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign (new MDT)", stage_render_and_sign,
-                                                    session, new_id, broad=True)
-        except MDTPrintPageNotFoundError:
-            log.warning(f"  case {case_id}: new MDT #{new_id} print page ALSO returned 404 — "
-                        f"treating as a UHI patient and applying the UHI fallback (edit + re-print).")
-            mdt_signed_bytes = _uhi_fix_and_reprint()
-    return new_id, new_full_name, mdt_signed_bytes
+            request_no = call_with_reconnect(session, f"Final upload (MDT #{new_id}, code {code})",
+                                              stage_upload_merged_pdf,
+                                              session, national_id, new_id, merged_pdf_path, tumor_cfg)
+            return request_no, new_id, new_full_name
+        except OpenRequestSameDiagnosisError as next_exc:
+            exc = next_exc
 
 
 def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
                          pipeline_state: dict, patient_pdf_path: str) -> dict:
     """pipeline_state must contain: pre_request_id, full_name, tumor_cfg
     (dict), medical_report_text. Returns a result dict shaped like
-    process_row()'s: status SUCCESS/FAILED, final_request_no, error."""
+    process_row()'s: status SUCCESS/FAILED, final_request_no, error.
+
+    HOW A SUBMISSION CAN GO FROM HERE (each branch is explained where it lives):
+      Stage 2  print/sign the MDT ........ 404 on the print page -> new MDT (same code)
+      Stage 6  upload
+                 accepted ................ SUCCESS
+                 open request, same dx ... new MDT under a fallback code, upload again
+                 max open requests ....... fail, retry later (site cap)
+                 request already exists .. fail, check the site (avoid a duplicate)
+                 UHI-insurance block ..... edit pre-request + re-print, upload again
+                 anything else ........... fail with the site's own message"""
     pre_request_id = pipeline_state["pre_request_id"]
     full_name = pipeline_state["full_name"]
     tumor_cfg = pipeline_state["tumor_cfg"]
     medical_report_text = pipeline_state["medical_report_text"]
+    state = dict(pipeline_state)   # kept in step with pre_request_id whenever an MDT is re-created
 
     try:
         # NOTE: no DMS/CMIS archive merge happens here anymore. Per your
@@ -616,32 +706,30 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                                                     session, pre_request_id, broad=True)
         except MDTPrintPageNotFoundError:
             # The MDT from an earlier attempt has no printable form on SMC
-            # (HTTP 404). Create a new one (with the UHI fallback where it
-            # applies) and carry on with the new pre_request_id / name —
-            # everything below (report, merge, upload, the returned
-            # pre_request_id) uses these local variables.
-            pre_request_id, full_name, mdt_signed_bytes = _recreate_mdt_after_print_404(
-                session, case_id, attempt_id, national_id, pipeline_state, pre_request_id)
+            # (HTTP 404; retrying/re-logging-in never clears it). Replace
+            # it with a new MDT built the normal way and continue with the
+            # new pre_request_id / name.
+            pre_request_id, full_name, mdt_signed_bytes, state = _recreate_mdt(
+                session, case_id, attempt_id, national_id, state, reason="print page returned 404")
 
         log.info("  [Stage 3] Building medical report …")
         report_pdf_bytes = build_medical_report_pdf(full_name, national_id, medical_report_text, tumor_cfg)
 
         log.info("  [Stage 5] Merging MDT + report + patient document …")
-        os.makedirs(MERGED_PDF_DIR, exist_ok=True)
-        merged_pdf_path = os.path.join(MERGED_PDF_DIR, f"{national_id}_{pre_request_id}.pdf")
-        merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, patient_pdf_path, merged_pdf_path)
-
-        if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
-            return {"status": "FAILED", "error": f"Merged PDF write failed or suspiciously small: {merged_pdf_path}"}
-
-        compress_err = _ensure_under_upload_limit(merged_pdf_path)
-        if compress_err:
-            return {"status": "FAILED", "error": compress_err}
+        merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
+                                            report_pdf_bytes, patient_pdf_path)
 
         log.info("  [Stage 6] Uploading merged PDF to the website …")
         try:
             final_request_no = call_with_reconnect(session, "Final upload", stage_upload_merged_pdf,
                                                     session, national_id, pre_request_id, merged_pdf_path, tumor_cfg)
+        except OpenRequestSameDiagnosisError as open_exc:
+            # Site rule: patient already has an open request with this
+            # diagnosis code. Re-code the MDT and retry - see the block
+            # comment above OPEN_REQUEST_FALLBACK_DIAG_CODES.
+            final_request_no, pre_request_id, full_name = _retry_upload_after_open_request_error(
+                session, case_id, attempt_id, national_id, state, open_exc,
+                report_pdf_bytes, patient_pdf_path, tumor_cfg)
         except RowProcessingError as upload_exc:
             if is_max_requests_reached_error(upload_exc):
                 # Site-side per-patient concurrent-open-request cap, NOT a
@@ -699,19 +787,8 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                 session, national_id, pre_request_id, broad=True,
             )
             log.info("  Re-merging with the corrected MDT form …")
-            try:
-                os.remove(merged_pdf_path)
-            except OSError:
-                pass
-            merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, patient_pdf_path, merged_pdf_path)
-            if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
-                return {"status": "FAILED",
-                        "error": f"Re-merged PDF (post-UHI-fix) write failed or suspiciously small: {merged_pdf_path}"}
-
-            compress_err = _ensure_under_upload_limit(merged_pdf_path)
-            if compress_err:
-                return {"status": "FAILED", "error": f"(post-UHI-fix) {compress_err}"}
-
+            merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
+                                                report_pdf_bytes, patient_pdf_path)
             log.info("  Retrying upload with the corrected merged PDF …")
             final_request_no = call_with_reconnect(
                 session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,

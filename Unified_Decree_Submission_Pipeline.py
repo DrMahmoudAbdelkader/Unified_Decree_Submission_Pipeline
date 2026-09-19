@@ -1197,8 +1197,7 @@ class PatientRequestAlreadyExistsError(RowProcessingError):
 class MDTPrintPageNotFoundError(RowProcessingError):
     """Raised by render_print_page_to_pdf() when SMC answers the MDT print
     page request with HTTP 404 - i.e. this pre_request_id has no printable
-    form on the site (seen on MDTs created by an earlier attempt, most
-    likely UHI patients).
+    form on the site (seen on MDTs created by an earlier attempt).
 
     Deliberately a RowProcessingError, NOT an OSError: it used to be raised
     as OSError, which call_with_reconnect(broad=True) treats as a network
@@ -1213,6 +1212,47 @@ class MDTPrintPageNotFoundError(RowProcessingError):
 
 def is_mdt_print_page_not_found_error(exc: Exception) -> bool:
     return isinstance(exc, MDTPrintPageNotFoundError)
+
+
+# ---------------------------------------------------------------------
+# SITE RULE (Sept 2026): "patient has an open request with the same
+# diagnosis". SMC now refuses to file a new decree request for a patient
+# who still has an earlier request UNDER REVIEW that carries the SAME
+# diagnosis code, even when the treatment plan differs. The refusal comes
+# back from the final Requests/Create POST as an HTTP 200 page whose
+# #requestModal shows this sentence and whose script says
+# `var msg = 'NotSaved'` (see extract_request_modal_error).
+#
+# It is NOT a UHI / insurance problem and NOT a session problem - earlier
+# versions of this script mis-reported it as both. decree_common.
+# run_finalize_stages reacts to it by creating a NEW MDT under a different
+# diagnosis code (OPEN_REQUEST_FALLBACK_DIAG_CODES) and retrying the upload.
+# ---------------------------------------------------------------------
+OPEN_REQUEST_SAME_DIAGNOSIS_MESSAGE = "للمريض طلب مفتوح بنفس التشخيص"
+
+
+class OpenRequestSameDiagnosisError(RowProcessingError):
+    """Final upload refused by the rule above. `mdt_diag_code` is the
+    diagnosis code the MDT (pre-request) behind this upload actually
+    carries, as reported by SMC itself (SearchSSN's patientPreReq) - NOT
+    what this script believes it created. The fallback logic decides from
+    THAT value, so a reused MDT that an earlier attempt already re-coded
+    is recognised correctly."""
+
+    def __init__(self, message: str, mdt_diag_code: str = ""):
+        super().__init__(message)
+        self.mdt_diag_code = mdt_diag_code
+
+
+# Every decree request is filed under diagnosis group 11 = "الأورام"
+# (oncology), whatever the cancer type, procedure or treatment plan. This
+# constant is the single source of truth: it is what MDT creation and the
+# final upload both send. It deliberately does NOT read the per-type
+# `speciality_code` in TUMOR_TYPE_CONFIG, nor the value SMC reports back
+# for the pre-request - either of those could drift (the Create form's own
+# DIAGNOSISGROUP dropdown has no default and posts its FIRST option, 2 =
+# "الاضطرابات العقلية والسلوكية", if nothing selects 11).
+DIAGNOSIS_GROUP_ONCOLOGY = "11"
 
 
 NETWORK_EXCEPTIONS = (
@@ -2803,10 +2843,34 @@ def dump_debug_artifacts(patient_id: str, payload, raw_html: str):
 UHI_BLOCK_ERROR_SNIPPET = "يتبع منظومة التامين الصحي الشامل"
 
 
+def extract_request_modal_error(raw_html: str) -> Optional[str]:
+    """Returns the text of the red error modal SMC shows after a REJECTED
+    Requests/Create POST, or None.
+
+    The Create page ALWAYS contains a #requestModal (a static "حدث خطأ
+    بالنظام" placeholder on a fresh page), so the modal's presence proves
+    nothing. What marks a real verdict is the page script setting
+    `var msg = 'NotSaved'`; only then is the modal body the server's reason.
+    (On success the same script says 'Saved' and the modal carries the new
+    request number - handled separately by submit_request_with_pdf.)
+
+    This is the message the old code never read: the page shows the modal,
+    then reloads the blank PreRequest search page, which is exactly why a
+    rejection used to look like being bounced to a login screen."""
+    m = re.search(r"var\s+msg\s*=\s*'([^']*)'", raw_html or "")
+    if not m or m.group(1) != "NotSaved":
+        return None
+    soup = BeautifulSoup(raw_html, "html.parser")
+    body = soup.select_one("#requestModal .modal-body")
+    text = re.sub(r"\s+", " ", body.get_text(" ", strip=True)) if body else ""
+    return text or None
+
+
 def extract_upload_validation_errors(raw_html: str) -> List[str]:
-    """Pulls the human-readable validation messages out of a Requests/Create
-    (or PreRequest/Create) response. Factored out so both the first attempt
-    and the UHI-exclusion retry can reuse the same parsing."""
+    """Pulls the human-readable rejection messages out of a Requests/Create
+    (or PreRequest/Create) response: field-validation spans, the validation
+    summary, and the NotSaved error modal (extract_request_modal_error).
+    Factored out so the first attempt and every retry share one parser."""
     errors = re.findall(
         r'<span[^>]*class="[^"]*field-validation-error[^"]*"[^>]*>(.*?)</span>',
         raw_html, re.S,
@@ -2814,7 +2878,11 @@ def extract_upload_validation_errors(raw_html: str) -> List[str]:
         r'<div[^>]*class="[^"]*validation-summary-errors[^"]*"[^>]*>(.*?)</div>',
         raw_html, re.S,
     )
-    return [re.sub(r"<.*?>", "", e).strip() for e in errors if re.sub(r"<.*?>", "", e).strip()]
+    cleaned = [re.sub(r"<.*?>", "", e).strip() for e in errors if re.sub(r"<.*?>", "", e).strip()]
+    modal_error = extract_request_modal_error(raw_html)
+    if modal_error and modal_error not in cleaned:
+        cleaned.append(modal_error)
+    return cleaned
 
 
 def save_debug_html(patient_id: str, pre_request_id: str, html: str):
@@ -2869,18 +2937,6 @@ def describe_rejected_upload_page(raw_html: str, limit: int = 8) -> str:
     if texts:
         parts.append("messages on the page: " + " | ".join(texts[:limit]))
     return ("; ".join(parts) + ". ") if parts else "no visible error text could be extracted from the response. "
-
-
-def extract_upload_errors_with_uhi_fallback(raw_html: str) -> List[str]:
-    """extract_upload_validation_errors(), plus: if the UHI-block sentence
-    appears ANYWHERE in the response even though it was not inside a
-    recognized validation element, still report it - so the UHI resend /
-    deep UHI fallback triggers instead of the row dying with a generic
-    message."""
-    errors = extract_upload_validation_errors(raw_html)
-    if not any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors) and UHI_BLOCK_ERROR_SNIPPET in (raw_html or ""):
-        errors = errors + [UHI_BLOCK_ERROR_SNIPPET]
-    return errors
 
 
 # =====================================================================
@@ -3017,7 +3073,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         warnings.append(f"GetLastLetterContent returned non-empty: {last_letter[:200]}")
 
     session.get_regions_by_city(city_id)
-    session.get_diagnosis_data(tumor_cfg["speciality_code"])
+    session.get_diagnosis_data(DIAGNOSIS_GROUP_ONCOLOGY)
     diag_matches = session.get_diagnosis_with_med_proc(tumor_cfg["diag_code"])
     initial_icd10_name = diag_matches[0]["DIAGNOSISARABICNAME"] if diag_matches else ""
 
@@ -3104,7 +3160,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         "TREATMENTPROCEDUREID": tumor_cfg["proc_id"],
         "RENALLFAILURESESSIONSTARTDATE": "",
         "TREATMENTPLAN": treatment_plan_text,
-        "DIAGNOSISGROUP": tumor_cfg["speciality_code"],
+        "DIAGNOSISGROUP": DIAGNOSIS_GROUP_ONCOLOGY,  # always 11 (الأورام) - see the constant
         "DEPARTMENTIDFK": str(department_id or ""),
         "INITIALICD10CODECOMMENT": "",
         "SPECIALCOMMITTEEDOCTOR1": SPECIALCOMMITTEEDOCTOR1,
@@ -3116,7 +3172,6 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         "ICUSERVICENAME": "", "ICUSERVICETYPEID": "", "ICUSERVICETYPENAME": "",
     }
 
-    uhi_excluded = False
     pre_request_id, raw_html = session.create_prerequest(payload)
     if not pre_request_id:
         errors = extract_upload_validation_errors(raw_html)
@@ -3131,7 +3186,6 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
             payload["UHIEXCLUDED"] = "Y"
             pre_request_id, raw_html = session.create_prerequest(payload)
             if pre_request_id:
-                uhi_excluded = True
                 log.info(f"    {patient_id}: UHI-exclusion resubmission succeeded.")
 
     if not pre_request_id:
@@ -3141,12 +3195,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
             f"Raw response + payload dumped to {DEBUG_DIR}\\{patient_id}_* for inspection."
         )
 
-    # "uhi_excluded" = creation only succeeded after the HASINSURANCE=N /
-    # UHIEXCLUDED=Y resubmission, i.e. SMC flagged this patient as UHI.
-    # decree_common uses it to decide whether to apply the deep UHI fallback
-    # right after re-creating an MDT whose earlier copy 404'd on print.
-    return {"pre_request_id": pre_request_id, "full_name": full_name, "warnings": warnings,
-            "uhi_excluded": uhi_excluded}
+    return {"pre_request_id": pre_request_id, "full_name": full_name, "warnings": warnings}
 
 
 # =====================================================================
@@ -3271,6 +3320,11 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     recomend_hospital_name = (pre_req.get("RecommHospitalName") or "").strip()
     sending_hospital = (pre_req.get("sendingHospital") or recomend_hospital_name).strip()
 
+    server_group = str(pre_req.get("DIAGNOSISGROUP") or "")
+    if server_group and server_group != DIAGNOSIS_GROUP_ONCOLOGY:
+        log.warning(f"    {patient_id}: SMC reports DIAGNOSISGROUP={server_group} on MDT #{pre_request_id}; "
+                    f"sending {DIAGNOSIS_GROUP_ONCOLOGY} (الأورام) as required.")
+
     session.get_file_size(referer=create_page_referer)
     session.get_sms_setup(referer=create_page_referer)
 
@@ -3315,16 +3369,12 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
         "TREATMENTPROCEDUREID": str(pre_req.get("TREATMENTPROCEDUREID") or ""),
         "RENALFAILURESESSIONSTARTDATE": "",
         "INITIALICD10CODECOMMENT": pre_req.get("INITIALICD10CODECOMMENT") or "",
-        # FIXED BUG: this was hardcoded to "2" regardless of tumor type,
-        # which silently overwrote the correct DIAGNOSISGROUP (speciality
-        # code, e.g. "11" for breast) that was actually used when the MDT
-        # was created — meaning the final uploaded request could carry a
-        # different committee/speciality routing than the MDT record it's
-        # attached to. Now reuses whatever GetPreRequests/SearchSSN
-        # actually returned for this pre-request (the value the server
-        # itself stored at creation time), falling back to the tumor
-        # type's own speciality_code only if the server didn't return one.
-        "DIAGNOSISGROUP": str(pre_req.get("DIAGNOSISGROUP") or (tumor_cfg or {}).get("speciality_code") or "11"),
+        # Always 11 (الأورام). History: this was once hardcoded "2", then
+        # copied whatever SMC reported for the pre-request; both let a
+        # request land under the wrong group. Pinned now - see
+        # DIAGNOSIS_GROUP_ONCOLOGY. (A differing server value is logged
+        # above, never sent.)
+        "DIAGNOSISGROUP": DIAGNOSIS_GROUP_ONCOLOGY,
         "DEPARTMENTIDFK": str(pre_req.get("DEPARTMENTIDFK") or ""),
         "TREATMENTPLAN": pre_req.get("TREATMENTPLAN") or "",
         "CANCERPLACEID": "",
@@ -3335,7 +3385,7 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     new_req_no, raw_html = session.submit_request_with_pdf(form_fields, merged_pdf_path, referer_prid=pre_request_id)
 
     if not new_req_no:
-        errors = extract_upload_errors_with_uhi_fallback(raw_html)
+        errors = extract_upload_validation_errors(raw_html)
         if any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors):
             # Same fix a human makes by ticking "this patient has no
             # insurance" in the UI: resend with HASINSURANCE=N and
@@ -3357,8 +3407,14 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     if new_req_no:
         return new_req_no
 
-    errors = extract_upload_errors_with_uhi_fallback(raw_html)
+    errors = extract_upload_validation_errors(raw_html)
     save_debug_html(patient_id, pre_request_id, raw_html)
+    open_request_msg = next((e for e in errors if OPEN_REQUEST_SAME_DIAGNOSIS_MESSAGE in e), None)
+    if open_request_msg:
+        raise OpenRequestSameDiagnosisError(
+            f"SMC rejected the upload of MDT #{pre_request_id}: {open_request_msg}",
+            mdt_diag_code=str(pre_req.get("INITIALICD10CODE") or ""),
+        )
     if errors:
         raise RowProcessingError("Upload validation errors: " + " | ".join(errors))
     if upload_response_looks_like_login_page(raw_html):
