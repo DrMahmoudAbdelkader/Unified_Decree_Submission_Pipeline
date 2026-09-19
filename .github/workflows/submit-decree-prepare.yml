@@ -295,6 +295,23 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # The SMC response HTML saved when a final upload comes back without a
+      # request number (see Unified_Decree_Submission_Pipeline.save_debug_html;
+      # decree_common.configure_smc_credentials points DEBUG_DIR here). Kept
+      # on EVERY run, not just failed ones, because the batch can exit 0 while
+      # individual cases failed - and this HTML is the only place the real
+      # rejection reason is visible. Small (a few hundred KB per failed case);
+      # it contains patient details, hence the short retention.
+      - name: Upload SMC upload-rejection HTML (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decree-upload-debug-${{ github.run_id }}-${{ matrix.batch.name }}
+          path: |
+            /tmp/decree_merged/debug/**
+          if-no-files-found: ignore
+          retention-days: 5
+
       # Only populated when debug_render_mdt_and_stop is true (see
       # decree_submission_prepare.debug_dump_mdt_and_stop) — a SEPARATE
       # artifact on purpose, so a real run's merged submission PDFs and a
