@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -544,6 +545,51 @@ OPEN_REQUEST_FALLBACK_DIAG_CODES = ["C80"]
 OPEN_REQUEST_EXEMPT_DIAG_CODES = {"AB45.6"}
 
 
+# ---------------------------------------------------------------------
+# KEEPING THE MERGED PDF OF A FAILED CASE
+#
+# When a case fails AFTER its merged PDF was built (upload refused, compress
+# failed, ...), the ready-to-upload file is copied to FAILED_MERGED_DIR
+# together with a small .txt saying why. The workflows then run
+# publish_failed_pdfs.py, which stores that folder on the repo's
+# `failed-pdfs` branch for 10 days - so the case can be submitted by hand
+# without redoing sign / report / merge. Failures BEFORE the merge (tumor
+# type unrecognised, MDT print failed, ...) produce no PDF and save nothing.
+# ---------------------------------------------------------------------
+FAILED_MERGED_DIR = "/tmp/decree_failed_merged"
+
+# national_id -> path of the newest merged PDF built for it in this process.
+# Needed because a fallback (re-created MDT) builds a NEW merged file and the
+# exception that ends the case does not carry its path. Cases run one at a
+# time per process, so national_id is a safe key.
+_LAST_MERGED_PDF: Dict[str, str] = {}
+
+
+def _keep_failed_merged_pdf(case_id: int, national_id: str, error: str) -> None:
+    """Copies this case's newest merged PDF (+ a .txt with the reason) into
+    FAILED_MERGED_DIR. Never raises - saving a convenience copy must not hide
+    the real failure."""
+    try:
+        src = _LAST_MERGED_PDF.get(national_id)
+        if not src or not os.path.exists(src):
+            return
+        os.makedirs(FAILED_MERGED_DIR, exist_ok=True)
+        stem = f"case{case_id}__{os.path.splitext(os.path.basename(src))[0]}"   # case<id>__<nid>_<mdt>
+        mdt_id = os.path.splitext(os.path.basename(src))[0].rsplit("_", 1)[-1]
+        shutil.copyfile(src, os.path.join(FAILED_MERGED_DIR, stem + ".pdf"))
+        with open(os.path.join(FAILED_MERGED_DIR, stem + ".txt"), "w", encoding="utf-8") as fh:
+            fh.write(
+                f"case_id: {case_id}\nnational_id: {national_id}\nmdt (pre_request_id): {mdt_id}\n"
+                f"failed_at_utc: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+                f"error: {error}\n\n"
+                f"The PDF is already signed, merged and compressed. To submit by hand: open\n"
+                f"Requests/Create?action=HopitalCreateNewRequest&prid={mdt_id} on the SMC site and attach it.\n"
+            )
+        log.info(f"  Kept the failed case's merged PDF for manual submission: {stem}.pdf")
+    except Exception as exc:
+        log.warning(f"  Could not keep the failed merged PDF ({exc}) — not fatal.")
+
+
 def _build_merged_pdf(national_id: str, pre_request_id: str, mdt_signed_bytes: bytes,
                       report_pdf_bytes: bytes, patient_pdf_path: str) -> str:
     """Stage 5 (+ the size compression): MDT form + report + patient
@@ -559,6 +605,7 @@ def _build_merged_pdf(national_id: str, pre_request_id: str, mdt_signed_bytes: b
     merge_final_pdf(mdt_signed_bytes, report_pdf_bytes, patient_pdf_path, merged_pdf_path)
     if not os.path.exists(merged_pdf_path) or os.path.getsize(merged_pdf_path) < 20_000:
         raise RowProcessingError(f"Merged PDF write failed or suspiciously small: {merged_pdf_path}")
+    _LAST_MERGED_PDF[national_id] = merged_pdf_path
     compress_err = _ensure_under_upload_limit(merged_pdf_path)
     if compress_err:
         raise RowProcessingError(compress_err)
@@ -802,10 +849,13 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
         # the permanent R2 key by the document-review edge function the
         # moment the human approved/labeled it — well before finalize
         # ever runs. Either way, nothing left to write back here.
+        _LAST_MERGED_PDF.pop(national_id, None)
         return {"status": "SUCCESS", "final_request_no": final_request_no, "pre_request_id": pre_request_id}
 
     except Exception as exc:
         log.exception(f"case {case_id}: finalize stages failed")
+        _keep_failed_merged_pdf(case_id, national_id, str(exc))
+        _LAST_MERGED_PDF.pop(national_id, None)
         return {"status": "FAILED", "error": str(exc)}
 
 
