@@ -599,7 +599,7 @@ _SUPPLIED_TUMOR_TABLE = [
     ("neuroblastoma",                  "Neuroblastoma",                            "سرطان بالعقد العصبيه",               "AB10.8"),
     ("hepatitis_c_liver_focus",        "Hepatitis C with Suspected Hepatic Focal Lesion", "التهاب كبدي سي واشتباه بؤره سرطانيه بالكبد", "AA59.2"),
     ("liver_cirrhosis_diabetes_focus", "Liver Cirrhosis with Suspected Hepatic Focal Lesion", "تليف كبدي وسكر بالدم وتضخم بالطحال واشتباه بؤره سرطانيه بالكبد", "U94.4"),
-    ("plasma_cell_cancer",             "Plasma Cell Cancer",                       "سرطان بالخلايا البلازميه",           "C72"),
+    ("plasma_cell_cancer",             "Plasma Cell Cancer",                       "سرطان بالخلايا البلازميه",           "AB23.9"),
     ("post_bladder_tumor_resection",   "Bladder Cancer, Status Post Resection",    "ما بعد استئصال ورم سرطاني بالمثانه", "AB12.8"),
     ("cancer_transfusion_need",        "Cancer Requiring Blood Transfusion",       "مريض سرطان يحتاج نقل دم ومشتقاته",   "AB18.9"),
     ("skin_cancer_mf",                 "Mycosis Fungoides",                        "سرطان بالجلد (M.F)",                 "U86.9"),
@@ -860,7 +860,7 @@ TUMOR_TYPE_ALIASES = {
     "bloodrelatedtumors": "blood_tumor",           # C95
     "bladdercancer": "bladder_cancer",             # C67.9
     "kidneycancer": "kidney_cancer",               # C64.9
-    "plasmacellcancer": "plasma_cell_cancer",      # C72
+    "plasmacellcancer": "plasma_cell_cancer",      # AB23.9
     # "Brain Tumor" (the exact text used in your sheet) had NO alias at
     # all pointing at the existing brain_cns entry (U37.6) - its own
     # auto-derived alias only covers the full english_label "brain and
