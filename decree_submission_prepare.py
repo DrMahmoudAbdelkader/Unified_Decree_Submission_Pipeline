@@ -443,13 +443,25 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
     alias_override = aliases.get(case["tumor_type"])
     tumor_type_custom = (case.get("tumor_type_custom") or "").strip()
 
-    pipeline_key = alias_override or tumor_type_custom or case["tumor_type"]
-    canonical, tumor_cfg_base = resolve_tumor_type(pipeline_key)
-
-    if canonical is None and not alias_override and tumor_type_custom:
-        # tumor_type_custom didn't resolve either — last resort, try the
-        # coarse code itself.
-        canonical, tumor_cfg_base = resolve_tumor_type(case["tumor_type"])
+    # Try each candidate in priority order and take the first that actually
+    # resolves. FIXED: a cancer_type_aliases override row whose
+    # pipeline_tumor_key doesn't resolve (stale/typo'd key) used to END the
+    # search - the tumor_type_custom text and the coarse tumor_type code were
+    # never tried, so a type the script knows perfectly well (e.g.
+    # PLASMA_CELL_CANCER) failed as "not recognized".
+    canonical, tumor_cfg_base = None, None
+    tried = []
+    for candidate in (alias_override, tumor_type_custom, case["tumor_type"]):
+        if not candidate or candidate in tried:
+            continue
+        tried.append(candidate)
+        canonical, tumor_cfg_base = resolve_tumor_type(candidate)
+        if canonical is not None:
+            if candidate is not alias_override and alias_override:
+                log.warning(f"case {case_id}: cancer_type_aliases override {alias_override!r} for "
+                            f"{case['tumor_type']!r} does not resolve — fixed it by using {candidate!r} instead. "
+                            f"Correct or delete that override row.")
+            break
 
     if canonical is None:
         msg = (f"لم يتم التعرف على نوع الورم \"{tumor_type_custom or case['tumor_type']}\" "

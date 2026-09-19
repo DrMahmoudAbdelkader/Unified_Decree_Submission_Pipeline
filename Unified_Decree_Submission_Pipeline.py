@@ -1954,7 +1954,13 @@ class SMCSession:
         return parsed
 
     def get_file_size(self, referer: Optional[str] = None):
-        self._get(f"{BASE_URL}/smc//Requests/GetFileSize", ajax=True, referer=referer)
+        r = self._get(f"{BASE_URL}/smc//Requests/GetFileSize", ajax=True, referer=referer)
+        # The response was previously thrown away. It is (most likely) the
+        # upload size limit SMC enforces on the Create form - log it so a
+        # failed upload can be compared against the real cap.
+        if r is not None:
+            log.info(f"    GetFileSize response: {r.text[:200]!r}")
+        return r
 
     def get_sms_setup(self, referer: Optional[str] = None):
         self._get(f"{BASE_URL}/smc//Requests/GetSMSSetup", ajax=True, referer=referer)
@@ -2822,6 +2828,61 @@ def save_debug_html(patient_id: str, pre_request_id: str, html: str):
         log.error(f"    Could not save debug HTML: {exc}")
 
 
+def upload_response_looks_like_login_page(raw_html: str) -> bool:
+    """True only for a real login page: has a username AND a password
+    <input>, and is NOT the Requests/Create form re-displayed (which carries
+    the CITIZENSSN input). The old check was just `"username" in html and
+    "password" in html`, which also matches the ~165K-char Create page that
+    SMC sends back when it REJECTS a submission (its layout contains those
+    words) - so genuine rejections were reported as 'session was rejected'."""
+    soup = BeautifulSoup(raw_html or "", "html.parser")
+    has_login_inputs = bool(soup.find("input", {"name": re.compile(r"^user(name)?$", re.I)})) and \
+        bool(soup.find("input", {"type": "password"}))
+    is_create_form = bool(soup.find("input", {"name": "CITIZENSSN"}))
+    return has_login_inputs and not is_create_form
+
+
+def describe_rejected_upload_page(raw_html: str, limit: int = 8) -> str:
+    """Best-effort summary of WHY SMC re-displayed the Create form: which
+    inputs the server flagged (ASP.NET MVC adds the input-validation-error
+    class to them) plus any alert/danger/toast text on the page. Used only
+    when extract_upload_validation_errors() found nothing."""
+    soup = BeautifulSoup(raw_html or "", "html.parser")
+    flagged = []
+    for el in soup.select(".input-validation-error"):
+        name = el.get("name") or el.get("id")
+        if name and name not in flagged:
+            flagged.append(name)
+    texts = []
+    for el in soup.select(".alert, .text-danger, .validation-summary-errors, .field-validation-error, "
+                          ".toast-message, .swal2-html-container, .modal-body"):
+        t = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+        if t and len(t) <= 300 and t not in texts:
+            texts.append(t)
+    for m in re.finditer(r"(?:toastr\.\w+|alert|swal|Swal\.fire)\(\s*([\"'])(.+?)\1", raw_html or "", re.S):
+        t = re.sub(r"\s+", " ", m.group(2)).strip()
+        if t and len(t) <= 300 and t not in texts:
+            texts.append(t)
+    parts = []
+    if flagged:
+        parts.append("fields flagged invalid by the server: " + ", ".join(flagged[:limit]))
+    if texts:
+        parts.append("messages on the page: " + " | ".join(texts[:limit]))
+    return ("; ".join(parts) + ". ") if parts else "no visible error text could be extracted from the response. "
+
+
+def extract_upload_errors_with_uhi_fallback(raw_html: str) -> List[str]:
+    """extract_upload_validation_errors(), plus: if the UHI-block sentence
+    appears ANYWHERE in the response even though it was not inside a
+    recognized validation element, still report it - so the UHI resend /
+    deep UHI fallback triggers instead of the row dying with a generic
+    message."""
+    errors = extract_upload_validation_errors(raw_html)
+    if not any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors) and UHI_BLOCK_ERROR_SNIPPET in (raw_html or ""):
+        errors = errors + [UHI_BLOCK_ERROR_SNIPPET]
+    return errors
+
+
 # =====================================================================
 # STAGE 1: MDT CREATION
 # =====================================================================
@@ -3274,7 +3335,7 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     new_req_no, raw_html = session.submit_request_with_pdf(form_fields, merged_pdf_path, referer_prid=pre_request_id)
 
     if not new_req_no:
-        errors = extract_upload_validation_errors(raw_html)
+        errors = extract_upload_errors_with_uhi_fallback(raw_html)
         if any(UHI_BLOCK_ERROR_SNIPPET in e for e in errors):
             # Same fix a human makes by ticking "this patient has no
             # insurance" in the UI: resend with HASINSURANCE=N and
@@ -3296,14 +3357,21 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     if new_req_no:
         return new_req_no
 
-    errors = extract_upload_validation_errors(raw_html)
+    errors = extract_upload_errors_with_uhi_fallback(raw_html)
     save_debug_html(patient_id, pre_request_id, raw_html)
     if errors:
         raise RowProcessingError("Upload validation errors: " + " | ".join(errors))
-    if "username" in raw_html.lower() and "password" in raw_html.lower():
+    if upload_response_looks_like_login_page(raw_html):
         raise RowProcessingError("Upload response looks like a login page — session was rejected.")
+    try:
+        pdf_mb = os.path.getsize(merged_pdf_path) / (1024 * 1024)
+    except OSError:
+        pdf_mb = -1
     raise RowProcessingError(
-        f"Upload POST returned 200 but no 'رقم الطلب' found in response. Debug HTML saved to {DEBUG_DIR}"
+        f"Upload POST returned 200 but SMC did not confirm the request (no 'رقم الطلب' in the response) and "
+        f"showed no recognized validation message. PDF sent: {pdf_mb:.2f} MB. "
+        f"{describe_rejected_upload_page(raw_html)}"
+        f"Response HTML saved as {DEBUG_DIR}/{patient_id}_{pre_request_id}_*_upload_response.html"
     )
 
 

@@ -105,6 +105,13 @@ def configure_smc_credentials(username_env="SMC_USERNAME", password_env="SMC_PAS
     _pipeline_module.FALLBACK_PATIENT_DOCS_DIR = _pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR
     os.makedirs(_pipeline_module.PATIENT_DOCS_UNDER_PROCESSED_DIR, exist_ok=True)
     os.makedirs(_pipeline_module.PATIENT_DOCS_ROOT, exist_ok=True)
+    # Same class of bug as FALLBACK_PATIENT_DOCS_DIR above: DEBUG_DIR is
+    # computed at import time from the hardcoded D:\SMC\... Windows path, so
+    # on the runner every "Debug HTML saved: D:\SMC\..." file landed in
+    # oddly-named folders inside the checkout and vanished with the runner.
+    # Point it under /tmp/decree_merged/debug, which the workflows upload.
+    _pipeline_module.DEBUG_DIR = os.path.join(MERGED_PDF_DIR, "debug")
+    os.makedirs(_pipeline_module.DEBUG_DIR, exist_ok=True)
 
 
 def _install_mdt_form_font() -> None:
