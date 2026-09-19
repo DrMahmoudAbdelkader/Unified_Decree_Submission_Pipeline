@@ -1194,6 +1194,27 @@ class PatientRequestAlreadyExistsError(RowProcessingError):
     MaxRequestsReachedError."""
 
 
+class MDTPrintPageNotFoundError(RowProcessingError):
+    """Raised by render_print_page_to_pdf() when SMC answers the MDT print
+    page request with HTTP 404 - i.e. this pre_request_id has no printable
+    form on the site (seen on MDTs created by an earlier attempt, most
+    likely UHI patients).
+
+    Deliberately a RowProcessingError, NOT an OSError: it used to be raised
+    as OSError, which call_with_reconnect(broad=True) treats as a network
+    blip and retried 5x with a re-login each time - and every one of those
+    retries got the same 404 (see the "gave up after 5 reconnect attempts:
+    Could not fetch MDT print page ... (HTTP 404)" message), so a fresh
+    login never clears it. As a RowProcessingError it passes straight
+    through call_with_reconnect so the caller
+    (decree_common.run_finalize_stages) can fall back to creating a NEW MDT
+    for the case instead of failing it."""
+
+
+def is_mdt_print_page_not_found_error(exc: Exception) -> bool:
+    return isinstance(exc, MDTPrintPageNotFoundError)
+
+
 NETWORK_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
@@ -2027,6 +2048,13 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
     url = session.print_prerequest_url(pre_request_id)
 
     resp = session.s.get(url, timeout=30)
+    if resp.status_code == 404:
+        # Not a connectivity problem - see MDTPrintPageNotFoundError. Never
+        # retried; the caller falls back to creating a new MDT.
+        raise MDTPrintPageNotFoundError(
+            f"Could not fetch MDT print page for pre_request_id={pre_request_id} (HTTP 404) - "
+            f"this MDT has no printable form on SMC."
+        )
     if resp.status_code != 200:
         raise OSError(
             f"Could not fetch MDT print page for pre_request_id={pre_request_id} "
@@ -3027,6 +3055,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
         "ICUSERVICENAME": "", "ICUSERVICETYPEID": "", "ICUSERVICETYPENAME": "",
     }
 
+    uhi_excluded = False
     pre_request_id, raw_html = session.create_prerequest(payload)
     if not pre_request_id:
         errors = extract_upload_validation_errors(raw_html)
@@ -3041,6 +3070,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
             payload["UHIEXCLUDED"] = "Y"
             pre_request_id, raw_html = session.create_prerequest(payload)
             if pre_request_id:
+                uhi_excluded = True
                 log.info(f"    {patient_id}: UHI-exclusion resubmission succeeded.")
 
     if not pre_request_id:
@@ -3050,7 +3080,12 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
             f"Raw response + payload dumped to {DEBUG_DIR}\\{patient_id}_* for inspection."
         )
 
-    return {"pre_request_id": pre_request_id, "full_name": full_name, "warnings": warnings}
+    # "uhi_excluded" = creation only succeeded after the HASINSURANCE=N /
+    # UHIEXCLUDED=Y resubmission, i.e. SMC flagged this patient as UHI.
+    # decree_common uses it to decide whether to apply the deep UHI fallback
+    # right after re-creating an MDT whose earlier copy 404'd on print.
+    return {"pre_request_id": pre_request_id, "full_name": full_name, "warnings": warnings,
+            "uhi_excluded": uhi_excluded}
 
 
 # =====================================================================

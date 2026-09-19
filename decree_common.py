@@ -27,12 +27,14 @@ import Unified_Decree_Submission_Pipeline as _pipeline_module
 from Unified_Decree_Submission_Pipeline import (
     SMCSession,
     stage_render_and_sign,
+    stage_create_mdt,
     stage_upload_merged_pdf,
     stage_fix_uhi_exclusion_and_reprint_mdt,
     is_deep_uhi_upload_error,
     is_max_requests_reached_error,
     is_patient_request_already_exists_error,
     RowProcessingError,
+    MDTPrintPageNotFoundError,
     merge_final_pdf,
     call_with_reconnect,
 )
@@ -506,6 +508,77 @@ def _ensure_under_upload_limit(merged_pdf_path: str) -> Optional[str]:
     return None
 
 
+def _recreate_mdt_after_print_404(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
+                                   pipeline_state: dict, old_pre_request_id: str):
+    """FALLBACK for an MDT whose print page returns HTTP 404 (typically an
+    MDT created by an earlier attempt, most likely for a UHI patient).
+
+    1. Creates a brand-new MDT with the same treatment text / tumor config
+       (stage_create_mdt). The MDT text is read from this attempt's
+       website_submission_treatment_plan column (written by prepare.py),
+       since pipeline_state itself does not carry it.
+    2. Immediately saves the NEW pre_request_id into this attempt's
+       pipeline_state (before printing anything), so if a later step fails
+       the next retry reuses this MDT instead of creating yet another one.
+    3. Prints + signs the new MDT, applying the deep UHI fallback
+       (PreRequest/Edit with HASINSURANCE=N/UHIEXCLUDED=Y, then re-print):
+         - straight away when creation itself only succeeded through the
+           UHI-exclusion resubmission (SMC flagged the patient as UHI), or
+         - after a plain print of the new MDT ALSO 404s.
+       A plain print that works is used as-is, no UHI edit.
+
+    Returns (new_pre_request_id, new_full_name, mdt_signed_bytes). The old
+    MDT is left untouched on SMC. Raises on any failure; the caller
+    (run_finalize_stages) turns that into a normal FAILED result."""
+    rows = sb.select(ATTEMPTS_TABLE, select="website_submission_treatment_plan", filters={"id": f"eq.{attempt_id}"})
+    mdt_text = ((rows[0].get("website_submission_treatment_plan") if rows else "") or "").strip()
+    if not mdt_text:
+        raise RowProcessingError(
+            f"MDT #{old_pre_request_id} has no printable form (HTTP 404) and a new MDT cannot be created: "
+            f"attempt {attempt_id} has no saved treatment-plan text."
+        )
+
+    log.warning(f"  case {case_id}: MDT #{old_pre_request_id} print page returned 404 — "
+                f"creating a NEW MDT for this case instead.")
+    new_out = call_with_reconnect(session, "MDT re-creation (print page 404)", stage_create_mdt,
+                                   session, national_id, mdt_text, pipeline_state["tumor_cfg"])
+    new_id = new_out["pre_request_id"]
+    new_full_name = new_out["full_name"]
+    uhi_flagged = bool(new_out.get("uhi_excluded"))
+
+    new_state = dict(pipeline_state)
+    new_state["pre_request_id"] = new_id
+    new_state["full_name"] = new_full_name
+    new_state["replaced_pre_request_ids"] = list(pipeline_state.get("replaced_pre_request_ids") or []) + [old_pre_request_id]
+    try:
+        sb.update(ATTEMPTS_TABLE, attempt_id, {"pipeline_state": new_state})
+    except Exception as exc:
+        log.warning(f"  case {case_id}: could not save the new pre_request_id {new_id} to pipeline_state ({exc}) — "
+                    f"continuing, but a retry may create another MDT.")
+    log_event(case_id, attempt_id, "mdt_recreated_after_print_404",
+              {"old_pre_request_id": old_pre_request_id, "new_pre_request_id": new_id,
+               "uhi_flagged_at_creation": uhi_flagged})
+
+    def _uhi_fix_and_reprint():
+        return call_with_reconnect(session, "UHI edit + MDT reprint (after MDT re-creation)",
+                                    stage_fix_uhi_exclusion_and_reprint_mdt,
+                                    session, national_id, new_id, broad=True)
+
+    if uhi_flagged:
+        log.info(f"  case {case_id}: new MDT #{new_id} needed the UHI exclusion at creation — "
+                 f"applying the UHI fallback (edit + re-print) now.")
+        mdt_signed_bytes = _uhi_fix_and_reprint()
+    else:
+        try:
+            mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign (new MDT)", stage_render_and_sign,
+                                                    session, new_id, broad=True)
+        except MDTPrintPageNotFoundError:
+            log.warning(f"  case {case_id}: new MDT #{new_id} print page ALSO returned 404 — "
+                        f"treating as a UHI patient and applying the UHI fallback (edit + re-print).")
+            mdt_signed_bytes = _uhi_fix_and_reprint()
+    return new_id, new_full_name, mdt_signed_bytes
+
+
 def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
                          pipeline_state: dict, patient_pdf_path: str) -> dict:
     """pipeline_state must contain: pre_request_id, full_name, tumor_cfg
@@ -531,8 +604,17 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
         # bypass the very review the human just did. This function only
         # ever does: sign, build the report, merge, upload — nothing else.
         log.info(f"  [Stage 2] Rendering + signing MDT form for pre_request_id={pre_request_id} …")
-        mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign", stage_render_and_sign,
-                                                session, pre_request_id, broad=True)
+        try:
+            mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign", stage_render_and_sign,
+                                                    session, pre_request_id, broad=True)
+        except MDTPrintPageNotFoundError:
+            # The MDT from an earlier attempt has no printable form on SMC
+            # (HTTP 404). Create a new one (with the UHI fallback where it
+            # applies) and carry on with the new pre_request_id / name —
+            # everything below (report, merge, upload, the returned
+            # pre_request_id) uses these local variables.
+            pre_request_id, full_name, mdt_signed_bytes = _recreate_mdt_after_print_404(
+                session, case_id, attempt_id, national_id, pipeline_state, pre_request_id)
 
         log.info("  [Stage 3] Building medical report …")
         report_pdf_bytes = build_medical_report_pdf(full_name, national_id, medical_report_text, tumor_cfg)
