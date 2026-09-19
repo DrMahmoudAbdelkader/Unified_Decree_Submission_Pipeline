@@ -3099,7 +3099,10 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
     # then the free-text treatment-plan wording. Without this, the row
     # still submitted successfully but silently carried NO indication of
     # the procedure/category on the MDT form itself.
-    treatment_plan_text = f"{proc_desc}\r\n{description}" if proc_desc else description
+    # GetReqTreatmentProcDesc may include trailing CR/LF padding; remove
+    # only that outer padding before adding the one intended line separator.
+    proc_desc_clean = proc_desc.strip() if proc_desc else ""
+    treatment_plan_text = f"{proc_desc_clean}\r\n{description}" if proc_desc_clean else description
 
     try:
         ctx = session.get_create_page_context()
