@@ -154,6 +154,10 @@ jobs:
     # nothing is READY_TO_SUBMIT.
     if: ${{ needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
+    # `contents: write` is only for the failed-PDF publish step below (it
+    # pushes the failed-pdfs branch). Nothing else in this job needs it.
+    permissions:
+      contents: write
     # Per BATCH, not per queue. ~10 cases each; was 60 for everything.
     timeout-minutes: 30
     strategy:
@@ -273,6 +277,23 @@ jobs:
           CASE_IDS: ${{ matrix.batch.case_ids }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python decree_submission_prepare.py
+
+      # Keeps the merged PDF of every case that FAILED after its merge, so it
+      # can be submitted by hand without redoing sign/report/merge. The
+      # Python side (decree_common._keep_failed_merged_pdf) drops them in
+      # /tmp/decree_failed_merged; this stores them on the repo's
+      # `failed-pdfs` branch under failed_merged_pdfs/<date>/ and removes
+      # folders older than 10 days. See publish_failed_pdfs.py for why it is
+      # a branch (history never accumulates) and how parallel batches avoid
+      # overwriting each other. continue-on-error: a problem here must never
+      # turn a good run red or hide the real result.
+      - name: Publish failed cases' merged PDFs (branch failed-pdfs)
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python publish_failed_pdfs.py
 
       # CHANGED: was `if: always()`. /tmp/decree_merged holds the MERGED
       # PATIENT SUBMISSION PDFs — real patient documents. Uploading them on

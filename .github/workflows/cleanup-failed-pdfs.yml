@@ -1,0 +1,51 @@
+# .github/workflows/cleanup-failed-pdfs.yml
+# ============================================================================
+# Housekeeping for the `failed-pdfs` branch (merged PDFs of failed cases, see
+# publish_failed_pdfs.py). Every prepare/finalize run already prunes folders
+# older than 10 days; this makes sure it also happens on days when nothing
+# runs, and lets you clean by hand:
+#
+#   Actions -> "Cleanup failed merged PDFs" -> Run workflow
+#       keep_days  how many days to keep (default 10)
+#       purge_all  tick to delete EVERYTHING on the branch right now
+#
+# You can also simply delete a date folder on GitHub (branch failed-pdfs);
+# the next run rebuilds the branch from whatever is left.
+# ============================================================================
+
+name: Cleanup failed merged PDFs
+
+on:
+  schedule:
+    - cron: "17 3 * * *"          # daily, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      keep_days:
+        description: "Keep folders newer than this many days"
+        required: false
+        default: "10"
+      purge_all:
+        description: "Delete EVERYTHING on the failed-pdfs branch now"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo (for publish_failed_pdfs.py)
+        uses: actions/checkout@v4
+
+      - name: Prune the failed-pdfs branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_DIR: /tmp/nothing-to-add
+          KEEP_DAYS: ${{ github.event.inputs.keep_days || '10' }}
+          PURGE_ALL: ${{ github.event.inputs.purge_all }}
+        run: python3 publish_failed_pdfs.py
