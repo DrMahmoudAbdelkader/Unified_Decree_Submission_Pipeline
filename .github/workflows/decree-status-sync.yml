@@ -52,6 +52,15 @@ on:
   schedule:
     - cron: "0 23 * * *"
   workflow_dispatch:
+    inputs:
+      max_single_lookups:
+        description: "Max targeted lookups for requests older than the bulk window (default 300). Raise for the first big backlog run, e.g. 1000."
+        required: false
+        default: "300"
+      lookback_days:
+        description: "Bulk-window size in days (default 15)"
+        required: false
+        default: "15"
 
 jobs:
   sync:
@@ -96,4 +105,9 @@ jobs:
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
           SMC_SENDING_SITE: ${{ secrets.SMC_SENDING_SITE }}
+          # On the nightly schedule there are no inputs, so these fall back
+          # to the defaults. They must never be an empty string — the script
+          # does int(os.environ[...]) on them.
+          MAX_SINGLE_STATUS_LOOKUPS: ${{ github.event.inputs.max_single_lookups || '300' }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '15' }}
         run: python decree_status_and_letters_sync.py
