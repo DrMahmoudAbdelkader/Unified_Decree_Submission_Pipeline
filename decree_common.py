@@ -612,12 +612,26 @@ def _build_merged_pdf(national_id: str, pre_request_id: str, mdt_signed_bytes: b
     return merged_pdf_path
 
 
+# Hard ceiling on how many times _recreate_mdt() will replace itself when
+# the REPLACEMENT MDT's own print page also 404s (or its post-UHI-edit
+# reprint does — see the two callers of MAX_MDT_RECREATE_ATTEMPTS below).
+# Without this, a patient/diagnosis combination that SMC simply never
+# gives a printable form to would recurse forever instead of failing the
+# row with a clear message. 3 covers "the site was mid-glitch" without
+# hammering it indefinitely.
+MAX_MDT_RECREATE_ATTEMPTS = 3
+
+
 def _recreate_mdt(session: SMCSession, case_id: int, attempt_id: int, national_id: str,
-                  pipeline_state: dict, *, reason: str, diag_code_override: Optional[str] = None):
+                  pipeline_state: dict, *, reason: str, diag_code_override: Optional[str] = None,
+                  _attempt: int = 1):
     """Creates a brand-new MDT for this case, saves it as the attempt's MDT,
-    and prints + signs it. Used by two fallbacks (see their callers):
-      - reason "print page 404": the earlier MDT has no printable form; the
-        replacement is identical to a normal creation.
+    and prints + signs it. Used by three fallbacks (see their callers):
+      - reason "print page returned 404": the earlier MDT has no printable
+        form; the replacement is identical to a normal creation.
+      - reason "UHI reprint returned 404": the post-UHI-edit reprint of an
+        existing MDT (stage_fix_uhi_exclusion_and_reprint_mdt) itself came
+        back 404 instead of the corrected form; same recovery as above.
       - reason "open request with same diagnosis": same, except the
         diagnosis code is diag_code_override (every derived lookup - ICD
         name, department, treatment-proc list - follows that code, exactly
@@ -628,6 +642,12 @@ def _recreate_mdt(session: SMCSession, case_id: int, attempt_id: int, national_i
     new pre_request_id is written to pipeline_state IMMEDIATELY, before any
     further step, so a failure later leaves the retry reusing this MDT
     instead of creating yet another. The old MDT is left as-is on SMC.
+
+    If the REPLACEMENT MDT's own print page ALSO 404s, this recreates
+    again (up to MAX_MDT_RECREATE_ATTEMPTS total) rather than letting that
+    second MDTPrintPageNotFoundError escape uncaught — that gap is exactly
+    what let cases 4828/5013/5676 fall through to a raw "Could not fetch
+    MDT print page … HTTP 404" failure instead of getting a further retry.
 
     Returns (new_pre_request_id, new_full_name, mdt_signed_bytes, new_state).
     pipeline_state["tumor_cfg"] is NOT modified: the medical report keeps
@@ -665,8 +685,25 @@ def _recreate_mdt(session: SMCSession, case_id: int, attempt_id: int, national_i
               {"reason": reason, "old_pre_request_id": old_pre_request_id,
                "new_pre_request_id": new_id, "diag_code": cfg["diag_code"]})
 
-    mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign (new MDT)", stage_render_and_sign,
-                                            session, new_id, broad=True)
+    try:
+        mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign (new MDT)", stage_render_and_sign,
+                                                session, new_id, broad=True)
+    except MDTPrintPageNotFoundError:
+        # The REPLACEMENT MDT also has no printable form. Previously this
+        # propagated straight out of _recreate_mdt (and from there out of
+        # run_finalize_stages entirely), failing the row with the raw 404
+        # message instead of getting the same recovery the FIRST 404 got.
+        if _attempt >= MAX_MDT_RECREATE_ATTEMPTS:
+            raise RowProcessingError(
+                f"MDT #{new_id} (recreated because: {reason}) also returned HTTP 404 on its print "
+                f"page after {_attempt} attempt(s) at recreating it — giving up rather than "
+                f"recreating indefinitely. Check this case manually on SMC."
+            )
+        log.warning(f"  case {case_id}: newly-created MDT #{new_id} ALSO returned 404 on print — "
+                    f"recreating again (attempt {_attempt + 1}/{MAX_MDT_RECREATE_ATTEMPTS}).")
+        return _recreate_mdt(session, case_id, attempt_id, national_id, new_state,
+                              reason=reason, diag_code_override=diag_code_override,
+                              _attempt=_attempt + 1)
     return new_id, new_full_name, mdt_signed_bytes, new_state
 
 
@@ -829,10 +866,26 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
             # first print) is overwritten/discarded here.
             log.warning(f"  case {case_id}: UHI-blocked after standard resend — editing "
                         f"pre-request + re-printing MDT form.")
-            mdt_signed_bytes = call_with_reconnect(
-                session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
-                session, national_id, pre_request_id, broad=True,
-            )
+            try:
+                mdt_signed_bytes = call_with_reconnect(
+                    session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
+                    session, national_id, pre_request_id, broad=True,
+                )
+            except MDTPrintPageNotFoundError:
+                # The post-UHI-edit reprint of THIS MDT also came back 404
+                # instead of the corrected form. Previously this escaped
+                # uncaught all the way out of run_finalize_stages, failing
+                # the row with the raw 404 message and never actually
+                # reaching a UHI-corrected page — this is the exact gap
+                # you described (new MDT hits a UHI problem, but the
+                # fallback meant to get the correct signed page never
+                # ran). Recover the same way Stage 2's 404 does: replace
+                # this MDT outright and continue with the replacement.
+                log.warning(f"  case {case_id}: MDT #{pre_request_id}'s post-UHI-edit reprint also "
+                            f"returned 404 — creating a brand-new MDT instead of reprinting this one.")
+                pre_request_id, full_name, mdt_signed_bytes, state = _recreate_mdt(
+                    session, case_id, attempt_id, national_id, state,
+                    reason="UHI reprint returned 404")
             log.info("  Re-merging with the corrected MDT form …")
             merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
                                                 report_pdf_bytes, patient_pdf_path)
