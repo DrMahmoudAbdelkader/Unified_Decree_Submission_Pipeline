@@ -886,6 +886,18 @@ TUMOR_TYPE_ALIASES = {
     "ورم بالغدة الدرقية": "thyroid_cancer",          # C73 - "ورم بالغدة" vs registered "سرطان الغدة" wording of the SAME organ (thyroid)
     "ورم خبيث بالبروستاتا": "prostate_cancer",       # C61 - "ورم خبيث بال" vs registered "سرطان ال" wording of the SAME organ (prostate)
     "ورم خبيث فى الغدة النكفية": "salivary_gland_cancer",  # C08.9 - the parotid IS a major salivary gland; same ICD bucket as registered "سرطان بالغده اللعابيه"
+    # Added from the requirement_opened failures on cases 5336/5628/5817:
+    # "malignant tumor of the rectum" wording variant - colorectal_cancer's
+    # own diag_code (C20) IS the ICD-10 code for rectal cancer specifically
+    # (C18=colon, C19=rectosigmoid junction, C20=rectum), so this is the
+    # SAME code as the already-registered "سرطان القولون والمستقيم" spelling,
+    # not a new diagnosis.
+    "ورم خبيث بالمستقيم": "colorectal_cancer",       # C20
+    # Added from the requirement_opened failures on cases 5704/5820:
+    # Chronic Myeloid Leukemia - same C95 blood-tumor bucket as the existing
+    # bare "لوكيميا" / "leukemia" aliases above, just the fuller clinical
+    # phrase actually present in these cases' tumor_type_custom text.
+    "اللوكيميا الميلوديه المزمنه": "blood_tumor",     # C95
 }
 
 # FIXED BUG: this used to be a blind TUMOR_TYPE_ALIASES.update(_EXTRA_ALIASES),
