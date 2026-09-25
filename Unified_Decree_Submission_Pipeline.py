@@ -532,16 +532,14 @@ _add_generic_tumor_type("brain_cns", "Brain and Central Nervous System Cancer",
                          "أورام المخ والجهاز العصبي المركزي", "U37.6")
 _add_generic_tumor_type("gynecological_cancer", "Gynecological Cancer", "أورام النساء", "C56")
 
-# Explicitly requested addition - diag_code C56 as supplied. Reuses the
-# SAME code as "gynecological_cancer" above (same intentional-code-reuse
-# pattern already used elsewhere in this file for pelvic_cancer /
-# abdominal_pelvic_cancer, both U55.5, and colon_cancer / colorectal_cancer
-# both being distinct-but-related codes) - Column C text alone decides
-# which of the two a row resolves to; they are independent, separately
-# selectable entries. speciality_code/proc_id left at the "9"/"10"
-# default per the note above _SUPPLIED_TUMOR_TABLE - update if this
-# needs its own committee/proc routing.
-_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56",
+# Originally added with diag_code "C56" (bare), intentionally reusing the
+# same code as "gynecological_cancer" above. Cross-checking against the
+# real decree_treatment_plans data (plans_cancer_aliases.xlsx) shows every
+# actual "سرطان المبيض" submission carries diagnosis_codes = ["C56.9"],
+# not bare "C56" - corrected to match what the app actually sends. This
+# no longer shares a code with gynecological_cancer (C56); if that
+# shared-code behavior was actually wanted, revert this one line.
+_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56.9",
                          extra_aliases=["ovarian_cancer"])
 
 # Explicitly requested addition - Thyroid Gland Tumor, diag_code C73 as
@@ -658,6 +656,63 @@ _ALL_DIAG_CODES_ADDITIONS = [
     ("prostate_cancer_early_detection",   "Early Prostate Cancer Detection (Initiative)",                       "كشف مبكر اورام بروستاتا (مبادره)",      "AB51.6"),
 ]
 for _cid, _elabel, _arname, _dcode in _ALL_DIAG_CODES_ADDITIONS:
+    _add_generic_tumor_type(_cid, _elabel, _arname, _dcode)
+del _cid, _elabel, _arname, _dcode
+
+# --- Batch 5: reconciled against the real cancer_type_group values that
+# actually appear in decree_treatment_plans (plans_cancer_aliases.xlsx),
+# cross-checked one-for-one against that same table's diagnosis_codes
+# column for each cancer_type_group - so every diag_code below is not a
+# guess, it's the exact code your own app already sends for that plan.
+# arabic_name is copied VERBATIM from cancer_type_group (byte-for-byte,
+# so it doubles as the Column C / OTHER_ONCOLOGY alias with no separate
+# entry needed). speciality_code/proc_id left at the "11"/"10" default
+# (same as every other generic entry above) since the sheet has no
+# speciality/proc data - override per-entry if SMC needs different
+# committee routing for any of these.
+_REAL_DATA_ADDITIONS = [
+    ("uterine_cancer",          "Uterine Cancer",                                    "ورم خبيث بالرحم",              "C54.9"),
+    ("gallbladder_cancer",      "Gallbladder Cancer",                                "ورم خبيث بالمرارة",             "C23"),
+    ("tonsil_cancer",           "Tonsil Cancer",                                     "ورم خبيث باللوزتين",            "C09.9"),
+    ("thymus_cancer",           "Thymic Cancer",                                     "ورم بالغدة الثيموسية",          "C37"),
+    ("vulvar_cancer",           "Vulvar Cancer",                                     "ورم خبيث بالفرج",               "C51.9"),
+    ("vaginal_cancer",          "Vaginal Cancer",                                    "ورم خبيث بالمهبل",              "C52"),
+    ("penile_cancer",           "Penile Cancer",                                     "ورم خبيث بالقضيب",              "C60.9"),
+    ("scalp_cancer",            "Scalp Cancer",                                      "ورم خبيث بفروه الراس",          "C44.4"),
+    ("gestational_trophoblastic_tumor", "Gestational Trophoblastic Tumor (Placental Cancer)", "ورم خبيث بالمشيمة", "C58"),
+    ("renal_pelvis_cancer",     "Renal Pelvis Cancer",                               "ورم خبيث بحوض الكلية",          "C65"),
+    ("tracheal_cancer",         "Tracheal Cancer",                                   "ورم خبيث بالقصبة الهوائية",     "C33"),
+    ("conjunctival_cancer",     "Conjunctival Cancer",                               "ورم خبيث بالملتحمه",            "C69.0"),
+    # Not itself a malignancy (immune thrombocytopenia), but this is the
+    # exact cancer_type_group text and diag_code your app already ties to
+    # a real treatment plan, so it's registered the same generic way as
+    # every other non-strictly-"cancer" entry already in this file
+    # (hepatitis_c_liver_focus, liver_cirrhosis_diabetes_focus, etc.).
+    ("adult_itp_post_treatment_failure", "Adult Immune Thrombocytopenia, Post Steroid/Immunosuppressant Failure",
+     "التكسير المناعي للصفائح الدمويه للبالغين مابعد فشل الاستجابه للعلاج ب(كورتيزون-او مثبطات المناعه-)", "AB23.0"),
+    # Distinct leukemia subtypes - each has its OWN diag_code in the real
+    # data, genuinely different from blood_tumor's C95 and from each
+    # other, so each gets its own canonical entry rather than being
+    # folded into the existing bare "لوكيميا"/"leukemia"/blood_tumor
+    # alias group:
+    ("acute_leukemia",          "Acute Leukemia",                                    "اللوكيميا الحاده",              "AB43.4"),
+    ("cll_17p_deletion",        "Chronic Lymphocytic Leukemia (17p Deletion)",       "اللوكيميا الليمفاويه المزمنه (CLL 17P deletion)", "AB49.8"),
+    ("aml",                     "Acute Myeloid Leukemia (AML)",                      "اللوكيميا الميلوديه الحاده (AML)", "AB53.0"),
+    ("hairy_cell_leukemia",     "Hairy Cell Leukemia",                               "لوكيميا شعريه",                 "U32.7"),
+    # Chronic Myeloid Leukemia - previously (wrongly) aliased straight to
+    # blood_tumor/C95 below in TUMOR_TYPE_ALIASES; the real data shows
+    # this cancer_type_group actually carries its own distinct code
+    # (AB52.5), so it's split out into its own canonical entry here and
+    # the old alias is redirected to it (see the TUMOR_TYPE_ALIASES fix
+    # further down).
+    ("cml",                     "Chronic Myeloid Leukemia (CML)",                    "اللوكيميا الميلوديه المزمنه",   "AB52.5"),
+    # Parotid gland cancer - previously (wrongly) aliased to the generic
+    # salivary_gland_cancer/C08.9 bucket below; the real data shows the
+    # app actually uses the parotid-specific ICD code C07, so this is
+    # split into its own entry too (old alias redirected, see below).
+    ("parotid_gland_cancer",    "Parotid Gland Cancer",                              "ورم خبيث فى الغدة النكفية",     "C07"),
+]
+for _cid, _elabel, _arname, _dcode in _REAL_DATA_ADDITIONS:
     _add_generic_tumor_type(_cid, _elabel, _arname, _dcode)
 del _cid, _elabel, _arname, _dcode
 
@@ -885,7 +940,11 @@ TUMOR_TYPE_ALIASES = {
     "لوكيميا": "blood_tumor",                        # C95 - bare Arabic word, same precedent as the existing bare English "leukemia"/"blood cancer" aliases above
     "ورم بالغدة الدرقية": "thyroid_cancer",          # C73 - "ورم بالغدة" vs registered "سرطان الغدة" wording of the SAME organ (thyroid)
     "ورم خبيث بالبروستاتا": "prostate_cancer",       # C61 - "ورم خبيث بال" vs registered "سرطان ال" wording of the SAME organ (prostate)
-    "ورم خبيث فى الغدة النكفية": "salivary_gland_cancer",  # C08.9 - the parotid IS a major salivary gland; same ICD bucket as registered "سرطان بالغده اللعابيه"
+    # REDIRECTED (was salivary_gland_cancer/C08.9): the real
+    # decree_treatment_plans data shows this cancer_type_group's actual
+    # diagnosis_codes is C07 (parotid-specific), not C08.9 - now points at
+    # its own parotid_gland_cancer entry (Batch 5, above) instead.
+    "ورم خبيث فى الغدة النكفية": "parotid_gland_cancer",  # C07
     # Added from the requirement_opened failures on cases 5336/5628/5817:
     # "malignant tumor of the rectum" wording variant - colorectal_cancer's
     # own diag_code (C20) IS the ICD-10 code for rectal cancer specifically
@@ -893,11 +952,46 @@ TUMOR_TYPE_ALIASES = {
     # SAME code as the already-registered "سرطان القولون والمستقيم" spelling,
     # not a new diagnosis.
     "ورم خبيث بالمستقيم": "colorectal_cancer",       # C20
-    # Added from the requirement_opened failures on cases 5704/5820:
-    # Chronic Myeloid Leukemia - same C95 blood-tumor bucket as the existing
-    # bare "لوكيميا" / "leukemia" aliases above, just the fuller clinical
-    # phrase actually present in these cases' tumor_type_custom text.
-    "اللوكيميا الميلوديه المزمنه": "blood_tumor",     # C95
+    # REDIRECTED (was blood_tumor/C95): the real decree_treatment_plans
+    # data shows this cancer_type_group's actual diagnosis_codes is
+    # AB52.5, a distinct CML-specific code, not the generic C95 blood-
+    # tumor bucket it was originally (wrongly) folded into - now points
+    # at its own cml entry (Batch 5, above) instead.
+    "اللوكيميا الميلوديه المزمنه": "cml",              # AB52.5
+    # Added from a live "لم يتم التعرف على نوع الورم" failure (OTHER_ONCOLOGY
+    # case). "Tumor of the brain AND pituitary gland" - the pituitary sits at
+    # the base of the brain and pituitary tumors are routinely grouped with
+    # brain/CNS tumors clinically, so this is mapped to the existing
+    # brain_cns entry (U37.6, "أورام المخ والجهاز العصبي المركزي") rather than
+    # inventing a new code - same reasoning already used for the plain
+    # "Brain Tumor" alias above. Flag for a quick sanity check: if SMC
+    # actually wants pituitary-specific routing (e.g. under the endocrine
+    # bucket, malignant_endocrine_gland_tumor/C75) instead, this needs to be
+    # split into its own canonical entry with a confirmed diag code.
+    "ورم بالمخ والغده النخاميه": "brain_cns",         # U37.6
+    # RESOLVED (previously left deliberately unmapped below): confirmed via
+    # the real decree_treatment_plans data that "ورم خبيث بالرحم" (uterus)
+    # carries diagnosis_codes = ["C54.9"] - genuinely NOT the same organ as
+    # cervical_cancer (C53.9, the cervix), so it now points at its own
+    # uterine_cancer entry (Batch 5, above) rather than being folded into
+    # cervical_cancer.
+    "ورم خبيث بالرحم": "uterine_cancer",              # C54.9
+    # Wording/spelling variants of an already-registered exact-match alias
+    # or arabic_name, confirmed against the real data to carry the SAME
+    # diag_code as their canonical sibling - alias-only additions, no new
+    # canonical type needed:
+    "ورم سرطانى بالغدد العصبيه مرتجع غير مستجيب للعلاج": "neuroendocrine_recurrent",  # AB45.1 - ى/ي (alif maksura) spelling of the registered "سرطاني" form
+    "سرطان بالعقد العصبيه (neuoroblastoma)": "neuroblastoma",  # AB10.8 - registered arabic_name plus a parenthetical (misspelled) English suffix
+    "سرطان بالجلد (.m.f)": "skin_cancer_mf",          # U86.9 - registered arabic_name with a stray leading "." inside the parenthetical
+    # _add_generic_tumor_type() registers arabic_name as an alias WITHOUT
+    # lower-casing it (only diag_code/english_label are lower-cased), but
+    # resolve_tumor_type() always lower-cases the incoming Column C value
+    # before lookup - so any arabic_name containing UPPERCASE Latin text
+    # in a parenthetical (as these two Batch-5 entries do) can never match
+    # via its own auto-registered alias. Explicit lower-cased duplicates
+    # added here so the exact real-data strings actually resolve:
+    "اللوكيميا الليمفاويه المزمنه (cll 17p deletion)": "cll_17p_deletion",  # AB49.8
+    "اللوكيميا الميلوديه الحاده (aml)": "aml",        # AB53.0
 }
 
 # FIXED BUG: this used to be a blind TUMOR_TYPE_ALIASES.update(_EXTRA_ALIASES),
