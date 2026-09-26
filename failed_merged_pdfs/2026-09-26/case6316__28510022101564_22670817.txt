@@ -1,0 +1,8 @@
+case_id: 6316
+national_id: 28510022101564
+mdt (pre_request_id): 22670817
+failed_at_utc: 2026-09-26T18:09:35+00:00
+error: Could not load Requests/Create page for prid=22670817
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22670817 on the SMC site and attach it.

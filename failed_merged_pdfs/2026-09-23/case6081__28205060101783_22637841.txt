@@ -1,0 +1,8 @@
+case_id: 6081
+national_id: 28205060101783
+mdt (pre_request_id): 22637841
+failed_at_utc: 2026-09-23T14:20:59+00:00
+error: Patient 28205060101783 hit the site's max-open-requests limit for MDT #22637841 (Requests/SearchSSN returned 'MaxNumberOfRequestsReached'). This is a site-side per-patient concurrent-request cap, NOT a UHI/insurance issue - the MDT itself was created fine and was left untouched. Retry this case on its own later, once this patient's other open request(s) have cleared.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22637841 on the SMC site and attach it.

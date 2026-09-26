@@ -1,0 +1,8 @@
+case_id: 4828
+national_id: 26712112100707
+mdt (pre_request_id): 22564653
+failed_at_utc: 2026-09-21T01:04:07+00:00
+error: Could not fetch MDT print page for pre_request_id=22564653 (HTTP 404) - this MDT has no printable form on SMC.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22564653 on the SMC site and attach it.
