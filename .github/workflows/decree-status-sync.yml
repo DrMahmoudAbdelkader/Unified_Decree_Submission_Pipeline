@@ -15,6 +15,13 @@
 #   growing without bound, and what takes a finished request out of the
 #   tracker's live list.
 #
+#   Since 2026-09-27 it also refreshes decree_request_month_seed (the
+#   full-month backfill table decree-status-tracking.js reads) in the same
+#   run, reusing the same SMC login/session — see sync_seed_table() in
+#   decree_status_and_letters_sync.py. No new secrets or steps needed here:
+#   it's the same script invocation below. decree_request_seed_status_refresh.py,
+#   if it's still in this repo, is no longer used and can be deleted.
+#
 # SCHEDULE — 23:00 UTC
 #   GitHub cron is UTC only; it has no notion of Africa/Cairo. Egypt is
 #   UTC+2 in winter and UTC+3 during DST (Apr–Oct), so 23:00 UTC lands at
