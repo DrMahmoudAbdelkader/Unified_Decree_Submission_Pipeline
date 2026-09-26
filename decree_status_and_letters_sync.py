@@ -81,6 +81,20 @@ old popup-based version never saw at all. Any status text that comes back
 without a matching row falls into the "Unknown" bucket (never guessed as
 final) and is logged — check the run summary's "Unmapped statuses" line
 after the first real run and add rows for whatever shows up there.
+
+FULL-MONTH SEED REFRESH (decree_request_month_seed) — NEW
+--------------------------------------------------------------------------
+After the open-attempt sweep above finishes, sync_seed_table() reuses the
+SAME logged-in session and the SAME SendRequestStatusJson bulk endpoint to
+refresh decree_request_month_seed (see decree_request_month_seed_schema.sql
+and decree-status-tracking.js) — the full month's SMC export used to cover
+requests that have no in-app case/attempt at all. No second login, no
+per-request lookups: that endpoint already returns any request's status for
+a date window regardless of whether this app tracked it, chunked into
+~10-day windows since seed rows can span the whole month. This replaces the
+standalone decree_request_seed_status_refresh.py stub — delete that file,
+nothing runs it anymore. A seed-refresh failure is caught and logged
+separately; it never fails the run or affects the attempt sweep above.
 """
 
 from __future__ import annotations
@@ -120,6 +134,16 @@ ATTEMPTS_TABLE = "decree_request_attempts"
 CASES_TABLE = "decree_request_cases"
 EVENTS_TABLE = "decree_request_events"
 STATUS_MAP_TABLE = "smc_status_map"
+# Full-month backfill table (see decree_request_month_seed_schema.sql /
+# decree-status-tracking.js) — most of its rows have no in-app case/attempt
+# at all, so they can't go through load_open_attempts()/process_one_attempt()
+# above. sync_seed_table() below refreshes them instead, reusing this same
+# script's session and the same SendRequestStatusJson bulk endpoint, since
+# that endpoint already returns any request's status for a date window
+# regardless of whether this app tracked it. This replaces the old
+# decree_request_seed_status_refresh.py stub — delete that file, it's no
+# longer needed as a separate script/login.
+SEED_TABLE = "decree_request_month_seed"
 
 # decree_request_events.created_by is NOT NULL with no default. Every OTHER
 # writer in this pipeline goes through decree_common.log_event(), which
@@ -545,6 +569,103 @@ def _get_smc_credentials():
 
 
 # =====================================================================
+# Full-month seed table (decree_request_month_seed) refresh — reuses this
+# script's already-logged-in session and the same SendRequestStatusJson
+# bulk endpoint the open-attempt sweep uses above. No second login, no
+# per-request single lookups, no separate script: that endpoint already
+# returns EVERY request's status for a date window, whether or not this
+# app has a case/attempt for it, which is exactly what a seed row is.
+# =====================================================================
+
+def load_open_seed_rows(status_map: Dict[str, dict]) -> List[dict]:
+    """Every decree_request_month_seed row not already at a final status —
+    reusing the exact same status_map (the exact same Approved/Admin_Letter/
+    Cancelled* definition of "final") the open-attempt sweep above already
+    uses, so a status this app doesn't treat as final for an in-app attempt
+    isn't treated as final here either. Paged the same way
+    load_open_attempts() is, for the same reason (PostgREST's unpaged
+    response cap)."""
+    page_size = 500
+    offset = 0
+    rows: List[dict] = []
+    while True:
+        page = sb.select(
+            SEED_TABLE,
+            select="id,request_number,last_known_status,request_date",
+            filters={"offset": str(offset)},
+            order="request_date.asc",
+            limit=page_size,
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return [
+        r for r in rows
+        if not resolve_status_bucket(status_map, r.get("last_known_status") or "")["is_final"]
+    ]
+
+
+def _chunk_date_ranges(start_iso: str, end_iso: str, chunk_days: int = 10):
+    """Splits [start, end] into <=chunk_days-wide inclusive slices. A full
+    month is well outside the ~15-day window this endpoint has actually
+    been exercised at (LOOKBACK_DAYS's default) — chunking at the same
+    proven scale avoids finding out the hard way whether one huge
+    single-call window gets silently truncated by the site."""
+    cur = datetime.strptime(start_iso, "%Y-%m-%d")
+    end = datetime.strptime(end_iso, "%Y-%m-%d")
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+        yield cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
+        cur = chunk_end + timedelta(days=1)
+
+
+def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dict[str, int]:
+    """Refreshes decree_request_month_seed the same way process_one_attempt()
+    refreshes decree_request_attempts above — same session, same bulk
+    endpoint, same status_map — just against a wider, chunked date window
+    since seed rows can be a full month old. Only ever writes
+    last_known_status/imported_at on decree_request_month_seed itself; never
+    touches decree_request_cases/decree_request_attempts/decree_request_events,
+    same as the schema/JS side already assume about this table."""
+    counters = {"checked": 0, "updated": 0, "reached_final": 0}
+    open_rows = load_open_seed_rows(status_map)
+    if not open_rows:
+        log.info("Seed refresh: no open decree_request_month_seed rows to check.")
+        return counters
+
+    dated_rows = [r for r in open_rows if r.get("request_date")]
+    earliest = min((r["request_date"] for r in dated_rows), default=today_iso)
+    log.info(f"Seed refresh: {len(open_rows)} open seed row(s), window {earliest}..{today_iso}.")
+
+    bulk: Dict[str, dict] = {}
+    for chunk_start, chunk_end in _chunk_date_ranges(earliest, today_iso):
+        bulk.update(fetch_status_window(session, chunk_start, chunk_end))
+        time.sleep(REQUEST_DELAY)
+
+    for row in open_rows:
+        counters["checked"] += 1
+        hit = bulk.get(str(row["request_number"]))
+        if hit is None or not hit.get("request_status"):
+            continue  # not found this run (older than the site keeps, or a
+            # transient gap) — leave last_known_status as-is, retried next run
+        new_status = hit["request_status"]
+        if new_status == row.get("last_known_status"):
+            continue
+        sb.update(SEED_TABLE, row["id"], {
+            "last_known_status": new_status,
+            "imported_at": datetime.now().astimezone().isoformat(),
+        })
+        counters["updated"] += 1
+        if resolve_status_bucket(status_map, new_status)["is_final"]:
+            counters["reached_final"] += 1
+
+    log.info(f"Seed refresh done. Checked {counters['checked']}, updated {counters['updated']}, "
+             f"reached a final status {counters['reached_final']}.")
+    return counters
+
+
+# =====================================================================
 # Per-attempt processing
 # =====================================================================
 
@@ -725,6 +846,16 @@ def main():
     if unmapped_statuses:
         log.warning(f"Unmapped statuses seen — add these to smc_status_map: {sorted(unmapped_statuses)}")
 
+    try:
+        seed_counters = sync_seed_table(session, status_map, today_iso)
+    except Exception as exc:
+        # Best-effort, same spirit as the fallback query in
+        # decree-status-tracking.js: a seed-refresh failure never fails the
+        # whole run or blocks the open-attempt sweep above, which already
+        # completed successfully by this point.
+        seed_counters = {"checked": 0, "updated": 0, "reached_final": 0}
+        log.error(f"Seed table refresh failed (open-attempt sweep above still succeeded): {exc}")
+
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
@@ -748,6 +879,12 @@ def main():
                 f.write(f"\n> {budget_exhausted} stale attempt(s) were deferred rather than skipped silently — "
                         f"they'll be prioritized first on tomorrow's run (oldest-checked-first ordering). "
                         f"Raise MAX_SINGLE_STATUS_LOOKUPS if this number stays large night after night.\n")
+            f.write(
+                f"\n## Full-month seed refresh (decree_request_month_seed)\n"
+                f"- Open seed rows checked: **{seed_counters['checked']}**\n"
+                f"- Updated: **{seed_counters['updated']}**\n"
+                f"- Reached a final status this run: **{seed_counters['reached_final']}**\n"
+            )
 
     if attempts and crashed > len(attempts) / 2:
         log.error(f"More than half of tonight's attempts crashed ({crashed}/{len(attempts)}) — "
