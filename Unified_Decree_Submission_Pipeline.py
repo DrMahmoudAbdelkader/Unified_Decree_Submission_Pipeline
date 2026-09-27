@@ -1320,6 +1320,41 @@ def is_mdt_print_page_not_found_error(exc: Exception) -> bool:
     return isinstance(exc, MDTPrintPageNotFoundError)
 
 
+class MDTCreatePageNotFoundError(RowProcessingError):
+    """Raised by SMCSession.get_requests_create_context() when SMC answers
+    the Requests/Create page (loaded right before the final upload, to
+    scrape __RequestVerificationToken) with HTTP 404 - i.e. this
+    pre_request_id's create-request form is gone, even though its MDT
+    print page still works fine and PreRequest/GetPreRequests still finds
+    the pre-request record itself.
+
+    THE PATTERN THIS MATCHES: this is the same "MDT from an earlier
+    attempt/day is no longer fully usable" situation MDTPrintPageNotFoundError
+    already covers for the print step - just caught one stage LATER, after
+    the form printed and got signed successfully. Confirmed NOT a session
+    problem: _get() already checks for a login redirect (_session_expired())
+    before ever reaching this 404, and PreRequest/GetPreRequests coming
+    back 200 for the same prid immediately before this call shows SMC still
+    considers the pre-request itself valid - it's specifically the
+    "create a new request against this prid" route that 404s, most likely
+    because a Request was already created against it before (by an earlier
+    partial run, a manual submission, or a previous attempt for this same
+    case) and SMC no longer serves that form for a prid that's already
+    been consumed.
+
+    Deliberately a RowProcessingError (passes straight through
+    call_with_reconnect untouched, same as MDTPrintPageNotFoundError) so
+    decree_common.run_finalize_stages can react to it the same way it
+    reacts to a print-page 404: replace this MDT with a brand-new one
+    (stage_create_mdt) and retry sign + merge + upload with the
+    replacement, instead of failing the row on a bare "Could not load
+    Requests/Create page" message."""
+
+
+def is_mdt_create_page_not_found_error(exc: Exception) -> bool:
+    return isinstance(exc, MDTCreatePageNotFoundError)
+
+
 # ---------------------------------------------------------------------
 # SITE RULE (Sept 2026): "patient has an open request with the same
 # diagnosis". SMC now refuses to file a new decree request for a patient
@@ -2014,7 +2049,18 @@ class SMCSession:
         url = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
         r = self._get(url)
         if r is None:
-            raise RuntimeError(f"Could not load Requests/Create page for prid={pre_request_id}")
+            # _get() already ruled out a login-redirect (_session_expired())
+            # before returning None here, so a None means SMC gave back a
+            # real non-200 (confirmed in practice: a flat HTTP 404 "The
+            # resource cannot be found") for this specific prid's
+            # create-request form - see MDTCreatePageNotFoundError's
+            # docstring for why that most likely means a Request already
+            # exists against this MDT.
+            raise MDTCreatePageNotFoundError(
+                f"Could not load Requests/Create page for prid={pre_request_id} (non-200/404) - "
+                f"this MDT's create-request form appears unavailable, most likely because a "
+                f"Request was already created against it."
+            )
 
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -3409,6 +3455,12 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
     try:
         ctx = session.get_requests_create_context(pre_request_id)
     except RuntimeError as exc:
+        # NOTE: get_requests_create_context() raises MDTCreatePageNotFoundError
+        # (a RowProcessingError, not a RuntimeError) for the specific "page
+        # 404d" case - that one is NOT caught here on purpose, so it
+        # propagates up as itself for run_finalize_stages to react to. Only
+        # the other RuntimeError case (page loaded but the CSRF token
+        # couldn't be scraped from it) gets wrapped here.
         raise RowProcessingError(str(exc)) from exc
 
     create_page_referer = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"

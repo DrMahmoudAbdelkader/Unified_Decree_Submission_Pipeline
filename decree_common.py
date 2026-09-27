@@ -36,6 +36,8 @@ from Unified_Decree_Submission_Pipeline import (
     is_patient_request_already_exists_error,
     RowProcessingError,
     MDTPrintPageNotFoundError,
+    MDTCreatePageNotFoundError,
+    is_mdt_create_page_not_found_error,
     OpenRequestSameDiagnosisError,
     merge_final_pdf,
     call_with_reconnect,
@@ -770,6 +772,7 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                  open request, same dx ... new MDT under a fallback code, upload again
                  max open requests ....... fail, retry later (site cap)
                  request already exists .. fail, check the site (avoid a duplicate)
+                 create page 404 ......... print worked, but MDT already consumed -> new MDT, upload again
                  UHI-insurance block ..... edit pre-request + re-print, upload again
                  anything else ........... fail with the site's own message"""
     pre_request_id = pipeline_state["pre_request_id"]
@@ -867,46 +870,71 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                     "to avoid creating a second, duplicate request."
                 ) from upload_exc
 
-            if not is_deep_uhi_upload_error(upload_exc):
-                raise
-
-            # The quick HASINSURANCE=N/UHIEXCLUDED=Y resend inside
-            # stage_upload_merged_pdf already tried and failed for a
-            # genuine UHI-insurance block. Fall back to editing the
-            # pre-request + re-printing the MDT form, then rebuild the
-            # merged PDF with the CORRECTED form and retry the upload
-            # once. The previous merged PDF (built from the faulty/stuck
-            # first print) is overwritten/discarded here.
-            log.warning(f"  case {case_id}: UHI-blocked after standard resend — editing "
-                        f"pre-request + re-printing MDT form.")
-            try:
-                mdt_signed_bytes = call_with_reconnect(
-                    session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
-                    session, national_id, pre_request_id, broad=True,
-                )
-            except MDTPrintPageNotFoundError:
-                # The post-UHI-edit reprint of THIS MDT also came back 404
-                # instead of the corrected form. Previously this escaped
-                # uncaught all the way out of run_finalize_stages, failing
-                # the row with the raw 404 message and never actually
-                # reaching a UHI-corrected page — this is the exact gap
-                # you described (new MDT hits a UHI problem, but the
-                # fallback meant to get the correct signed page never
-                # ran). Recover the same way Stage 2's 404 does: replace
-                # this MDT outright and continue with the replacement.
-                log.warning(f"  case {case_id}: MDT #{pre_request_id}'s post-UHI-edit reprint also "
-                            f"returned 404 — creating a brand-new MDT instead of reprinting this one.")
+            if is_mdt_create_page_not_found_error(upload_exc):
+                # The Requests/Create page 404d for this MDT even though its
+                # print page worked fine and rendered/signed correctly (see
+                # MDTCreatePageNotFoundError's docstring) - this happens on
+                # an MDT inherited from an earlier day/attempt when a
+                # Request was already created against it before. Same
+                # recovery as a print-page 404: replace this MDT outright,
+                # re-merge with the new one, and retry the upload once.
+                log.warning(f"  case {case_id}: MDT #{pre_request_id}'s create-request page "
+                            f"returned 404 (print worked, but this MDT appears already "
+                            f"consumed) — creating a brand-new MDT instead.")
                 pre_request_id, full_name, mdt_signed_bytes, state = _recreate_mdt(
                     session, case_id, attempt_id, national_id, state,
-                    reason="UHI reprint returned 404")
-            log.info("  Re-merging with the corrected MDT form …")
-            merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
-                                                report_pdf_bytes, patient_pdf_path)
-            log.info("  Retrying upload with the corrected merged PDF …")
-            final_request_no = call_with_reconnect(
-                session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,
-                session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
-            )
+                    reason="create page returned 404 (MDT already consumed)")
+                log.info("  Re-merging with the newly-created MDT …")
+                merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
+                                                    report_pdf_bytes, patient_pdf_path)
+                log.info("  Retrying upload with the newly-created MDT's merged PDF …")
+                final_request_no = call_with_reconnect(
+                    session, "Final upload (retry after MDT recreate - create page 404)",
+                    stage_upload_merged_pdf,
+                    session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
+                )
+
+            elif not is_deep_uhi_upload_error(upload_exc):
+                raise
+
+            else:
+                # The quick HASINSURANCE=N/UHIEXCLUDED=Y resend inside
+                # stage_upload_merged_pdf already tried and failed for a
+                # genuine UHI-insurance block. Fall back to editing the
+                # pre-request + re-printing the MDT form, then rebuild the
+                # merged PDF with the CORRECTED form and retry the upload
+                # once. The previous merged PDF (built from the faulty/stuck
+                # first print) is overwritten/discarded here.
+                log.warning(f"  case {case_id}: UHI-blocked after standard resend — editing "
+                            f"pre-request + re-printing MDT form.")
+                try:
+                    mdt_signed_bytes = call_with_reconnect(
+                        session, "UHI edit + MDT reprint", stage_fix_uhi_exclusion_and_reprint_mdt,
+                        session, national_id, pre_request_id, broad=True,
+                    )
+                except MDTPrintPageNotFoundError:
+                    # The post-UHI-edit reprint of THIS MDT also came back 404
+                    # instead of the corrected form. Previously this escaped
+                    # uncaught all the way out of run_finalize_stages, failing
+                    # the row with the raw 404 message and never actually
+                    # reaching a UHI-corrected page — this is the exact gap
+                    # you described (new MDT hits a UHI problem, but the
+                    # fallback meant to get the correct signed page never
+                    # ran). Recover the same way Stage 2's 404 does: replace
+                    # this MDT outright and continue with the replacement.
+                    log.warning(f"  case {case_id}: MDT #{pre_request_id}'s post-UHI-edit reprint also "
+                                f"returned 404 — creating a brand-new MDT instead of reprinting this one.")
+                    pre_request_id, full_name, mdt_signed_bytes, state = _recreate_mdt(
+                        session, case_id, attempt_id, national_id, state,
+                        reason="UHI reprint returned 404")
+                log.info("  Re-merging with the corrected MDT form …")
+                merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
+                                                    report_pdf_bytes, patient_pdf_path)
+                log.info("  Retrying upload with the corrected merged PDF …")
+                final_request_no = call_with_reconnect(
+                    session, "Final upload (retry after UHI fix)", stage_upload_merged_pdf,
+                    session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
+                )
 
         # No R2 write happens here for either path. A cache-hit patient's
         # permanent copy was already correct before this run started. A
