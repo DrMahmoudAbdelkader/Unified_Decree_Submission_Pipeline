@@ -13,7 +13,17 @@ Requires the case's latest attempt to have document_review_status =
 module wiring notes) and a non-null pipeline_state (written by
 decree_submission_prepare.py). Anything else is treated as a
 configuration error, not silently skipped, since finalize should only
-ever be invoked for a specific, already-approved case.
+ever be invoked for a specific, already-approved case — WITH ONE
+DELIBERATE EXCEPTION: since prepare.py's merge-log fix, a cache-hit
+patient with nothing newly archived is fully submitted (or failed and
+requeued) by PREPARE ITSELF, without ever going through review, and its
+document_review_status ends up 'not_required' either way (see
+write_submission_result()). If finalize still gets invoked for such a
+case — a stale/queued "Approve & Continue" click from before prepare
+auto-resolved it, or a duplicate workflow dispatch — that is a redundant,
+harmless trigger, not a genuine misconfiguration, and is reported/skipped
+as such (status "already_submitted" / "skipped_wrong_entrypoint") rather
+than opening a misleading extra requirement or failing the whole run.
 
 RUN LOCALLY:
     export SUPABASE_URL=...  SUPABASE_SERVICE_ROLE_KEY=...
@@ -141,6 +151,50 @@ def finalize_one_case(session: SMCSession, case: dict) -> dict:
     attempt_id = attempt["id"]
 
     if attempt.get("document_review_status") != "approved":
+        # Since the merge-log fix (decree_submission_prepare.py's
+        # straight-through path), a case can reach 'not_required' WITHOUT
+        # ever having been staged for review: a cache-hit patient with
+        # nothing newly archived is fully handled by PREPARE itself
+        # (run_finalize_stages + write_submission_result), which sets
+        # document_review_status='not_required' regardless of whether that
+        # attempt SUCCEEDED or FAILED — see resolve_patient_document()'s
+        # and process_case()'s docstrings. If finalize gets invoked for
+        # such a case anyway (a stale/queued "Approve & Continue" click
+        # from before prepare auto-resolved it, or a duplicate workflow
+        # dispatch), it is NOT the same situation as a case that was
+        # genuinely staged for review and never approved - treating it
+        # the same way here used to open a misleading "submission_failed"
+        # requirement even for a case that had already SUCCEEDED, and
+        # failed the whole run (exit code 1) for something that isn't
+        # actually a problem.
+        if attempt.get("document_review_status") == "not_required":
+            if attempt.get("attempt_status") == "SUBMITTED":
+                # Already fully submitted via the straight-through prepare
+                # path. Report it plainly and do NOT open a requirement -
+                # there is nothing here for a human to act on.
+                log.info(f"  case {case_id}: already SUBMITTED via prepare's straight-through path "
+                         f"(website_request_id={attempt.get('website_request_id')}) - this finalize "
+                         f"call is redundant (stale trigger); skipping without opening a requirement.")
+                return {"case_id": case_id, "status": "already_submitted",
+                        "request_number": attempt.get("website_request_id")}
+            if case.get("case_status") == "READY_TO_SUBMIT":
+                # Prepare already tried the straight-through submission once
+                # and it FAILED - the real reason is already recorded as its
+                # own OPEN requirement from that run (see write_submission_
+                # result's failure branch). Finalize has no fresh
+                # pipeline_state/reviewed document to work from here (this
+                # case never went through the review flow that populates
+                # what finalize expects), so retrying belongs in PREPARE
+                # (which re-resolves the document itself), not here. Skip
+                # instead of opening a second, duplicate-looking requirement
+                # on top of the one that already explains the real failure.
+                log.info(f"  case {case_id}: already failed once via prepare's straight-through path "
+                         f"and is back at READY_TO_SUBMIT - finalize is the wrong entrypoint to retry "
+                         f"it from; skipping without opening a duplicate requirement.")
+                return {"case_id": case_id, "status": "skipped_wrong_entrypoint",
+                        "message": "Already failed via prepare's straight-through path; retry through "
+                                   "prepare, not finalize — see the existing OPEN requirement for the "
+                                   "real failure reason."}
         msg = (f"لا يمكن إكمال هذا الطلب — حالة مراجعة المستند الحالية هي "
                f"'{attempt.get('document_review_status')}' وليست 'approved'. "
                "يجب الموافقة على المستند من الوحدة أولاً.")
@@ -210,6 +264,8 @@ def main():
     summary = {
         "total": len(results),
         "submitted": sum(1 for r in results if r["status"] == "submitted"),
+        "already_submitted": sum(1 for r in results if r["status"] == "already_submitted"),
+        "skipped_wrong_entrypoint": sum(1 for r in results if r["status"] == "skipped_wrong_entrypoint"),
         "error": sum(1 for r in results if r["status"] == "error"),
         "linked_siblings_submitted": sum(
             1 for r in results for s in r.get("linked_siblings", []) if s["status"] == "submitted"
@@ -223,7 +279,12 @@ def main():
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"## Decree finalize run\n- Submitted: **{summary['submitted']}**\n"
                     f"- Also auto-submitted (linked to the same patient's approved document): "
-                    f"**{summary['linked_siblings_submitted']}**\n- Errors: **{summary['error']}**\n")
+                    f"**{summary['linked_siblings_submitted']}**\n"
+                    f"- Already submitted via prepare (redundant/stale finalize trigger — no action needed): "
+                    f"**{summary['already_submitted']}**\n"
+                    f"- Skipped — already failed via prepare, retry through prepare instead: "
+                    f"**{summary['skipped_wrong_entrypoint']}**\n"
+                    f"- Errors: **{summary['error']}**\n")
 
     if summary["error"] > 0:
         sys.exit(1)
