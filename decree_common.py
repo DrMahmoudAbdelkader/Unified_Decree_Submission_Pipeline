@@ -550,11 +550,19 @@ OPEN_REQUEST_EXEMPT_DIAG_CODES = {"AB45.6"}
 #
 # When a case fails AFTER its merged PDF was built (upload refused, compress
 # failed, ...), the ready-to-upload file is copied to FAILED_MERGED_DIR
-# together with a small .txt saying why. The workflows then run
-# publish_failed_pdfs.py, which stores that folder on the repo's
-# `failed-pdfs` branch for 10 days - so the case can be submitted by hand
-# without redoing sign / report / merge. Failures BEFORE the merge (tumor
-# type unrecognised, MDT print failed, ...) produce no PDF and save nothing.
+# together with a small .txt saying why - so the case can be submitted by
+# hand without redoing sign / report / merge. Failures BEFORE the merge
+# (tumor type unrecognised, MDT print failed, ...) produce no PDF and save
+# nothing.
+#
+# NOTE: this used to also be committed to the repo's `failed-pdfs` branch
+# by a separate publish_failed_pdfs.py workflow step, but that step was
+# removed (it was slow and redundant - see submit-decree-finalize.yml's
+# history). Both this FAILED_MERGED_DIR copy (PDF + .txt reason) and the
+# plain MERGED_PDF_DIR (== /tmp/decree_merged) are now picked up instead
+# by the existing "Upload run artifacts" workflow step, as a normal
+# (fast) GitHub Actions run artifact with 14-day retention - no repo
+# branch commit involved.
 # ---------------------------------------------------------------------
 FAILED_MERGED_DIR = "/tmp/decree_failed_merged"
 
@@ -771,19 +779,24 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
     state = dict(pipeline_state)   # kept in step with pre_request_id whenever an MDT is re-created
 
     try:
-        # NOTE: no DMS/CMIS archive merge happens here anymore. Per your
-        # latest instruction, that merge now happens during PREPARE, for
-        # a freshly-extracted document, BEFORE it's staged to pending/ for
-        # human review — see decree_submission_prepare.py's
-        # resolve_patient_document() (30-day window for a document that
-        # had to be extracted; the existing 7-day window is untouched for
-        # an R2-cache-hit document, exactly as it ran before). So by the
-        # time finalize resumes here, whatever the human reviewed/approved
-        # (via the document-review edge function, which uploads straight
-        # to the permanent R2 key) is already the fully-merged document —
-        # re-merging it a second time here would be redundant and would
-        # bypass the very review the human just did. This function only
-        # ever does: sign, build the report, merge, upload — nothing else.
+        # NOTE: no DMS/CMIS archive merge happens here anymore. That merge
+        # now happens during PREPARE, before this attempt ever reaches
+        # finalize — see decree_submission_prepare.py's
+        # resolve_patient_document(): a freshly-extracted document gets a
+        # 30-day window merge; an R2-cache-hit document is instead diffed
+        # against that patient's persisted merge log (r2_client.
+        # get_merged_archive_ids/save_merged_archive_ids +
+        # patient_pdf_dms_archive_fallback.merge_new_archive_docs_by_id) so
+        # only genuinely-new archive items get pulled — no day window, and
+        # no re-merging the same items on every run. So by the time
+        # finalize resumes here, whatever the human reviewed/approved (via
+        # the document-review edge function, which uploads straight to the
+        # permanent R2 key) — or whatever cache-hit document had nothing
+        # new to merge — is already the fully-merged document being
+        # submitted; re-merging it a second time here would be redundant
+        # and would bypass the very review the human just did. This
+        # function only ever does: sign, build the report, merge, upload —
+        # nothing else.
         log.info(f"  [Stage 2] Rendering + signing MDT form for pre_request_id={pre_request_id} …")
         try:
             mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign", stage_render_and_sign,

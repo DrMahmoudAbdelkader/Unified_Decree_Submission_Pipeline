@@ -26,9 +26,10 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Optional
+from typing import List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -194,4 +195,79 @@ def upload(national_id: str, local_path: str) -> bool:
         return True
     except ClientError as e:
         log.error(f"R2 upload failed for {national_id}: {e}")
+        return False
+
+
+# =====================================================================
+# DMS/CMIS ARCHIVE MERGE LOG — one small JSON object per patient,
+# recording exactly which archive item IDs (the verbatim
+# "dd/mm/yyyy HH:MM:SS AM/PM" data-id strings — see
+# patient_pdf_dms_archive_fallback.py) are already baked into that
+# patient's current document.
+#
+# WHY THIS EXISTS: the DMS archive merge used to be driven purely by a
+# rolling "last N days" window computed relative to *today*, re-run on
+# every submission. That meant the SAME archive items a patient's file
+# was already merged and reviewed with yesterday fell right back inside
+# today's window and got downloaded and appended AGAIN — duplicating
+# pages on every subsequent run for as long as they stayed inside the
+# window (up to 30 days), which regularly pushed the file back over
+# ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES and re-triggered a human review
+# for a patient who had already been reviewed and submitted. This log is
+# the fix: prepare.py now diffs the patient's CURRENT archive item list
+# against merged_ids here (see patient_pdf_dms_archive_fallback.
+# merge_new_archive_docs_by_id) and only ever pulls items that aren't in
+# this list yet — so a patient with nothing newly scanned since their
+# last merge produces zero new pages and goes straight to submission,
+# no matter how many days have passed.
+#
+# Lives in the SAME bucket as the permanent document cache, under its
+# own key prefix — never confused with either the permanent <id>.pdf
+# key or the pending/<id>.pdf staging key.
+# =====================================================================
+
+def _merge_log_key_for(national_id: str) -> str:
+    clean_id = "".join(c for c in national_id if c.isalnum())
+    return f"merge_log/{clean_id}.json"
+
+
+def get_merged_archive_ids(national_id: str) -> List[str]:
+    """Returns the list of DMS/CMIS archive item IDs already merged into
+    this patient's document on some earlier run, or [] if none recorded
+    yet (a genuinely first-time patient, or R2 not configured) — an
+    empty list is not an error, it just means "nothing to diff against,
+    treat every current archive item as new"."""
+    if not _configured():
+        return []
+    client = _get_client()
+    try:
+        resp = client.get_object(Bucket=R2_BUCKET_NAME, Key=_merge_log_key_for(national_id))
+        data = json.loads(resp["Body"].read().decode("utf-8"))
+        return list(data.get("merged_ids") or [])
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            return []
+        log.warning(f"R2 merge-log read failed for {national_id}: {e}")
+        return []
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+        log.warning(f"R2 merge-log for {national_id} was unreadable ({e}) — treating as empty.")
+        return []
+
+
+def save_merged_archive_ids(national_id: str, merged_ids: List[str]) -> bool:
+    """Persists the FULL current set of archive item IDs now baked into
+    this patient's document. Call this every time a DMS/CMIS merge
+    actually appends something — not just when the file also gets
+    promoted to the permanent cache — since the log's job is to record
+    what's been merged, not to gate on review status."""
+    if not _configured():
+        return False
+    client = _get_client()
+    try:
+        body = json.dumps({"merged_ids": list(merged_ids)}, ensure_ascii=False).encode("utf-8")
+        client.put_object(Bucket=R2_BUCKET_NAME, Key=_merge_log_key_for(national_id),
+                           Body=body, ContentType="application/json")
+        return True
+    except ClientError as e:
+        log.error(f"R2 merge-log write failed for {national_id}: {e}")
         return False

@@ -88,7 +88,11 @@ from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, 
     render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser, \
     find_and_verify_reusable_mdt, RECENT_ARCHIVE_DAYS_BACK
 from patient_pdf_website_fallback import download_patient_pdf_from_website
-from patient_pdf_dms_archive_fallback import refresh_local_pdf_with_recent_archive_docs
+from patient_pdf_dms_archive_fallback import (
+    refresh_local_pdf_and_get_merged_ids,
+    get_all_patient_archive_pdfs_merged_with_ids,
+    merge_new_archive_docs_by_id,
+)
 import supabase_client as sb
 import r2_client
 
@@ -101,14 +105,34 @@ import r2_client
 # This merge now happens here, during prepare, BEFORE the file is staged
 # to pending/ for review — not during finalize — so decree_common.
 # run_finalize_stages() never has to re-merge (see its own docstring).
+#
+# This is still a rolling day-window on purpose — it's only ever used for
+# a patient's FIRST extraction, when there's no merge log yet to diff
+# against. The result is recorded into that patient's merge log right
+# away (see resolve_patient_document() below) precisely so every run
+# AFTER this one has something real to diff against instead of falling
+# back to a window at all.
 PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 30
 
-# Archive window used for an R2 CACHE-HIT document. Was left equal to the
-# pipeline's RECENT_ARCHIVE_DAYS_BACK (7) with a comment saying "set to 30
-# if you want cache hits merged with the same 30-day window" — but that
-# change was never actually made. Applied now, per your instruction: same
-# 30-day window as a freshly-extracted document gets.
-CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK = 30
+# FIXED BUG (repeated-review loop): an R2 CACHE-HIT document used to be
+# refreshed with the same kind of rolling day-window as a freshly-
+# extracted one (this used to be CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK = 30).
+# Because the window is computed relative to *today* on every run, the
+# SAME archive item(s) already merged into a patient's file yesterday (or
+# any day inside the window) fell right back inside today's window and
+# were downloaded and re-appended AGAIN — duplicating pages on every
+# subsequent submission for that patient until the file crossed
+# ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES below and got routed back to human
+# review, even though nothing had actually changed in DMS. That's exactly
+# the "I review it once, submit it, and the next day it wants reviewing
+# again" bug.
+#
+# A cache-hit document is now refreshed with merge_new_archive_docs_by_id()
+# instead (patient_pdf_dms_archive_fallback.py), which diffs the patient's
+# CURRENT archive item list against a persisted per-patient merge log
+# (r2_client.get_merged_archive_ids/save_merged_archive_ids) — so it only
+# ever pulls items that were never merged before, no matter how many days
+# have passed. No day-window constant is needed for this path any more.
 
 # If merging DMS archive pages into an R2-cached document produces a file
 # bigger than this, the document is routed to human review (as if it had
@@ -326,49 +350,63 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
     same patient after the first one reuses the already-resolved result
     instead of hitting the network again.
 
-    ARCHIVE MERGE WINDOW, per your latest instruction:
+    ARCHIVE MERGE, per your latest instruction (log-based, not a rolling
+    day-window):
       - R2 CACHE HIT ("local" — this patient's document was already
         reviewed/approved on some earlier run): find_local_fn below is the
-        only override on this path; locate_patient_document_pdf() calls
-        the real refresh_local_pdf_with_recent_archive_docs() via _refresh_fn
-        below, which passes CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK (30, same
-        window as a freshly-extracted document — see that constant's own
-        comment for why this was bumped from 7), and finishes straight
-        through to submission in this same run — no human review needed.
-        If that merge actually appended pages and the result stays under
-        the size threshold, the merged file is also re-uploaded to R2's
-        permanent key (see the size-rule block below) so the merge
-        persists for every future run, not just this one's local /tmp copy.
+        only override on this path. Instead of re-sweeping a rolling day
+        window (the old behaviour — see CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK's
+        old comment above), _refresh_fn now loads this patient's merge log
+        (r2_client.get_merged_archive_ids — every DMS/CMIS archive item ID
+        already baked into their current document) and calls
+        merge_new_archive_docs_by_id(), which pulls ONLY archive items not
+        already in that log. If nothing new is found, the local file is
+        left completely untouched and this run submits straight through —
+        no re-merge, no review, exactly the "just use the Cloudflare copy
+        as-is" behaviour you asked for. If something new IS found and the
+        result stays under the size threshold, the merged file is
+        re-uploaded to R2's permanent key AND the merge log is updated
+        with the new item IDs (see the size-rule block below), so the
+        NEXT run's diff is against an up-to-date log rather than the same
+        old window catching the same old items again (the actual cause of
+        the repeated-review bug you ran into).
       - NEWLY EXTRACTED (not cached — had to be pulled from the SMC
-        website, or failing that the full CMIS archive): the website-
-        fallback branch now ALSO merges in the last
+        website, or failing that the full CMIS archive): unchanged in
+        spirit — the website-fallback branch still merges in the last
         PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK (30) days of DMS/
-        CMIS archive pages, so the human review that happens next (via
-        the app's document-review edge function) sees the fully merged
-        document, not just the bare extraction. This is the ONLY thing
-        that changed on this path — everything else (staging to
-        pending/, opening the review requirement, moving to the next
-        case) is untouched.
+        CMIS archive pages so the human review that follows sees the
+        fully merged document, not just the bare extraction. The ONE
+        addition: whatever archive item IDs that merge actually covered
+        (or, for the full-CMIS-archive fallback, every item the patient
+        has) are saved into this patient's merge log right away — see the
+        block after locate_patient_document_pdf() below — so this
+        patient's very NEXT submission (which will very likely be an R2
+        cache hit once this one is reviewed and approved) has a real log
+        to diff against from the start, instead of an empty one that
+        would make the whole 30-day window look "new" all over again.
 
-      SIZE RULE (added): an R2 cache hit that the DMS merge grew past
+      SIZE RULE (unchanged): an R2 cache hit that the DMS merge grew past
       ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES is returned as
       (path, OVERSIZE_DOC_SOURCE, True) — i.e. flagged as newly extracted so
       it takes the review path below rather than the straight-through one.
 
-      _extraction_state is a plain closure flag, not a global: it's
+      _extraction_state is a plain closure dict, not a global: it's
       created fresh for every call, so it can only ever reflect THIS
-      patient's resolution, never leak across patients or runs. It gets
-      set to True only if _website_fn below actually returns a path (a
-      genuine extraction) — never for a cache hit, and never for the
-      full-CMIS-archive fallback (which locate_patient_document_pdf never
-      calls refresh_fn for at all — that fallback already pulls every
-      archived page there is, so a 'last N days' merge on top of it would
-      be a no-op by construction, same as before this change).
+      patient's resolution, never leak across patients or runs.
+      "newly_extracted" is set True only if _website_fn below actually
+      returns a path (a genuine extraction). "archive_merged" is set True
+      only when a merge (window- or log-based) actually appended
+      something. "merged_ids" carries whatever the merge step(s) computed
+      as this patient's CURRENT full set of covered archive item IDs, so
+      it can be persisted to the merge log once — regardless of whether
+      this document ends up submitted straight through or routed to
+      human review, since the archive items are baked into the file
+      either way.
     """
     if national_id in doc_cache:
         return doc_cache[national_id]
 
-    extraction_state = {"newly_extracted": False, "archive_merged": False}
+    extraction_state = {"newly_extracted": False, "archive_merged": False, "merged_ids": None}
 
     def _website_fn(session_, base_url, patient_id, output_dir):
         path = download_patient_pdf_from_website(session_, base_url, patient_id, output_dir)
@@ -378,23 +416,61 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
 
     def _refresh_fn(patient_id, pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK):
         if extraction_state["newly_extracted"]:
-            days_back = PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK
-        else:
-            days_back = CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK
-        refreshed = refresh_local_pdf_with_recent_archive_docs(patient_id, pdf_path, days_back=days_back)
-        if refreshed:
-            # locate_patient_document_pdf() swallows this return value, so
-            # remember it here — the size rule below only applies when
-            # archive pages were ACTUALLY appended this run.
+            # First time this patient's document has ever been resolved
+            # this way — no merge log exists yet, so fall back to the
+            # rolling day-window (unchanged behaviour) and capture exactly
+            # which item IDs it covered, to seed the log below.
+            updated, ids = refresh_local_pdf_and_get_merged_ids(
+                patient_id, pdf_path, days_back=PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK)
+            if updated:
+                extraction_state["archive_merged"] = True
+                extraction_state["merged_ids"] = ids
+            return updated
+
+        # R2 cache hit — diff against the persisted merge log instead of
+        # any day window. This is the actual fix for the repeated-review
+        # bug: see merge_new_archive_docs_by_id()'s docstring.
+        already_merged_ids = r2_client.get_merged_archive_ids(patient_id)
+        updated, all_ids = merge_new_archive_docs_by_id(patient_id, pdf_path, already_merged_ids)
+        if updated:
             extraction_state["archive_merged"] = True
-        return refreshed
+            extraction_state["merged_ids"] = all_ids
+        return updated
+
+    def _full_archive_fn(patient_id, output_dir):
+        # Genuinely first-time patient — nothing on the SMC website
+        # either, falling all the way through to the full CMIS archive
+        # pull. Capture every item ID this covers (== the patient's whole
+        # archive history) so the merge log starts accurate from the very
+        # first document, not empty.
+        path, ids = get_all_patient_archive_pdfs_merged_with_ids(patient_id, output_dir)
+        if path:
+            extraction_state["merged_ids"] = ids
+        return path
 
     result = locate_patient_document_pdf(
         session, national_id,
         find_local_fn=make_r2_aware_finder(national_id),
         website_fn=_website_fn,
         refresh_fn=_refresh_fn,
+        full_archive_fn=_full_archive_fn,
     )
+
+    # Persist the merge log whenever we now know this patient's full set
+    # of covered archive item IDs — regardless of what happens next
+    # (straight-through submission or routed to review): the archive
+    # items are baked into the file either way, so the log should reflect
+    # that immediately rather than waiting on a review outcome we have no
+    # visibility into from here.
+    if extraction_state["merged_ids"] is not None:
+        if r2_client.save_merged_archive_ids(national_id, extraction_state["merged_ids"]):
+            log.info(f"  [merge log] {national_id}: recorded "
+                     f"{len(extraction_state['merged_ids'])} archive item(s) as merged.")
+        else:
+            log.warning(f"  [merge log] {national_id}: could not persist the merge log — "
+                        f"the next run may re-check items already covered by this document "
+                        f"(harmless: they'll just be found already-merged and skipped, at worst "
+                        f"re-diffed against CMIS once more).")
 
     # SIZE RULE: an R2 cache hit (source "local", newly_extracted False) is
     # normally submitted straight through with no review. But if the DMS
@@ -414,20 +490,13 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
                      f"routing to human review instead of submitting straight through.")
             result = (pdf_path, OVERSIZE_DOC_SOURCE, True)
         else:
-            # PERMANENT R2 UPDATE (new): a cache-hit document that just had
-            # fresh DMS/CMIS archive pages merged onto it, staying under
-            # the review threshold, is about to be submitted straight
-            # through using this merged copy — but until now the merge
-            # only ever lived in this run's /tmp file. The R2 permanent
-            # <national_id>.pdf key was never overwritten, so every future
-            # run re-derived the SAME "last CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK
-            # (7) days" merge from scratch instead of building on what was
-            # already found — meaning any DMS page that fell outside that
-            # rolling 7-day window before a run happened to catch it (e.g.
-            # a gap of more than 7 days between runs) was permanently
-            # missed. Promoting the merged file back to R2 now makes the
-            # merge durable: next run's cache hit already contains today's
-            # pages, and only needs to look for whatever's NEW since today.
+            # PERMANENT R2 UPDATE: a cache-hit document that just had fresh
+            # DMS/CMIS archive pages merged onto it, staying under the
+            # review threshold, is about to be submitted straight through
+            # using this merged copy — promote it back to R2's permanent
+            # key so every future run's cache hit already contains these
+            # pages (the merge log saved above already ensures the NEXT
+            # run's diff won't re-pull them either way).
             if r2_client.upload(national_id, pdf_path):
                 log.info(f"  [R2 permanent update] {national_id}: merged DMS pages promoted to the "
                          f"permanent R2 copy ({merged_size / (1024 * 1024):.2f} MB).")

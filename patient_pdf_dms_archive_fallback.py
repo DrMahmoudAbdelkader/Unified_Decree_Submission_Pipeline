@@ -394,6 +394,49 @@ def _open_patient_session(national_id: str) -> Optional[tuple]:
 # PUBLIC ENTRY POINT #1 - full extraction (patient has NO local PDF yet)
 # =====================================================================
 
+def _get_all_patient_archive_pdfs_merged_core(national_id: str, output_dir: str):
+    """Shared implementation for get_all_patient_archive_pdfs_merged()
+    (kept path-only, for backward compatibility with any existing
+    caller) and get_all_patient_archive_pdfs_merged_with_ids() (also
+    returns every archive item ID that ended up in the merged file, so
+    prepare.py can seed this patient's merge log the first time — see
+    r2_client.get_merged_archive_ids / save_merged_archive_ids and
+    merge_new_archive_docs_by_id() below). Returns (output_path_or_None,
+    all_ids)."""
+    opened = _open_patient_session(national_id)
+    if not opened:
+        return None, []
+    session, mr, archive_index_html = opened
+
+    all_dates = extract_archive_row_dates(archive_index_html)
+    if not all_dates:
+        log.info(f"  [DMS archive] MR {mr} has no archive rows at all.")
+        return None, []
+    log.info(f"  [DMS archive] MR {mr} has {len(all_dates)} archived item(s) - pulling all.")
+
+    gallery_html = call_archive_view_all(session, all_dates)
+    if not gallery_html:
+        return None, []
+
+    pdf_urls = parse_gallery_pdf_urls(gallery_html)
+    log.info(f"  [DMS archive] Resolved {len(pdf_urls)} downloadable PDF URL(s) for MR {mr}.")
+    if not pdf_urls:
+        return None, []
+
+    pdf_bytes_list = [b for b in (_download_pdf_bytes(session, u) for u in pdf_urls) if b]
+    if not pdf_bytes_list:
+        log.warning(f"  [DMS archive] Found PDF links for MR {mr} but none downloaded successfully.")
+        return None, []
+
+    clean_id = re.sub(r"[^0-9]", "", national_id) or str(mr)
+    output_path = os.path.join(output_dir, f"{clean_id}_archive.pdf")
+    if not _merge_pdf_bytes_list(pdf_bytes_list, output_path):
+        return None, []
+
+    log.info(f"  [DMS archive] ✅ Merged {len(pdf_bytes_list)} archived PDF(s) -> {output_path}")
+    return output_path, all_dates
+
+
 def get_all_patient_archive_pdfs_merged(national_id: str, output_dir: str) -> Optional[str]:
     """
     Pulls EVERY archived PDF for this patient and merges them into one
@@ -401,44 +444,98 @@ def get_all_patient_archive_pdfs_merged(national_id: str, output_dir: str) -> Op
     Returns the merged file's path, or None if the patient couldn't be
     found/authorized in CMIS, or they have zero archived documents.
     """
-    opened = _open_patient_session(national_id)
-    if not opened:
-        return None
-    session, mr, archive_index_html = opened
+    path, _ids = _get_all_patient_archive_pdfs_merged_core(national_id, output_dir)
+    return path
 
-    all_dates = extract_archive_row_dates(archive_index_html)
-    if not all_dates:
-        log.info(f"  [DMS archive] MR {mr} has no archive rows at all.")
-        return None
-    log.info(f"  [DMS archive] MR {mr} has {len(all_dates)} archived item(s) - pulling all.")
 
-    gallery_html = call_archive_view_all(session, all_dates)
-    if not gallery_html:
-        return None
+def get_all_patient_archive_pdfs_merged_with_ids(national_id: str, output_dir: str):
+    """Same as get_all_patient_archive_pdfs_merged(), but also returns
+    every archive item ID that ended up in the merged file (== every row
+    this patient has, since this is the full-history fallback). Use this
+    one from prepare.py instead of the plain version so the very first
+    time a patient's document is built this way, their merge log can be
+    seeded immediately — otherwise the next run would have no log to
+    diff against and would (incorrectly) treat this patient's entire
+    archive history as "new" all over again.
 
-    pdf_urls = parse_gallery_pdf_urls(gallery_html)
-    log.info(f"  [DMS archive] Resolved {len(pdf_urls)} downloadable PDF URL(s) for MR {mr}.")
-    if not pdf_urls:
-        return None
-
-    pdf_bytes_list = [b for b in (_download_pdf_bytes(session, u) for u in pdf_urls) if b]
-    if not pdf_bytes_list:
-        log.warning(f"  [DMS archive] Found PDF links for MR {mr} but none downloaded successfully.")
-        return None
-
-    clean_id = re.sub(r"[^0-9]", "", national_id) or str(mr)
-    output_path = os.path.join(output_dir, f"{clean_id}_archive.pdf")
-    if not _merge_pdf_bytes_list(pdf_bytes_list, output_path):
-        return None
-
-    log.info(f"  [DMS archive] ✅ Merged {len(pdf_bytes_list)} archived PDF(s) -> {output_path}")
-    return output_path
+    Returns (output_path_or_None, all_ids).
+    """
+    return _get_all_patient_archive_pdfs_merged_core(national_id, output_dir)
 
 
 # =====================================================================
 # PUBLIC ENTRY POINT #2 - incremental refresh (patient ALREADY has a
 # local PDF; only pull today/yesterday's new archive items and append)
 # =====================================================================
+
+def _refresh_local_pdf_by_window_core(national_id: str, existing_local_pdf_path: str,
+                                       reference_date: Optional[date], days_back: int):
+    """Shared implementation behind refresh_local_pdf_with_recent_archive_docs()
+    (kept bool-only, for backward compatibility with any existing caller)
+    and refresh_local_pdf_and_get_merged_ids() (also returns which archive
+    item IDs fell inside the window and were actually merged in, so
+    prepare.py can seed a patient's merge log the first time their
+    document is built this way). Returns (updated: bool, ids_merged:
+    List[str]) — ids_merged is [] whenever updated is False.
+    """
+    if not os.path.exists(existing_local_pdf_path):
+        log.warning(f"  [DMS archive refresh] {existing_local_pdf_path} does not exist - "
+                    f"use get_all_patient_archive_pdfs_merged() instead for a first-time pull.")
+        return False, []
+
+    opened = _open_patient_session(national_id)
+    if not opened:
+        return False, []
+    session, mr, archive_index_html = opened
+
+    all_dates = extract_archive_row_dates(archive_index_html)
+    ref = reference_date or datetime.now().date()
+    days_back = max(days_back, 0)
+    cutoff_days = {ref - timedelta(days=n) for n in range(days_back + 1)}
+    recent_dates = [d for d in all_dates if _parse_row_date(d) in cutoff_days]
+
+    if not recent_dates:
+        log.info(f"  [DMS archive refresh] MR {mr} has no archive items dated between "
+                 f"{ref - timedelta(days=days_back)} and {ref} ({days_back}-day window) - "
+                 f"local file left unchanged.")
+        return False, []
+
+    log.info(f"  [DMS archive refresh] MR {mr} has {len(recent_dates)} recent archive item(s) "
+             f"({recent_dates}) - pulling them.")
+    gallery_html = call_archive_view_all(session, recent_dates)
+    if not gallery_html:
+        return False, []
+
+    pdf_urls = parse_gallery_pdf_urls(gallery_html)
+    if not pdf_urls:
+        log.info(f"  [DMS archive refresh] MR {mr}'s recent archive rows resolved to zero "
+                 f"downloadable PDF URLs - local file left unchanged.")
+        return False, []
+
+    new_pdf_bytes = [b for b in (_download_pdf_bytes(session, u) for u in pdf_urls) if b]
+    if not new_pdf_bytes:
+        log.warning(f"  [DMS archive refresh] Found {len(pdf_urls)} recent PDF link(s) for MR {mr} "
+                    f"but none downloaded successfully - local file left unchanged.")
+        return False, []
+
+    # Build the merged file (existing local pages FIRST, new pages
+    # appended after) into a temp path, then swap it in - so a failure
+    # partway through never corrupts or truncates the existing file.
+    tmp_path = existing_local_pdf_path + ".refresh_tmp"
+    with open(existing_local_pdf_path, "rb") as f:
+        existing_bytes = f.read()
+    ok = _merge_pdf_bytes_list([existing_bytes] + new_pdf_bytes, tmp_path)
+    if not ok:
+        log.warning(f"  [DMS archive refresh] Merge failed for MR {mr} - local file left unchanged.")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return False, []
+
+    os.replace(tmp_path, existing_local_pdf_path)
+    log.info(f"  [DMS archive refresh] ✅ Appended {len(new_pdf_bytes)} new page-set(s) into "
+             f"{existing_local_pdf_path}")
+    return True, recent_dates
+
 
 def refresh_local_pdf_with_recent_archive_docs(national_id: str, existing_local_pdf_path: str,
                                                 reference_date: Optional[date] = None,
@@ -462,66 +559,142 @@ def refresh_local_pdf_with_recent_archive_docs(national_id: str, existing_local_
     production; the days_back=7 default here only applies if this
     function is called directly without that override.
 
+    NOTE: this is a pure rolling day-window - it re-checks the SAME
+    window every call and does not know what was already merged on a
+    previous run, so calling it repeatedly for the same patient within
+    `days_back` days of a previous merge WILL re-download and re-append
+    the same archive items again. Kept as-is (bool return, no ID
+    tracking) purely for backward compatibility with any existing
+    caller. For a patient whose document already lives in the permanent
+    R2 cache, prepare.py now uses merge_new_archive_docs_by_id() instead,
+    which diffs against a persisted per-patient log and never re-merges
+    the same item twice - see that function's docstring for why.
+
     Returns True if the local file was updated (new pages appended),
     False if nothing new was found or anything along the way failed (in
     which case the existing local file is left completely untouched -
     this function never deletes or empties it, only ever appends to a
     fresh copy and swaps it in on success).
     """
+    updated, _ids = _refresh_local_pdf_by_window_core(national_id, existing_local_pdf_path,
+                                                       reference_date, days_back)
+    return updated
+
+
+def refresh_local_pdf_and_get_merged_ids(national_id: str, existing_local_pdf_path: str,
+                                          reference_date: Optional[date] = None,
+                                          days_back: int = 7):
+    """Same day-window merge as refresh_local_pdf_with_recent_archive_docs(),
+    but also returns which archive item IDs were actually merged in this
+    call. Use this (not the plain bool version) the first time a
+    patient's document is built via this window-based path, so the
+    result can be saved via r2_client.save_merged_archive_ids() and seed
+    that patient's merge log - otherwise the very next run would have
+    nothing to diff against and would re-treat this same window's items
+    as new all over again the moment the document becomes an R2 cache
+    hit.
+
+    Returns (updated: bool, ids_merged: List[str]).
+    """
+    return _refresh_local_pdf_by_window_core(national_id, existing_local_pdf_path,
+                                              reference_date, days_back)
+
+
+def merge_new_archive_docs_by_id(national_id: str, existing_local_pdf_path: str,
+                                  already_merged_ids: Optional[List[str]]):
+    """
+    DIFF-BASED replacement for the day-window refresh above, used for an
+    R2 CACHE-HIT patient (a document that was already reviewed, approved,
+    and promoted to the permanent cache on some earlier run).
+
+    THE BUG THIS FIXES: the old approach re-ran a rolling "last N days"
+    window on every submission, relative to *today* - so archive items
+    that were already merged into this patient's file yesterday (or any
+    day within the window) fell right back inside today's window and got
+    downloaded and appended AGAIN, duplicating pages on every subsequent
+    run for as long as they stayed inside the window. That silently
+    bloated the file until it crossed ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES
+    and re-triggered a human review for a patient who had already been
+    reviewed and submitted - exactly the "I keep getting asked to review
+    the same patient's file again" symptom.
+
+    THE FIX: already_merged_ids is the persisted list of archive item IDs
+    (the exact "dd/mm/yyyy HH:MM:SS AM/PM" data-id strings - see this
+    module's docstring) already baked into this patient's current
+    document (see r2_client.get_merged_archive_ids()). This function
+    fetches the patient's CURRENT full archive item list from CMIS and
+    downloads/appends ONLY the ones not already in that set - no day
+    window at all, so it can never re-merge the same item twice no
+    matter how long it's been since the last run. If a patient has had
+    NOTHING newly scanned into DMS since their last merge, this finds
+    zero new items and leaves the local file completely untouched.
+
+    Returns (updated, all_ids_now_covered):
+      - updated=False, all_ids_now_covered=already_merged_ids (unchanged)
+        -> nothing new since the log was last saved; existing_local_pdf_path
+           is left untouched. The caller should submit straight through
+           with NO review and should NOT rewrite the merge log (nothing
+           changed, nothing to save).
+      - updated=True, all_ids_now_covered=<already_merged_ids + the newly
+        merged ones> -> existing_local_pdf_path was overwritten with the
+        new archive pages appended. The caller should re-check the size
+        threshold as before and, whichever way that goes, persist
+        all_ids_now_covered via r2_client.save_merged_archive_ids() so
+        the next run's diff is against an up-to-date log.
+    """
+    already_merged_ids = list(already_merged_ids or [])
     if not os.path.exists(existing_local_pdf_path):
-        log.warning(f"  [DMS archive refresh] {existing_local_pdf_path} does not exist - "
-                    f"use get_all_patient_archive_pdfs_merged() instead for a first-time pull.")
-        return False
+        log.warning(f"  [DMS archive diff] {existing_local_pdf_path} does not exist - "
+                    f"use get_all_patient_archive_pdfs_merged_with_ids() instead for a "
+                    f"first-time pull.")
+        return False, already_merged_ids
 
     opened = _open_patient_session(national_id)
     if not opened:
-        return False
+        return False, already_merged_ids
     session, mr, archive_index_html = opened
 
-    all_dates = extract_archive_row_dates(archive_index_html)
-    ref = reference_date or datetime.now().date()
-    days_back = max(days_back, 0)
-    cutoff_days = {ref - timedelta(days=n) for n in range(days_back + 1)}
-    recent_dates = [d for d in all_dates if _parse_row_date(d) in cutoff_days]
+    all_ids = extract_archive_row_dates(archive_index_html)
+    already = set(already_merged_ids)
+    new_ids = [d for d in all_ids if d not in already]
 
-    if not recent_dates:
-        log.info(f"  [DMS archive refresh] MR {mr} has no archive items dated between "
-                 f"{ref - timedelta(days=days_back)} and {ref} ({days_back}-day window) - "
-                 f"local file left unchanged.")
-        return False
+    if not new_ids:
+        log.info(f"  [DMS archive diff] MR {mr}: no archive items beyond the "
+                 f"{len(already_merged_ids)} already recorded merged before - "
+                 f"local file left unchanged, no review needed.")
+        return False, already_merged_ids
 
-    log.info(f"  [DMS archive refresh] MR {mr} has {len(recent_dates)} recent archive item(s) "
-             f"({recent_dates}) - pulling them.")
-    gallery_html = call_archive_view_all(session, recent_dates)
+    log.info(f"  [DMS archive diff] MR {mr}: {len(new_ids)} newly archived item(s) not yet "
+             f"merged ({new_ids}) - pulling them.")
+    gallery_html = call_archive_view_all(session, new_ids)
     if not gallery_html:
-        return False
+        return False, already_merged_ids
 
     pdf_urls = parse_gallery_pdf_urls(gallery_html)
     if not pdf_urls:
-        log.info(f"  [DMS archive refresh] MR {mr}'s recent archive rows resolved to zero "
+        log.info(f"  [DMS archive diff] MR {mr}'s new archive rows resolved to zero "
                  f"downloadable PDF URLs - local file left unchanged.")
-        return False
+        return False, already_merged_ids
 
     new_pdf_bytes = [b for b in (_download_pdf_bytes(session, u) for u in pdf_urls) if b]
     if not new_pdf_bytes:
-        log.warning(f"  [DMS archive refresh] Found {len(pdf_urls)} recent PDF link(s) for MR {mr} "
+        log.warning(f"  [DMS archive diff] Found {len(pdf_urls)} new PDF link(s) for MR {mr} "
                     f"but none downloaded successfully - local file left unchanged.")
-        return False
+        return False, already_merged_ids
 
-    # Build the merged file (existing local pages FIRST, new pages
-    # appended after) into a temp path, then swap it in - so a failure
-    # partway through never corrupts or truncates the existing file.
     tmp_path = existing_local_pdf_path + ".refresh_tmp"
     with open(existing_local_pdf_path, "rb") as f:
         existing_bytes = f.read()
     ok = _merge_pdf_bytes_list([existing_bytes] + new_pdf_bytes, tmp_path)
     if not ok:
-        log.warning(f"  [DMS archive refresh] Merge failed for MR {mr} - local file left unchanged.")
+        log.warning(f"  [DMS archive diff] Merge failed for MR {mr} - local file left unchanged.")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return False
+        return False, already_merged_ids
 
     os.replace(tmp_path, existing_local_pdf_path)
-    log.info(f"  [DMS archive refresh] ✅ Appended {len(new_pdf_bytes)} new page-set(s) into "
-             f"{existing_local_pdf_path}")
-    return True
+    updated_ids = already_merged_ids + new_ids
+    log.info(f"  [DMS archive diff] ✅ Appended {len(new_pdf_bytes)} new page-set(s) into "
+             f"{existing_local_pdf_path} - {len(updated_ids)} archive item(s) now recorded "
+             f"merged for MR {mr}.")
+    return True, updated_ids
