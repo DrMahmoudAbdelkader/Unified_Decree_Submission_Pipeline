@@ -539,8 +539,18 @@ _add_generic_tumor_type("gynecological_cancer", "Gynecological Cancer", "أور�
 # not bare "C56" - corrected to match what the app actually sends. This
 # no longer shares a code with gynecological_cancer (C56); if that
 # shared-code behavior was actually wanted, revert this one line.
-_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56.9",
-                         extra_aliases=["ovarian_cancer"])
+# CORRECTED AGAIN (Sept 28 2026): SMC's own ICD table uses bare "C56" for ovarian
+# cancer - "C56.9" (what the app's decree_treatment_plans sends) is NOT an SMC
+# code, and an MDT created with an unknown code can never be converted into a
+# request (Requests/Create 404s; same failure as uterine C54.9 -> C54). So the
+# earlier "C56.9" correction above was wrong for SMC; "C56.9" stays only as an
+# INPUT alias so app-side/Excel values still resolve to this entry.
+_add_generic_tumor_type("ovarian_cancer", "OVARIAN CANCER", "سرطان المبيض", "C56",
+                         extra_aliases=["ovarian_cancer", "c56.9"])
+# _add_generic_tumor_type auto-registers diag_code.lower() as an alias, which
+# would now steal bare "c56" from gynecological_cancer (same code, registered
+# first). Keep the pre-existing meaning of a bare "C56" input.
+_EXTRA_ALIASES["c56"] = "gynecological_cancer"
 
 # Explicitly requested addition - Thyroid Gland Tumor, diag_code C73 as
 # supplied. english_label is set to match the exact Column C spelling
@@ -671,7 +681,12 @@ del _cid, _elabel, _arname, _dcode
 # speciality/proc data - override per-entry if SMC needs different
 # committee routing for any of these.
 _REAL_DATA_ADDITIONS = [
-    ("uterine_cancer",          "Uterine Cancer",                                    "ورم خبيث بالرحم",              "C54.9"),
+    # SMC's own ICD table only has "C54" for this diagnosis (verified against a real
+    # manual submission: GetDiagnosisWithMedProc -> ICD10CODE "C54", DIAGNOSISARABICNAME
+    # "ورم خبيث بالرحم"). "C54.9" (what the app's own decree_treatment_plans sends)
+    # does NOT exist on SMC: PreRequest/Create still accepts it, but the MDT it creates
+    # can never be converted (Requests/Create?prid=... -> 404). See resolve_smc_diagnosis().
+    ("uterine_cancer",          "Uterine Cancer",                                    "ورم خبيث بالرحم",              "C54"),
     ("gallbladder_cancer",      "Gallbladder Cancer",                                "ورم خبيث بالمرارة",             "C23"),
     ("tonsil_cancer",           "Tonsil Cancer",                                     "ورم خبيث باللوزتين",            "C09.9"),
     ("thymus_cancer",           "Thymic Cancer",                                     "ورم بالغدة الثيموسية",          "C37"),
@@ -971,11 +986,12 @@ TUMOR_TYPE_ALIASES = {
     "ورم بالمخ والغده النخاميه": "brain_cns",         # U37.6
     # RESOLVED (previously left deliberately unmapped below): confirmed via
     # the real decree_treatment_plans data that "ورم خبيث بالرحم" (uterus)
-    # carries diagnosis_codes = ["C54.9"] - genuinely NOT the same organ as
+    # carries diagnosis_codes = ["C54.9"] (SMC itself uses "C54") - genuinely NOT the same organ as
     # cervical_cancer (C53.9, the cervix), so it now points at its own
     # uterine_cancer entry (Batch 5, above) rather than being folded into
     # cervical_cancer.
-    "ورم خبيث بالرحم": "uterine_cancer",              # C54.9
+    "ورم خبيث بالرحم": "uterine_cancer",              # SMC code C54
+    "c54.9": "uterine_cancer",                        # legacy app-side code; SMC only knows C54
     # Wording/spelling variants of an already-registered exact-match alias
     # or arabic_name, confirmed against the real data to carry the SAME
     # diag_code as their canonical sibling - alias-only additions, no new
@@ -1691,8 +1707,8 @@ class SMCSession:
         except Exception:
             return []
 
-    def get_diagnosis_with_med_proc(self, diag_code: str) -> List[Dict]:
-        r = self._get(f"{BASE_URL}/smc/Requests/GetDiagnosisWithMedProc", params={"diagName": "", "diagCode": diag_code})
+    def get_diagnosis_with_med_proc(self, diag_code: str, diag_name: str = "") -> List[Dict]:
+        r = self._get(f"{BASE_URL}/smc/Requests/GetDiagnosisWithMedProc", params={"diagName": diag_name, "diagCode": diag_code})
         try:
             return r.json() if r is not None else []
         except Exception:
@@ -2058,8 +2074,10 @@ class SMCSession:
             # exists against this MDT.
             raise MDTCreatePageNotFoundError(
                 f"Could not load Requests/Create page for prid={pre_request_id} (non-200/404) - "
-                f"this MDT's create-request form appears unavailable, most likely because a "
-                f"Request was already created against it."
+                f"this MDT's create-request form appears unavailable. Either a Request was "
+                f"already created against it, OR the MDT was created with a diagnosis code SMC "
+                f"does not recognise (PreRequest/Create accepts unknown codes but such an MDT can "
+                f"never be converted)."
             )
 
         soup = BeautifulSoup(r.text, "html.parser")
@@ -3191,6 +3209,65 @@ def find_and_verify_reusable_mdt(session: SMCSession, national_id: str,
     return {"pre_request_id": candidate_pre_request_id, "full_name": full_name, "warnings": [], "reused": True}
 
 
+class InvalidDiagnosisCodeError(RowProcessingError):
+    """The diagnosis code we were about to put on an MDT does not exist in
+    SMC's own ICD table (and no parent code / same-name entry does either).
+
+    WHY THIS MATTERS (confirmed from a manual-vs-script HAR comparison,
+    uterine cancer, app code "C54.9" vs SMC's real "C54"): PreRequest/Create
+    happily ACCEPTS an unknown INITIALICD10CODE and returns a normal MDT
+    number + printable form, but Requests/Create?action=HopitalCreateNewRequest
+    &prid=<that MDT> then answers a flat HTTP 404 forever. It looked like a
+    server glitch / "MDT already consumed", and recreating the MDT with the
+    same bad code just produced another dead MDT each time. Failing here,
+    BEFORE any MDT is created, stops that loop."""
+
+
+def _norm_ar(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def resolve_smc_diagnosis(session: "SMCSession", diag_code: str, arabic_name: str = "") -> Optional[Tuple[str, str]]:
+    """Maps the diagnosis code our tumor table carries onto a code SMC really
+    has. Returns (icd10_code, arabic_diagnosis_name) exactly as SMC spells
+    them, or None if nothing matched.
+
+    Order: (1) exact ICD10CODE match for the code as given; (2) exact match
+    on each parent code (C54.9 -> C54); (3) exact Arabic-name match through
+    the same name search the site's own diagnosis box uses. Matching is on
+    the ICD10CODE FIELD, never on 'first row returned', because the lookup
+    is a fuzzy search and can return unrelated rows first."""
+    code = (diag_code or "").strip()
+
+    def pick(matches, wanted: str):
+        for m in matches or []:
+            if str(m.get("ICD10CODE") or "").strip().lower() == wanted.strip().lower():
+                return m
+        return None
+
+    m = pick(session.get_diagnosis_with_med_proc(code), code)
+    if m:
+        return str(m["ICD10CODE"]).strip(), _norm_ar(m.get("DIAGNOSISARABICNAME"))
+
+    parent = code
+    while "." in parent:
+        parent = parent.rsplit(".", 1)[0]
+        m = pick(session.get_diagnosis_with_med_proc(parent), parent)
+        if m:
+            log.warning(f"    Diagnosis code {code!r} does not exist on SMC - using its parent "
+                        f"{m['ICD10CODE']!r} ({_norm_ar(m.get('DIAGNOSISARABICNAME'))}) instead.")
+            return str(m["ICD10CODE"]).strip(), _norm_ar(m.get("DIAGNOSISARABICNAME"))
+
+    if arabic_name:
+        want = _norm_ar(arabic_name)
+        for m in session.get_diagnosis_with_med_proc("", diag_name=want) or []:
+            if _norm_ar(m.get("DIAGNOSISARABICNAME")) == want and m.get("ICD10CODE"):
+                log.warning(f"    Diagnosis code {code!r} does not exist on SMC - using {m['ICD10CODE']!r} "
+                            f"found by its exact Arabic name {want!r}.")
+                return str(m["ICD10CODE"]).strip(), want
+    return None
+
+
 def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tumor_cfg: Dict) -> Dict:
     """
     Runs the full MDT-creation sequence. Safe to re-run from scratch if
@@ -3226,8 +3303,21 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
 
     session.get_regions_by_city(city_id)
     session.get_diagnosis_data(DIAGNOSIS_GROUP_ONCOLOGY)
-    diag_matches = session.get_diagnosis_with_med_proc(tumor_cfg["diag_code"])
-    initial_icd10_name = diag_matches[0]["DIAGNOSISARABICNAME"] if diag_matches else ""
+    # Validate/repair the diagnosis code against SMC's own table BEFORE creating
+    # anything - an unknown code creates an MDT that can never become a request
+    # (Requests/Create 404s). See InvalidDiagnosisCodeError.
+    resolved = resolve_smc_diagnosis(session, tumor_cfg["diag_code"], tumor_cfg.get("arabic_name", ""))
+    if not resolved:
+        raise InvalidDiagnosisCodeError(
+            f"Diagnosis code {tumor_cfg['diag_code']!r} ({tumor_cfg.get('arabic_name', '')}) is not in SMC's "
+            f"diagnosis table (no exact code, parent-code or Arabic-name match), so an MDT created with it "
+            f"could never be converted into a request. No MDT was created. Fix this tumor type's diag_code "
+            f"to the code SMC's own diagnosis search returns."
+        )
+    resolved_code, resolved_name = resolved
+    if resolved_code.lower() != tumor_cfg["diag_code"].strip().lower():
+        tumor_cfg = dict(tumor_cfg, diag_code=resolved_code)   # local copy; caller's cfg untouched
+    initial_icd10_name = resolved_name
 
     department_id = session.get_department_by_diagnosis(tumor_cfg["diag_code"])
     if not department_id:
