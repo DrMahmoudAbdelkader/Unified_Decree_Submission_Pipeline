@@ -31,7 +31,7 @@ For each READY_TO_SUBMIT case:
        - NOT CACHED (genuinely new, or R2 not configured): falls through
          to the live SMC-website / CMIS-archive fallback extraction,
          same as before. If the SMC-website fallback finds it, this ALSO
-         merges in the last 30 days of DMS/CMIS archive pages onto that
+         merges in the last 7 days of DMS/CMIS archive pages onto that
          freshly-downloaded file (see resolve_patient_document() /
          PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK below) — so the
          human review that follows sees the fully merged document, not
@@ -98,10 +98,10 @@ import r2_client
 
 # How far back to look in the DMS/CMIS archive when a patient's document
 # had to be freshly EXTRACTED this run (not an R2 cache hit) — widened
-# from the pipeline's normal RECENT_ARCHIVE_DAYS_BACK (7, unchanged, still
-# used for a cache-hit patient exactly as before) per your instruction,
-# so the human reviewing the freshly-extracted file sees it WITH the last
-# month of archive pages already merged in, not just the bare extraction.
+# from the pipeline's normal RECENT_ARCHIVE_DAYS_BACK (7). This was 30 and
+# has been set back to 7 per your instruction, so the human reviewing the
+# freshly-extracted file sees it WITH only the last week of archive pages
+# already merged in, not just the bare extraction.
 # This merge now happens here, during prepare, BEFORE the file is staged
 # to pending/ for review — not during finalize — so decree_common.
 # run_finalize_stages() never has to re-merge (see its own docstring).
@@ -112,7 +112,7 @@ import r2_client
 # away (see resolve_patient_document() below) precisely so every run
 # AFTER this one has something real to diff against instead of falling
 # back to a window at all.
-PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 30
+PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 7
 
 # FIXED BUG (repeated-review loop): an R2 CACHE-HIT document used to be
 # refreshed with the same kind of rolling day-window as a freshly-
@@ -373,7 +373,7 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
       - NEWLY EXTRACTED (not cached — had to be pulled from the SMC
         website, or failing that the full CMIS archive): unchanged in
         spirit — the website-fallback branch still merges in the last
-        PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK (30) days of DMS/
+        PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK (7) days of DMS/
         CMIS archive pages so the human review that follows sees the
         fully merged document, not just the bare extraction. The ONE
         addition: whatever archive item IDs that merge actually covered
@@ -383,7 +383,7 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
         patient's very NEXT submission (which will very likely be an R2
         cache hit once this one is reviewed and approved) has a real log
         to diff against from the start, instead of an empty one that
-        would make the whole 30-day window look "new" all over again.
+        would make the whole 7-day window look "new" all over again.
 
       SIZE RULE (unchanged): an R2 cache hit that the DMS merge grew past
       ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES is returned as
