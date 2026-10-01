@@ -15,46 +15,36 @@ For each READY_TO_SUBMIT case:
   3. Locates the patient document via locate_patient_document_pdf(),
      with a custom find_local_fn that checks the PERMANENT R2 cache
      first (see r2_client.py) instead of a local folder that doesn't
-     exist on this runner.
-       - R2 CACHE HIT (already reviewed and approved for this patient
-         before): treated as a "local" find by locate_patient_document_pdf
-         (newly_extracted=False) — no review needed. This run continues
-         straight through Stages 2-6 (decree_common.run_finalize_stages)
-         and finishes the submission in the SAME run. If merging the last
-         CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK days of DMS/CMIS archive pages
-         onto it actually appended pages and the result stays under
-         ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES, the merged copy is also
-         promoted back to R2's permanent <national_id>.pdf key (see
-         resolve_patient_document()) — so the merge is durable and every
-         future run's cache hit already contains it, instead of the merge
-         only ever living in this run's local /tmp copy.
-       - NOT CACHED (genuinely new, or R2 not configured): falls through
-         to the live SMC-website / CMIS-archive fallback extraction,
-         same as before. If the SMC-website fallback finds it, this ALSO
-         merges in the last 7 days of DMS/CMIS archive pages onto that
-         freshly-downloaded file (see resolve_patient_document() /
-         PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK below) — so the
-         human review that follows sees the fully merged document, not
-         the bare extraction. Because this is freshly extracted, per the
-         two-phase decision, this run STOPS here — uploads the (already
-         merged) PDF to R2's pending/<national_id>.pdf key (see
-         r2_client.py; same bucket as the permanent cache, different
-         prefix — NOT Supabase Storage), saves everything decree_
-         submission_finalize.py will need to resume, and opens a
-         requirement asking a human to review it in the module before the
-         actual signing/merging/upload happens. decree_submission_
-         finalize.py never re-merges archive pages — that already
-         happened here, before the human ever saw the file.
-       - R2 CACHE HIT BUT OVERSIZED AFTER THE DMS MERGE: a cache hit is
-         normally submitted straight through with no review. The one
-         exception: if merging the recent DMS/CMIS archive pages into that
-         cached document actually appended pages AND the resulting file is
-         larger than ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES (default 4 MB,
-         env ARCHIVE_MERGE_REVIEW_MB), it is treated EXACTLY like a
-         freshly-extracted document: staged to R2 pending/<national_id>.pdf,
-         a review requirement is opened, and finalize resumes only after a
-         human approves it. See resolve_patient_document() (detection) and
-         OVERSIZE_DOC_SOURCE below.
+     exist on this runner. Three outcomes (ARCHIVE_WINDOW_DAYS, default 7,
+     is the only day-count involved):
+
+       A. R2 CACHE HIT, NOTHING NEW (already labeled; no DMS/CMIS archive
+          paper dated inside the window is missing from the patient's merge
+          log): no review. This run continues straight through Stages 2-6
+          (decree_common.run_finalize_stages) and finishes the submission in
+          the SAME run.
+
+       B. R2 CACHE HIT, NEW ARCHIVE PAPERS (window minus merge log is not
+          empty): the labeled file is NOT shown again. Only the new pages are
+          downloaded into a small separate PDF and staged at R2
+          pending/<national_id>.pdf with pipeline_state.review_mode="delta"
+          for the operator to label. On approval the document-review edge
+          function stores the labeled pages at delta/<national_id>.pdf, and
+          decree_submission_finalize.py appends them to the permanent labeled
+          file, uploads it, records the papers in the merge log, then
+          continues to submission. See resolve_patient_document().
+
+       C. NOT IN R2 (first time this patient is seen): falls through to the
+          live SMC-website / CMIS-archive extraction.
+            - Found on the SMC website: the same window of DMS pages is
+              merged onto it, and the WHOLE file goes to review.
+            - Only in DMS: the full archive is pulled (every paper is
+              already in it, no window) and the WHOLE file goes to review.
+          Either way the run STOPS here: the file is uploaded to R2
+          pending/<national_id>.pdf (review_mode="full"), everything
+          decree_submission_finalize.py needs is saved, and a requirement
+          asks a human to review it in the module. The labeler saves the
+          result to the permanent <national_id>.pdf key.
        - SAME-PATIENT SIBLINGS: if another case for this same national_id
          already has an attempt sitting at pending_review earlier in THIS
          run, this case is never uploaded/reviewed a second time — see
@@ -78,7 +68,10 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+
+from PyPDF2 import PdfReader
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -86,66 +79,52 @@ import decree_common as common
 from Unified_Decree_Submission_Pipeline import SMCSession, call_with_reconnect, stage_create_mdt, \
     locate_patient_document_pdf, resolve_tumor_type, resolve_request_category, resolve_effective_proc_id, \
     render_print_page_to_pdf, apply_signatures_and_stamp, shutdown_shared_browser, \
-    find_and_verify_reusable_mdt, RECENT_ARCHIVE_DAYS_BACK
+    find_and_verify_reusable_mdt
 from patient_pdf_website_fallback import download_patient_pdf_from_website
 from patient_pdf_dms_archive_fallback import (
     refresh_local_pdf_and_get_merged_ids,
     get_all_patient_archive_pdfs_merged_with_ids,
-    merge_new_archive_docs_by_id,
+    collect_recent_archive_delta,
 )
 import supabase_client as sb
 import r2_client
 
-# How far back to look in the DMS/CMIS archive when a patient's document
-# had to be freshly EXTRACTED this run (not an R2 cache hit) — widened
-# from the pipeline's normal RECENT_ARCHIVE_DAYS_BACK (7). This was 30 and
-# has been set back to 7 per your instruction, so the human reviewing the
-# freshly-extracted file sees it WITH only the last week of archive pages
-# already merged in, not just the bare extraction.
-# This merge now happens here, during prepare, BEFORE the file is staged
-# to pending/ for review — not during finalize — so decree_common.
-# run_finalize_stages() never has to re-merge (see its own docstring).
+# =====================================================================
+# DMS/CMIS ARCHIVE RULES — ONE window, used everywhere.
+# =====================================================================
+# ARCHIVE_WINDOW_DAYS is the ONLY day-count in this file (default 7; set the
+# ARCHIVE_WINDOW_DAYS env var / repo variable to change it). It used to be
+# two separate constants (30 for a freshly extracted file, nothing at all
+# for an R2 cache hit), which is how "I changed it to 7 and it still
+# collects 30 days" happened.
 #
-# This is still a rolling day-window on purpose — it's only ever used for
-# a patient's FIRST extraction, when there's no merge log yet to diff
-# against. The result is recorded into that patient's merge log right
-# away (see resolve_patient_document() below) precisely so every run
-# AFTER this one has something real to diff against instead of falling
-# back to a window at all.
-PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = 7
-
-# FIXED BUG (repeated-review loop): an R2 CACHE-HIT document used to be
-# refreshed with the same kind of rolling day-window as a freshly-
-# extracted one (this used to be CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK = 30).
-# Because the window is computed relative to *today* on every run, the
-# SAME archive item(s) already merged into a patient's file yesterday (or
-# any day inside the window) fell right back inside today's window and
-# were downloaded and re-appended AGAIN — duplicating pages on every
-# subsequent submission for that patient until the file crossed
-# ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES below and got routed back to human
-# review, even though nothing had actually changed in DMS. That's exactly
-# the "I review it once, submit it, and the next day it wants reviewing
-# again" bug.
+# Window semantics: archive rows dated from (today - N) through today,
+# inclusive, i.e. N+1 calendar days — same as the pipeline always did.
 #
-# A cache-hit document is now refreshed with merge_new_archive_docs_by_id()
-# instead (patient_pdf_dms_archive_fallback.py), which diffs the patient's
-# CURRENT archive item list against a persisted per-patient merge log
-# (r2_client.get_merged_archive_ids/save_merged_archive_ids) — so it only
-# ever pulls items that were never merged before, no matter how many days
-# have passed. No day-window constant is needed for this path any more.
+# Three situations, three behaviours:
+#
+#   A. Already labeled in R2, nothing new in the window
+#        -> submit straight through, no review.
+#   B. Already labeled in R2, NEW papers in the window (not in the
+#      patient's merge log)
+#        -> only those new pages are staged for labeling ("delta" review).
+#           After approval, finalize appends them to the labeled file in
+#           R2 and records them in the merge log. The labeled file is never
+#           re-shown.
+#   C. NOT in R2 (first time this patient is seen)
+#        - found on the SMC website: website file + the same window of DMS
+#          pages, whole file reviewed ("full" review).
+#        - only in DMS: every archived paper is already in the extraction
+#          (no window applies), whole file reviewed ("full" review).
+ARCHIVE_WINDOW_DAYS = int(os.environ.get("ARCHIVE_WINDOW_DAYS", "7") or 7)
+PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK = ARCHIVE_WINDOW_DAYS  # kept name, same value
 
-# If merging DMS archive pages into an R2-cached document produces a file
-# bigger than this, the document is routed to human review (as if it had
-# been missing from R2 and freshly extracted) instead of being submitted
-# straight through. 4 MiB by default; override with ARCHIVE_MERGE_REVIEW_MB.
-ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES = int(
-    float(os.environ.get("ARCHIVE_MERGE_REVIEW_MB", "4") or 4) * 1024 * 1024
-)
+# doc_source value for situation B. Only ever written into pipeline_state /
+# event details — nothing in the module UI branches on it.
+DELTA_DOC_SOURCE = "local+archive_delta"
 
-# doc_source value for a cache-hit document that was diverted to review
-# because of the size rule above. Only ever written into pipeline_state /
-# event details — nothing in the module UI or finalize branches on it.
-OVERSIZE_DOC_SOURCE = "local+archive_oversize"
+# Where the small new-pages-only PDF is written before it is staged.
+DELTA_DIR = os.path.join(common.PATIENT_DOC_CACHE_DIR, "delta")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_submission_prepare")
@@ -246,9 +225,29 @@ def debug_dump_mdt_and_stop(session: SMCSession, case_id: int, attempt_id: int,
             "raw_path": raw_path, "signed_path": signed_path}
 
 
+def _count_pages(pdf_path: str) -> Optional[int]:
+    try:
+        return len(PdfReader(pdf_path).pages)
+    except Exception:
+        return None
+
+
 def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre_request_id: str, full_name: str,
                                tumor_cfg: dict, medical_report_text: str, request_category: str,
-                               extracted_pdf_path: str, doc_source: str):
+                               extracted_pdf_path: str, doc_source: str,
+                               review_mode: str = "full", delta_ids: Optional[List[str]] = None,
+                               delta_window: Optional[dict] = None):
+    """Stages a document for the human reviewer.
+
+    review_mode "full":  extracted_pdf_path is the patient's WHOLE freshly
+                         extracted file; the labeler saves it to R2's permanent key.
+    review_mode "delta": extracted_pdf_path holds ONLY the new archive pages
+                         of an already-labeled patient; the document-review edge
+                         function sends the labeled result to delta/<id>.pdf and
+                         finalize appends it to the permanent file.
+    The mode is stored in pipeline_state.review_mode — the edge function and
+    finalize both read it from there (document_review_status keeps using
+    only its existing values, so no DB CHECK constraint is touched)."""
     case_id = case["id"]
 
     if not r2_client.upload_pending(national_id, extracted_pdf_path):
@@ -266,7 +265,11 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
         "request_category": request_category,
         "doc_source": doc_source,
         "review_url": review_url,
+        "review_mode": review_mode,
     }
+    if review_mode == "delta":
+        pipeline_state["delta_ids"] = list(delta_ids or [])
+        pipeline_state["delta_window"] = delta_window
 
     sb.update(common.ATTEMPTS_TABLE, attempt_id, {
         "document_review_status": "pending_review",
@@ -275,14 +278,15 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
     })
     sb.update(common.CASES_TABLE, case_id, {"case_status": "PENDING"})
 
-    if doc_source == OVERSIZE_DOC_SOURCE:
-        size_mb = os.path.getsize(extracted_pdf_path) / (1024 * 1024)
-        limit_mb = ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES / (1024 * 1024)
-        msg = ("تم إنشاء طلب MDT بنجاح (رقم مبدئي: {pre}). بعد دمج مستند المريض المحفوظ مع صفحات أرشيف DMS "
-               "الحديثة أصبح حجم الملف {size:.1f} ميجابايت (أكبر من {limit:.0f} ميجابايت)، لذلك تم تحويله "
-               "للمراجعة قبل المتابعة. راجع المستند ثم اضغط \"موافقة ومتابعة\" لإكمال التوقيع وإنشاء "
-               "التقرير الطبي ورفع الطلب.{link}").format(
-            pre=pre_request_id, size=size_mb, limit=limit_mb,
+    if review_mode == "delta":
+        pages = _count_pages(extracted_pdf_path)
+        pages_txt = f"{pages} صفحة" if pages else "صفحات"
+        msg = ("تم إنشاء طلب MDT بنجاح (رقم مبدئي: {pre}). ملف المريض محفوظ ومصنّف من قبل، "
+               "وتم العثور على أوراق جديدة في أرشيف DMS خلال آخر {days} أيام ({pages}). "
+               "راجع وصنّف هذه الأوراق الجديدة فقط — سيتم إضافتها تلقائيًا إلى الملف المصنّف سابقًا "
+               "ثم يتم إكمال التوقيع وإنشاء التقرير الطبي ورفع الطلب بعد الضغط على "
+               "\"موافقة ومتابعة\".{link}").format(
+            pre=pre_request_id, days=ARCHIVE_WINDOW_DAYS, pages=pages_txt,
             link=f"\nرابط المراجعة: {review_url}" if review_url else "",
         )
     else:
@@ -293,14 +297,16 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
             link=f"\nرابط المراجعة: {review_url}" if review_url else "",
         )
     common.log_event(case_id, attempt_id, "extraction_pending_review",
-                      {"pre_request_id": pre_request_id, "doc_source": doc_source, "review_url": review_url})
+                      {"pre_request_id": pre_request_id, "doc_source": doc_source, "review_url": review_url,
+                       "review_mode": review_mode, "delta_count": len(delta_ids or [])})
     sb.insert(common.REQUIREMENTS_TABLE, {"case_id": case_id, "attempt_id": attempt_id,
                                            "requirement_text": msg, "status": "OPEN"})
 
 
 def link_sibling_to_pending_review(case: dict, attempt_id: int, national_id: str, pre_request_id: str,
                                     full_name: str, tumor_cfg: dict, medical_report_text: str,
-                                    request_category: str, doc_source: str, primary_case_id: int):
+                                    request_category: str, doc_source: str, primary_case_id: int,
+                                    review_mode: str = "full"):
     """A SIBLING case for a patient that already has another case in this
     same run sitting at pending_review (see resolve_patient_document() /
     pending_review_by_patient in main()).
@@ -325,6 +331,7 @@ def link_sibling_to_pending_review(case: dict, attempt_id: int, national_id: str
         "medical_report_text": medical_report_text,
         "request_category": request_category,
         "doc_source": doc_source,
+        "review_mode": review_mode,
         "linked_primary_case_id": primary_case_id,
     }
     sb.update(common.ATTEMPTS_TABLE, attempt_id, {
@@ -339,116 +346,98 @@ def link_sibling_to_pending_review(case: dict, attempt_id: int, national_id: str
 
 
 def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: Dict[str, tuple]):
-    """locate_patient_document_pdf() is the potentially-slow step (SMC
-    website search + CMIS archive fallback when nothing's cached) — and
-    when the same patient has more than one case in a single run, calling
-    it once per CASE instead of once per PATIENT was both the root cause
-    of the duplicate-review bug (two independent 'newly extracted'
-    results for the exact same document) and pure wasted time (the same
-    slow fallback search running twice for nothing). doc_cache is a plain
-    dict scoped to this run, keyed by national_id, so every case for the
-    same patient after the first one reuses the already-resolved result
-    instead of hitting the network again.
+    """Resolves this patient's document ONCE per run (doc_cache, keyed by
+    national_id — every further case of the same patient reuses it; that
+    was the root cause of the old duplicate-review bug and is also simply
+    faster than re-searching SMC/CMIS per case).
 
-    ARCHIVE MERGE, per your latest instruction (log-based, not a rolling
-    day-window):
-      - R2 CACHE HIT ("local" — this patient's document was already
-        reviewed/approved on some earlier run): find_local_fn below is the
-        only override on this path. Instead of re-sweeping a rolling day
-        window (the old behaviour — see CACHE_HIT_ARCHIVE_MERGE_DAYS_BACK's
-        old comment above), _refresh_fn now loads this patient's merge log
-        (r2_client.get_merged_archive_ids — every DMS/CMIS archive item ID
-        already baked into their current document) and calls
-        merge_new_archive_docs_by_id(), which pulls ONLY archive items not
-        already in that log. If nothing new is found, the local file is
-        left completely untouched and this run submits straight through —
-        no re-merge, no review, exactly the "just use the Cloudflare copy
-        as-is" behaviour you asked for. If something new IS found and the
-        result stays under the size threshold, the merged file is
-        re-uploaded to R2's permanent key AND the merge log is updated
-        with the new item IDs (see the size-rule block below), so the
-        NEXT run's diff is against an up-to-date log rather than the same
-        old window catching the same old items again (the actual cause of
-        the repeated-review bug you ran into).
-      - NEWLY EXTRACTED (not cached — had to be pulled from the SMC
-        website, or failing that the full CMIS archive): unchanged in
-        spirit — the website-fallback branch still merges in the last
-        PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK (7) days of DMS/
-        CMIS archive pages so the human review that follows sees the
-        fully merged document, not just the bare extraction. The ONE
-        addition: whatever archive item IDs that merge actually covered
-        (or, for the full-CMIS-archive fallback, every item the patient
-        has) are saved into this patient's merge log right away — see the
-        block after locate_patient_document_pdf() below — so this
-        patient's very NEXT submission (which will very likely be an R2
-        cache hit once this one is reviewed and approved) has a real log
-        to diff against from the start, instead of an empty one that
-        would make the whole 7-day window look "new" all over again.
+    Returns (pdf_path, doc_source, needs_review, extra), where extra is
+        {"review_mode": None | "full" | "delta",
+         "delta_ids": [...], "delta_window": {"from": iso, "to": iso} | None}
 
-      SIZE RULE (unchanged): an R2 cache hit that the DMS merge grew past
-      ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES is returned as
-      (path, OVERSIZE_DOC_SOURCE, True) — i.e. flagged as newly extracted so
-      it takes the review path below rather than the straight-through one.
+      review_mode None     R2 cache hit, nothing new in the last
+                           ARCHIVE_WINDOW_DAYS days -> submit straight
+                           through (needs_review False; pdf_path is the
+                           labeled R2 file).
+      review_mode "delta"  R2 cache hit + NEW archive papers -> pdf_path is a
+                           small PDF with ONLY those new pages
+                           (doc_source DELTA_DOC_SOURCE, needs_review True).
+                           The labeled R2 file is not touched here.
+      review_mode "full"   not in R2 -> freshly extracted (SMC website +
+                           window of DMS pages, or the whole DMS archive);
+                           the whole file needs review (needs_review True).
 
-      _extraction_state is a plain closure dict, not a global: it's
-      created fresh for every call, so it can only ever reflect THIS
-      patient's resolution, never leak across patients or runs.
-      "newly_extracted" is set True only if _website_fn below actually
-      returns a path (a genuine extraction). "archive_merged" is set True
-      only when a merge (window- or log-based) actually appended
-      something. "merged_ids" carries whatever the merge step(s) computed
-      as this patient's CURRENT full set of covered archive item IDs, so
-      it can be persisted to the merge log once — regardless of whether
-      this document ends up submitted straight through or routed to
-      human review, since the archive items are baked into the file
-      either way.
+    MERGE LOG (r2_client.get/save_merged_archive_ids): records which
+    archive papers are already inside a patient's file.
+      - full review : saved HERE, right after extraction, so the next run
+                      has a log to diff against.
+      - delta review: NOT saved here. The new papers only enter the log
+                      after the operator has labeled them and finalize has
+                      merged them into the permanent file (see
+                      decree_submission_finalize.py). Saving early would
+                      mark papers as merged that nobody has labeled yet.
     """
     if national_id in doc_cache:
         return doc_cache[national_id]
 
-    extraction_state = {"newly_extracted": False, "archive_merged": False, "merged_ids": None}
+    st = {"newly_extracted": False, "merged_ids": None, "window": None,
+          "delta_path": None, "delta_ids": [], "archive_checked": None}
+
+    def _window_dict():
+        end = datetime.now().date()
+        start = end - timedelta(days=ARCHIVE_WINDOW_DAYS)
+        return {"from": start.isoformat(), "to": end.isoformat()}
 
     def _website_fn(session_, base_url, patient_id, output_dir):
         path = download_patient_pdf_from_website(session_, base_url, patient_id, output_dir)
         if path:
-            extraction_state["newly_extracted"] = True
+            st["newly_extracted"] = True
         return path
 
-    def _refresh_fn(patient_id, pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK):
-        if extraction_state["newly_extracted"]:
-            # First time this patient's document has ever been resolved
-            # this way — no merge log exists yet, so fall back to the
-            # rolling day-window (unchanged behaviour) and capture exactly
-            # which item IDs it covered, to seed the log below.
+    def _refresh_fn(patient_id, pdf_path, days_back=None):
+        # days_back (passed by locate_patient_document_pdf) is deliberately
+        # ignored — ARCHIVE_WINDOW_DAYS is the single source of truth.
+        if st["newly_extracted"]:
+            # Freshly downloaded from the SMC website: no valid merge log
+            # exists for this brand-new file, so merge the window of DMS
+            # pages straight into it and remember exactly which papers that was.
             updated, ids = refresh_local_pdf_and_get_merged_ids(
-                patient_id, pdf_path, days_back=PREPARE_NEWLY_EXTRACTED_ARCHIVE_MERGE_DAYS_BACK)
+                patient_id, pdf_path, days_back=ARCHIVE_WINDOW_DAYS)
             if updated:
-                extraction_state["archive_merged"] = True
-                extraction_state["merged_ids"] = ids
+                st["merged_ids"] = ids
+                st["window"] = _window_dict()
             return updated
 
-        # R2 cache hit — diff against the persisted merge log instead of
-        # any day window. This is the actual fix for the repeated-review
-        # bug: see merge_new_archive_docs_by_id()'s docstring.
-        already_merged_ids = r2_client.get_merged_archive_ids(patient_id)
-        updated, all_ids = merge_new_archive_docs_by_id(patient_id, pdf_path, already_merged_ids)
-        if updated:
-            extraction_state["archive_merged"] = True
-            extraction_state["merged_ids"] = all_ids
-        return updated
+        # R2 cache hit: window minus merge log = the new papers only, written
+        # to a SEPARATE small file. The labeled R2 file is left untouched.
+        already = r2_client.get_merged_archive_ids(patient_id)
+        os.makedirs(DELTA_DIR, exist_ok=True)
+        delta_path, new_ids, checked_ok = collect_recent_archive_delta(
+            patient_id, DELTA_DIR, already, days_back=ARCHIVE_WINDOW_DAYS)
+        st["archive_checked"] = checked_ok
+        if not checked_ok:
+            log.warning(f"  [archive] {patient_id}: could not check DMS for new papers — "
+                        f"continuing with the labeled file as-is.")
+            return False
+        if delta_path:
+            st["delta_path"], st["delta_ids"], st["window"] = delta_path, new_ids, _window_dict()
+            log.info(f"  [archive] {patient_id}: {len(new_ids)} new archive paper(s) in the last "
+                     f"{ARCHIVE_WINDOW_DAYS} day(s) — only these will be sent for labeling.")
+            return True
+        log.info(f"  [archive] {patient_id}: nothing new in the last {ARCHIVE_WINDOW_DAYS} day(s) "
+                 f"(beyond what is already merged) — submitting straight through.")
+        return False
 
     def _full_archive_fn(patient_id, output_dir):
-        # Genuinely first-time patient — nothing on the SMC website
-        # either, falling all the way through to the full CMIS archive
-        # pull. Capture every item ID this covers (== the patient's whole
-        # archive history) so the merge log starts accurate from the very
-        # first document, not empty.
+        # Not in R2 and not on the SMC website: pull the patient's WHOLE
+        # DMS archive. Every paper is in the file, so every id goes in the log.
         path, ids = get_all_patient_archive_pdfs_merged_with_ids(patient_id, output_dir)
         if path:
-            extraction_state["merged_ids"] = ids
+            st["merged_ids"] = ids
+            st["window"] = None
         return path
 
-    result = locate_patient_document_pdf(
+    pdf_path, doc_source, newly_extracted = locate_patient_document_pdf(
         session, national_id,
         find_local_fn=make_r2_aware_finder(national_id),
         website_fn=_website_fn,
@@ -456,54 +445,24 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
         full_archive_fn=_full_archive_fn,
     )
 
-    # Persist the merge log whenever we now know this patient's full set
-    # of covered archive item IDs — regardless of what happens next
-    # (straight-through submission or routed to review): the archive
-    # items are baked into the file either way, so the log should reflect
-    # that immediately rather than waiting on a review outcome we have no
-    # visibility into from here.
-    if extraction_state["merged_ids"] is not None:
-        if r2_client.save_merged_archive_ids(national_id, extraction_state["merged_ids"]):
-            log.info(f"  [merge log] {national_id}: recorded "
-                     f"{len(extraction_state['merged_ids'])} archive item(s) as merged.")
-        else:
-            log.warning(f"  [merge log] {national_id}: could not persist the merge log — "
-                        f"the next run may re-check items already covered by this document "
-                        f"(harmless: they'll just be found already-merged and skipped, at worst "
-                        f"re-diffed against CMIS once more).")
+    extra = {"review_mode": None, "delta_ids": [], "delta_window": None}
 
-    # SIZE RULE: an R2 cache hit (source "local", newly_extracted False) is
-    # normally submitted straight through with no review. But if the DMS
-    # archive merge just appended pages and the file is now over the review
-    # threshold, divert it to human review — same as a document that was
-    # missing from R2 and freshly extracted (newly_extracted=True flows into
-    # stage_and_flag_for_review / sibling-linking in prepare_one_case()).
-    pdf_path, doc_source, newly_extracted = result
-    if pdf_path and doc_source == "local" and not newly_extracted and extraction_state["archive_merged"]:
-        try:
-            merged_size = os.path.getsize(pdf_path)
-        except OSError:
-            merged_size = 0
-        if merged_size > ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES:
-            log.info(f"  [size rule] {national_id}: {merged_size / (1024 * 1024):.2f} MB after the DMS archive "
-                     f"merge (limit {ARCHIVE_MERGE_REVIEW_THRESHOLD_BYTES / (1024 * 1024):.0f} MB) — "
-                     f"routing to human review instead of submitting straight through.")
-            result = (pdf_path, OVERSIZE_DOC_SOURCE, True)
-        else:
-            # PERMANENT R2 UPDATE: a cache-hit document that just had fresh
-            # DMS/CMIS archive pages merged onto it, staying under the
-            # review threshold, is about to be submitted straight through
-            # using this merged copy — promote it back to R2's permanent
-            # key so every future run's cache hit already contains these
-            # pages (the merge log saved above already ensures the NEXT
-            # run's diff won't re-pull them either way).
-            if r2_client.upload(national_id, pdf_path):
-                log.info(f"  [R2 permanent update] {national_id}: merged DMS pages promoted to the "
-                         f"permanent R2 copy ({merged_size / (1024 * 1024):.2f} MB).")
+    if newly_extracted:
+        extra["review_mode"] = "full"
+        if st["merged_ids"] is not None:
+            w = st["window"] or {}
+            if r2_client.save_merged_archive_ids(national_id, st["merged_ids"],
+                                                   window_start=w.get("from"), window_end=w.get("to")):
+                log.info(f"  [merge log] {national_id}: recorded {len(st['merged_ids'])} archive item(s) as merged.")
             else:
-                log.warning(f"  [R2 permanent update] {national_id}: could not promote the merged copy "
-                            f"back to R2 — this run's submission still uses the merged file locally, "
-                            f"but the next run's cache hit will be the OLD (pre-merge) R2 copy.")
+                log.warning(f"  [merge log] {national_id}: could not persist the merge log — the next "
+                            f"check may offer some of these papers again as new.")
+        result = (pdf_path, doc_source, True, extra)
+    elif pdf_path and st["delta_path"]:
+        extra.update(review_mode="delta", delta_ids=st["delta_ids"], delta_window=st["window"])
+        result = (st["delta_path"], DELTA_DOC_SOURCE, True, extra)
+    else:
+        result = (pdf_path, doc_source, False, extra)
 
     doc_cache[national_id] = result
     return result
@@ -676,7 +635,8 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
     # Resolved ONCE per patient per run (see resolve_patient_document's
     # docstring) — a second case for the same patient reuses this instead
     # of re-searching the SMC website / CMIS archive from scratch.
-    id_pdf_path, doc_source, newly_extracted = resolve_patient_document(session, national_id, doc_cache)
+    id_pdf_path, doc_source, newly_extracted, doc_extra = resolve_patient_document(session, national_id, doc_cache)
+    review_mode = doc_extra.get("review_mode") or "full"
 
     if not id_pdf_path:
         msg = (f"لم يتم العثور على مستند المريض لا في الأرشيف الدائم ولا على موقع SMC ولا في أرشيف CMIS. "
@@ -690,19 +650,24 @@ def prepare_one_case(session: SMCSession, case: dict, aliases: Dict[str, str],
             # First case for this patient in this run to need review —
             # this is the ONE card the human will see and label.
             stage_and_flag_for_review(case, attempt_id, national_id, pre_request_id, full_name, tumor_cfg,
-                                       texts["medical_report_text"], request_category, id_pdf_path, doc_source)
+                                       texts["medical_report_text"], request_category, id_pdf_path, doc_source,
+                                       review_mode=review_mode,
+                                       delta_ids=doc_extra.get("delta_ids"),
+                                       delta_window=doc_extra.get("delta_window"))
             pending_review_by_patient[national_id] = case_id
             return {"case_id": case_id, "status": "pending_review", "pre_request_id": pre_request_id}
         # A sibling case for a patient that's already queued for review
         # above — link it instead of opening a second review for the same
         # physical document.
         link_sibling_to_pending_review(case, attempt_id, national_id, pre_request_id, full_name, tumor_cfg,
-                                        texts["medical_report_text"], request_category, doc_source, primary_case_id)
+                                        texts["medical_report_text"], request_category, doc_source, primary_case_id,
+                                        review_mode=review_mode)
         return {"case_id": case_id, "status": "pending_review_linked",
                 "pre_request_id": pre_request_id, "linked_primary_case_id": primary_case_id}
 
-    # Cache hit — already reviewed and approved for this patient before.
-    # Continue straight through to submission in this same run.
+    # Cache hit with NOTHING new in the archive window — already reviewed and
+    # approved for this patient before. Continue straight through to
+    # submission in this same run.
     pipeline_state = {
         "pre_request_id": pre_request_id, "full_name": full_name, "tumor_cfg": tumor_cfg,
         "medical_report_text": texts["medical_report_text"],

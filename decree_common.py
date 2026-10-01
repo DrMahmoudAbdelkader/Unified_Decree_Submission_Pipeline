@@ -782,24 +782,21 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
     state = dict(pipeline_state)   # kept in step with pre_request_id whenever an MDT is re-created
 
     try:
-        # NOTE: no DMS/CMIS archive merge happens here anymore. That merge
-        # now happens during PREPARE, before this attempt ever reaches
-        # finalize — see decree_submission_prepare.py's
-        # resolve_patient_document(): a freshly-extracted document gets a
-        # 30-day window merge; an R2-cache-hit document is instead diffed
-        # against that patient's persisted merge log (r2_client.
-        # get_merged_archive_ids/save_merged_archive_ids +
-        # patient_pdf_dms_archive_fallback.merge_new_archive_docs_by_id) so
-        # only genuinely-new archive items get pulled — no day window, and
-        # no re-merging the same items on every run. So by the time
-        # finalize resumes here, whatever the human reviewed/approved (via
-        # the document-review edge function, which uploads straight to the
-        # permanent R2 key) — or whatever cache-hit document had nothing
-        # new to merge — is already the fully-merged document being
-        # submitted; re-merging it a second time here would be redundant
-        # and would bypass the very review the human just did. This
-        # function only ever does: sign, build the report, merge, upload —
-        # nothing else.
+        # NOTE: no DMS/CMIS archive collection happens here. That happens
+        # during PREPARE (decree_submission_prepare.py's
+        # resolve_patient_document()), using ONE window (ARCHIVE_WINDOW_DAYS,
+        # default 7):
+        #   - freshly extracted file: website file + the window of DMS pages
+        #     (or the whole DMS archive if it only exists there), whole file
+        #     reviewed;
+        #   - R2 cache hit: window minus the patient's merge log
+        #     (r2_client.get_merged_archive_ids) = the NEW papers only. Only
+        #     those are labeled by the operator, and
+        #     decree_submission_finalize.py appends them to the labeled
+        #     permanent file BEFORE calling this function.
+        # So by the time this runs, patient_pdf_path is already the complete,
+        # reviewed document. This function only ever does: sign, build the
+        # report, merge, upload — nothing else.
         log.info(f"  [Stage 2] Rendering + signing MDT form for pre_request_id={pre_request_id} …")
         try:
             mdt_signed_bytes = call_with_reconnect(session, "MDT render/sign", stage_render_and_sign,
@@ -936,13 +933,11 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                     session, national_id, pre_request_id, merged_pdf_path, tumor_cfg,
                 )
 
-        # No R2 write happens here for either path. A cache-hit patient's
-        # permanent copy was already correct before this run started. A
-        # freshly-extracted patient's document was already merged (30-day
-        # DMS window, see decree_submission_prepare.py) and promoted to
-        # the permanent R2 key by the document-review edge function the
-        # moment the human approved/labeled it — well before finalize
-        # ever runs. Either way, nothing left to write back here.
+        # No R2 write happens here. The permanent copy is already final:
+        # a cache-hit patient's was correct before this run (or had its new
+        # labeled pages appended by decree_submission_finalize.py), and a
+        # freshly-extracted patient's was written by the document-review
+        # edge function the moment the human approved it.
         _LAST_MERGED_PDF.pop(national_id, None)
         return {"status": "SUCCESS", "final_request_no": final_request_no, "pre_request_id": pre_request_id}
 

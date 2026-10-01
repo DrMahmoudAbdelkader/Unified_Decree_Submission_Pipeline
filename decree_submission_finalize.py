@@ -25,6 +25,12 @@ harmless trigger, not a genuine misconfiguration, and is reported/skipped
 as such (status "already_submitted" / "skipped_wrong_entrypoint") rather
 than opening a misleading extra requirement or failing the whole run.
 
+TWO KINDS OF APPROVED REVIEW (pipeline_state.review_mode, set by prepare):
+    "full"   the whole file was labeled and is already at R2's permanent key.
+    "delta"  only NEW archive pages were labeled (delta/<id>.pdf). They are
+             appended to the permanent labeled file here, before signing —
+             see _prepare_approved_doc().
+
 RUN LOCALLY:
     export SUPABASE_URL=...  SUPABASE_SERVICE_ROLE_KEY=...
     export SMC_USERNAME=...  SMC_PASSWORD=...
@@ -35,11 +41,14 @@ RUN LOCALLY:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import sys
 from typing import List
+
+from PyPDF2 import PdfMerger
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -60,7 +69,9 @@ def parse_case_ids(raw: str) -> List[int]:
 
 
 def _download_approved_doc(national_id: str) -> str:
-    """The labeling step is expected to have already moved the cleaned
+    """(For a "delta" review the permanent file is the OLD labeled file and
+    _prepare_approved_doc() appends the new pages to it afterwards.)
+    The labeling step is expected to have already moved the cleaned
     document from R2's pending/<id>.pdf to the permanent <id>.pdf (root)
     key before setting document_review_status='approved' — so this is
     just an ordinary permanent-cache read, same call prepare.py's
@@ -73,6 +84,89 @@ def _download_approved_doc(national_id: str) -> str:
             f"saved it there yet. Approve only after the cleaned PDF is actually in R2."
         )
     return local_path
+
+
+def _append_pdf(base_path: str, extra_path: str, out_path: str) -> None:
+    """base pages first, extra pages after; written via a temp file so a
+    failure never leaves a half-written base."""
+    with open(base_path, "rb") as f:
+        base_bytes = f.read()
+    with open(extra_path, "rb") as f:
+        extra_bytes = f.read()
+    merger = PdfMerger()
+    tmp_path = out_path + ".merge_tmp"
+    try:
+        merger.append(io.BytesIO(base_bytes))
+        merger.append(io.BytesIO(extra_bytes))
+        merger.write(tmp_path)
+    finally:
+        merger.close()
+    os.replace(tmp_path, out_path)
+
+
+def _prepare_approved_doc(national_id: str, attempt_id: int, pipeline_state: dict) -> str:
+    """Returns the local path of the document to submit.
+
+    review_mode "full" (or absent — older attempts): the labeler already
+    saved the whole reviewed file to R2's permanent key; just download it.
+
+    review_mode "delta": the permanent file is the patient's ALREADY-LABELED
+    file and the operator labeled only the NEW archive pages, which the
+    document-review edge function stored at delta/<id>.pdf. Here they are
+    appended to the permanent file (labeled pages first, new pages after),
+    the result replaces the permanent file in R2, the new papers are added to
+    the patient's merge log, and the delta object is deleted. Safe to run
+    twice: once pipeline_state.delta_merged is set (or the papers are already
+    in the log) the append is skipped, so a retry after a later failure
+    cannot add the same pages again."""
+    base_path = _download_approved_doc(national_id)
+    if pipeline_state.get("review_mode") != "delta":
+        return base_path
+
+    delta_ids = list(pipeline_state.get("delta_ids") or [])
+    already_logged = set(r2_client.get_merged_archive_ids(national_id))
+    if pipeline_state.get("delta_merged") or (delta_ids and all(i in already_logged for i in delta_ids)):
+        log.info(f"  [delta] {national_id}: the new pages are already merged into the permanent file — "
+                 f"not appending them again.")
+        r2_client.delete_labeled_delta(national_id)   # drop any stale leftover so it can never be reused
+        return base_path
+
+    delta_path = r2_client.download_labeled_delta(national_id, common.PATIENT_DOC_CACHE_DIR)
+    if not delta_path:
+        raise RuntimeError(
+            f"لم يتم العثور على الصفحات الجديدة المصنّفة (delta/{national_id}.pdf) في R2 — "
+            f"صنّف الأوراق الجديدة ثم اضغط موافقة مرة أخرى."
+        )
+
+    _append_pdf(base_path, delta_path, base_path)
+    if not r2_client.upload(national_id, base_path):
+        raise RuntimeError("تعذر رفع الملف بعد إضافة الصفحات الجديدة إلى R2 — حاول مرة أخرى.")
+
+    # From here the permanent file already contains the new pages, so the
+    # bookkeeping below must never cause them to be appended a second time.
+    window = pipeline_state.get("delta_window") or {}
+    merged_ids = list(r2_client.get_merged_archive_ids(national_id))
+    merged_ids += [i for i in delta_ids if i not in already_logged]
+    saved = False
+    for _ in range(3):
+        if r2_client.save_merged_archive_ids(national_id, merged_ids,
+                                              window_start=window.get("from"), window_end=window.get("to")):
+            saved = True
+            break
+    if not saved:
+        log.warning(f"  [delta] {national_id}: pages merged but the merge log could NOT be saved — the "
+                    f"same archive papers may be offered for labeling again on the next request.")
+
+    pipeline_state["delta_merged"] = True
+    try:
+        sb.update(common.ATTEMPTS_TABLE, attempt_id, {"pipeline_state": pipeline_state})
+    except Exception as exc:
+        log.warning(f"  [delta] {national_id}: could not store delta_merged on attempt {attempt_id}: {exc}")
+
+    r2_client.delete_labeled_delta(national_id)
+    log.info(f"  [delta] ✅ {national_id}: {len(delta_ids)} new archive paper(s) appended to the permanent "
+             f"labeled file and recorded in the merge log.")
+    return base_path
 
 
 def _find_linked_sibling_attempts(primary_case_id: int) -> List[dict]:
@@ -216,7 +310,7 @@ def finalize_one_case(session: SMCSession, case: dict) -> dict:
         return {"case_id": case_id, "status": "error", "message": msg}
 
     try:
-        patient_pdf_path = _download_approved_doc(national_id)
+        patient_pdf_path = _prepare_approved_doc(national_id, attempt_id, pipeline_state)
     except Exception as exc:
         msg = f"تعذر تنزيل المستند المعتمد — {exc}"
         common.open_requirement(case_id, attempt_id, msg)

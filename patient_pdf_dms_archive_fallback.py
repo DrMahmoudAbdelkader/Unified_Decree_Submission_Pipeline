@@ -76,6 +76,14 @@ TWO WAYS THIS MODULE IS USED BY THE PIPELINE
   recent ones) and merges them into one new file. Used when the patient
   has NO local PDF at all yet.
 
+- collect_recent_archive_delta(): USED FOR A PATIENT WHO IS ALREADY
+  LABELED IN R2. Takes the archive rows dated inside the window (default 7
+  days), subtracts the ones the patient's merge log says are already in
+  their file, downloads ONLY what is left into a SEPARATE small PDF, and
+  never touches the existing file. prepare.py stages that small PDF for
+  the operator to label; finalize appends it to the labeled file. If
+  nothing is left, the patient goes straight to submission.
+
 - refresh_local_pdf_with_recent_archive_docs(): INCREMENTAL refresh -
   only looks at archive rows dated within the last `days_back` days
   (default 7, widened from the original today/yesterday-only window;
@@ -600,9 +608,88 @@ def refresh_local_pdf_and_get_merged_ids(national_id: str, existing_local_pdf_pa
                                               reference_date, days_back)
 
 
+def collect_recent_archive_delta(national_id: str, output_dir: str,
+                                  already_merged_ids: Optional[List[str]],
+                                  days_back: int = 7,
+                                  reference_date: Optional[date] = None):
+    """
+    Window AND log, together — for an R2 cache-hit patient.
+
+        candidates = archive rows dated from (today - days_back) through today
+        new        = candidates that are NOT in already_merged_ids
+
+    Both limits matter. The window alone re-collects the same papers on
+    every submission inside it (the old repeated-review bug); the log alone,
+    with an empty or partial log, treats the patient's ENTIRE archive
+    history as new (what merge_new_archive_docs_by_id() below does, and why
+    prepare.py no longer calls it).
+
+    Downloads only `new` into "<output_dir>/<national_id>_delta.pdf". The
+    patient's existing labeled file is never read or modified here.
+
+    Returns (delta_pdf_path_or_None, new_ids, checked_ok):
+      - (None, [], True)   archive checked, nothing new inside the window
+      - (path, ids, True)  new papers found and saved to `path`
+      - (None, [], False)  could not check (login/search/download failed).
+                           The caller decides what to do; nothing was changed.
+    """
+    already = set(already_merged_ids or [])
+
+    opened = _open_patient_session(national_id)
+    if not opened:
+        return None, [], False
+    session, mr, archive_index_html = opened
+
+    all_ids = extract_archive_row_dates(archive_index_html)
+    ref = reference_date or datetime.now().date()
+    days_back = max(int(days_back), 0)
+    window_days = {ref - timedelta(days=n) for n in range(days_back + 1)}
+    in_window = [d for d in all_ids if _parse_row_date(d) in window_days]
+    new_ids = [d for d in in_window if d not in already]
+
+    log.info(f"  [DMS archive delta] MR {mr}: {len(all_ids)} archive row(s) in total, "
+             f"{len(in_window)} dated {ref - timedelta(days=days_back)}..{ref}, "
+             f"{len(in_window) - len(new_ids)} of those already merged before, "
+             f"{len(new_ids)} new.")
+    if not new_ids:
+        return None, [], True
+
+    gallery_html = call_archive_view_all(session, new_ids)
+    if not gallery_html:
+        return None, [], False
+
+    pdf_urls = parse_gallery_pdf_urls(gallery_html)
+    if not pdf_urls:
+        log.info(f"  [DMS archive delta] MR {mr}: the {len(new_ids)} new row(s) resolved to zero "
+                 f"downloadable PDF URLs - nothing to add.")
+        return None, [], True
+
+    pdf_bytes = [b for b in (_download_pdf_bytes(session, u) for u in pdf_urls) if b]
+    if not pdf_bytes:
+        log.warning(f"  [DMS archive delta] MR {mr}: found {len(pdf_urls)} PDF link(s) but none "
+                    f"downloaded - treating as not checked.")
+        return None, [], False
+    if len(pdf_bytes) < len(pdf_urls):
+        log.warning(f"  [DMS archive delta] MR {mr}: only {len(pdf_bytes)} of {len(pdf_urls)} "
+                    f"PDF(s) downloaded - continuing with what was fetched.")
+
+    clean_id = re.sub(r"[^0-9]", "", national_id) or str(mr)
+    out_path = os.path.join(output_dir, f"{clean_id}_delta.pdf")
+    if not _merge_pdf_bytes_list(pdf_bytes, out_path):
+        return None, [], False
+
+    log.info(f"  [DMS archive delta] ✅ {len(pdf_bytes)} new PDF(s) saved to {out_path}")
+    return out_path, new_ids, True
+
+
 def merge_new_archive_docs_by_id(national_id: str, existing_local_pdf_path: str,
                                   already_merged_ids: Optional[List[str]]):
     """
+    NOT USED BY prepare.py ANY MORE — use collect_recent_archive_delta().
+    This function has NO date window: with an empty or partial merge log it
+    treats every archive row the patient has ever had as "new" and appends
+    all of it. Kept only so nothing importing it breaks.
+
     DIFF-BASED replacement for the day-window refresh above, used for an
     R2 CACHE-HIT patient (a document that was already reviewed, approved,
     and promoted to the permanent cache on some earlier run).
