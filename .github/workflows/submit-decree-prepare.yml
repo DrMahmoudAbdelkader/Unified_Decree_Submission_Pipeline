@@ -276,6 +276,10 @@ jobs:
           # nine others doing the same.
           CASE_IDS: ${{ matrix.batch.case_ids }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
+          # The ONE archive window (days) for every DMS/CMIS archive lookup in
+          # prepare. Default 7. To change it without editing code, add a
+          # repository VARIABLE (not secret) named ARCHIVE_WINDOW_DAYS.
+          ARCHIVE_WINDOW_DAYS: ${{ vars.ARCHIVE_WINDOW_DAYS || '7' }}
         run: python decree_submission_prepare.py
 
       # Keeps the merged PDF of every case that FAILED after its merge, so it
