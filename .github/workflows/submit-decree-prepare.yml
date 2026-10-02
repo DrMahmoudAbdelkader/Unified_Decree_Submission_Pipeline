@@ -107,6 +107,10 @@ on:
         description: "How many SMC logins you have as secrets (SMC_USERNAME, SMC_USERNAME_2, ...). Default 1 = every batch shares the primary account."
         required: false
         default: "1"
+      run_ref:
+        description: "Set by the submit-decree-requests edge function (notification tracking). Leave blank when running by hand."
+        required: false
+        default: ""
 
 jobs:
   # ==========================================================================
@@ -132,6 +136,17 @@ jobs:
       # for PyMuPDF/reportlab/boto3.
       - name: Install planner dependency
         run: pip install --disable-pip-version-check --quiet requests
+
+      # Tells the module this run really began — for a QUEUED session this is
+      # the moment it leaves the queue ("started" notification). Runs only
+      # once the concurrency group has released it, so it is accurate.
+      - name: Report run started (notifications)
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_REF: ${{ github.event.inputs.run_ref }}
+        run: python run_notify.py started
 
       - name: Plan batches
         id: chunk
@@ -280,6 +295,8 @@ jobs:
           # prepare. Default 7. To change it without editing code, add a
           # repository VARIABLE (not secret) named ARCHIVE_WINDOW_DAYS.
           ARCHIVE_WINDOW_DAYS: ${{ vars.ARCHIVE_WINDOW_DAYS || '7' }}
+          # Lets each batch add its counters to the run (see run_notify.py).
+          RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_prepare.py
 
       # Keeps the merged PDF of every case that FAILED after its merge, so it
@@ -350,3 +367,37 @@ jobs:
             /tmp/decree_mdt_debug/**
           if-no-files-found: ignore
           retention-days: 5
+
+  # ==========================================================================
+  # JOB 3 — NOTIFY. Runs after every batch has finished (or the plan found
+  # nothing / failed / the run was cancelled) and posts ONE message for the
+  # whole session to the module's notification center. If this was the last
+  # active session it also posts the "all sessions finished" message.
+  # ==========================================================================
+  notify:
+    needs: [plan, prepare]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependency
+        run: pip install --disable-pip-version-check --quiet requests
+
+      - name: Post completion notification
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_REF: ${{ github.event.inputs.run_ref }}
+          PHASE: prepare
+          PLAN_RESULT: ${{ needs.plan.result }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+        run: python run_notify.py finish

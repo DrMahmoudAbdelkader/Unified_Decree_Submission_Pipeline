@@ -29,6 +29,10 @@ on:
       case_ids:
         description: "Comma-separated decree_request_cases.id list — REQUIRED, this never runs in bulk"
         required: true
+      run_ref:
+        description: "Set by the submit-decree-requests edge function (notification tracking). Leave blank when running by hand."
+        required: false
+        default: ""
 
 jobs:
   finalize:
@@ -62,6 +66,14 @@ jobs:
       - name: Install Playwright's Chromium
         run: playwright install --with-deps chromium
 
+      - name: Report run started (notifications)
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_REF: ${{ github.event.inputs.run_ref }}
+        run: python run_notify.py started
+
       # fonts-hosny-amiri stays for medical_report_overlay.py's SEPARATE
       # report PDF (already calibrated). The MDT form's own font (Tahoma
       # or whatever the SMC print page's CSS asks for) is fetched from
@@ -93,7 +105,23 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
+          RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_finalize.py
+
+      # One mini notification per finished case; when it was the last
+      # finalize still running, the "all finished" message follows. `if:
+      # always()` so a crash or a cancel still reports. job.status is the
+      # result of the steps above (success / failure / cancelled).
+      - name: Post completion notification
+        if: always()
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_REF: ${{ github.event.inputs.run_ref }}
+          PHASE: finalize
+          OUTCOME: ${{ job.status }}
+        run: python run_notify.py finish
 
       # /tmp/decree_merged/** carries every merged PDF built this run
       # (success or failure - decree_common._build_merged_pdf always
