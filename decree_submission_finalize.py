@@ -368,6 +368,22 @@ def main():
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
+    # Feeds the module's notification center. Best-effort.
+    try:
+        import run_notify
+        run_notify.report_counts({
+            **{k: summary[k] for k in ("total", "submitted", "already_submitted", "skipped_wrong_entrypoint",
+                                       "error", "linked_siblings_submitted")},
+            "details": [
+                {"case_id": r.get("case_id"), "status": r.get("status"),
+                 "request_number": r.get("request_number"),
+                 "message": (r.get("message") or "")[:300]}
+                for r in results
+            ],
+        })
+    except Exception:
+        log.warning("could not report run counts for notifications (ignored)", exc_info=True)
+
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a", encoding="utf-8") as f:

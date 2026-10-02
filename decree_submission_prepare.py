@@ -800,6 +800,20 @@ def main():
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
+    # Feeds the module's notification center (this batch's counters are added
+    # to the run; the workflow's notify job posts the final message). Best-effort.
+    try:
+        import run_notify
+        run_notify.report_counts({
+            **{k: summary[k] for k in ("total", "submitted", "pending_review", "pending_review_linked",
+                                       "requirement_opened", "unexpected_error")},
+            "attention_case_ids": [r.get("case_id") for r in results
+                                   if r.get("status") in ("requirement_opened", "unexpected_error")
+                                   and r.get("case_id") is not None],
+        })
+    except Exception:
+        log.warning("could not report run counts for notifications (ignored)", exc_info=True)
+
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a", encoding="utf-8") as f:
