@@ -349,7 +349,9 @@ def fetch_single_status(session, request_number: str, today_iso: str) -> Optiona
     url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
     payload = {
         "CitizenName": "",
-        "StartDate": _smc_datetime_str("2015-01-01"),
+        # When RequestNumber is set the site ignores the date frame, so
+        # From = To = the same day is enough (confirmed by the owner).
+        "StartDate": _smc_datetime_str(today_iso),
         "EndDate": _smc_datetime_str(today_iso, end_of_day=True),
         "SsnNumber": "",
         "RequestNumber": request_number,
@@ -946,7 +948,13 @@ def main():
 
     today_iso = cairo_today_iso()
     start_iso = (datetime.strptime(today_iso, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    bulk_window = fetch_status_window(session, start_iso, today_iso)
+    # Chunked like the seed refresh: one call over a large LOOKBACK_DAYS
+    # (e.g. 33) made the site answer HTTP 500, which silently forced every
+    # attempt onto a slow single lookup.
+    bulk_window: Dict[str, dict] = {}
+    for chunk_start, chunk_end in _chunk_date_ranges(start_iso, today_iso):
+        bulk_window.update(fetch_status_window(session, chunk_start, chunk_end))
+        time.sleep(REQUEST_DELAY)
 
     attempts = load_open_attempts()
     log.info(f"{len(attempts)} open attempt(s) to check "
