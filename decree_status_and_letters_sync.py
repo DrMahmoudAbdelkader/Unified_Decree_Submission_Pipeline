@@ -8,6 +8,42 @@ mechanism from request_status_sync.py (a sibling repo's script, supplied
 2026-09-15), instead of the SearchRecommendationRequest + _PrintLetters
 popup-scraping this file used before.
 
+CHANGES IN THIS REVISION (2026-10-03)
+--------------------------------------------------------------------------
+Reviewed against the real smc_status_map: no pre-final stage is marked
+is_final (only Approved / Admin_Letter / Cancelled* are), so the "pre-final
+treated as final" theory is ruled out. What WAS weak, and is fixed here:
+
+ 1. SEED ROWS HAD NO FALLBACK. A decree_request_month_seed row that did not
+    come back in the bulk SendRequestStatusJson window was skipped silently
+    and retried the same way every night — if the bulk call missed it
+    (truncated/failed chunk, site quirk) it stayed at its stale status
+    forever (this is how requests whose decree had already been issued kept
+    reading "لجنة طبية" / "محول إلى طبيب آخر" in the seed table). Seed rows
+    missing from the bulk result now get the same targeted single lookup
+    in-app attempts already get, capped per run by MAX_SEED_SINGLE_LOOKUPS
+    (default 200), newest requests first.
+ 2. fetch_status_window() RETRIES. A transient HTTP 5xx / network error on
+    one 10-day chunk used to return {} straight away, which made every row
+    in that chunk look "not found". It now retries (STATUS_WINDOW_RETRIES,
+    default 2) with a short back-off before giving up.
+ 3. request_date TOLERANCE. The seed refresh passed request_date straight to
+    strptime("%Y-%m-%d"); a timestamp-typed column ("2026-09-23T00:00:00")
+    would raise and silently disable the whole seed refresh (it is caught
+    and logged as "Seed table refresh failed"). Only the first 10 characters
+    are used now.
+ 4. SPELLING-VARIANT LOOKUP. smc_status_map matching was exact-string only
+    (that is why the table carries both "قرار نهائى" and "قرار نهائي").
+    A variant not in the table fell to "Unknown". resolve_status_bucket()
+    now falls back to a normalized match (أ/إ/آ->ا, ى->ي, tatweel and extra
+    whitespace removed) when — and only when — it maps to exactly one bucket.
+    Unknown is still never final.
+ 5. One failing seed row can no longer abort the rest of the seed refresh,
+    and unmapped statuses seen on seed rows are logged like attempt ones.
+ 6. The run summary now reports seed single lookups / not-found counts.
+
+Nothing else changed: same tables, same columns, same schedule.
+
 WHY THE REBUILD
 --------------------------------------------------------------------------
 The previous version's status source was find_recommendation_id_for_request()
@@ -73,6 +109,8 @@ CONFIG NEEDED FROM YOU
         SendRequestStatusJson itself does not take a sending-site param.
     LOOKBACK_DAYS                     — default 15.
     MAX_SINGLE_STATUS_LOOKUPS         — default 300.
+    MAX_SEED_SINGLE_LOOKUPS           — default 200 (NEW).
+    STATUS_WINDOW_RETRIES             — default 2 (NEW).
 
 BEFORE TRUSTING THIS FOR REAL: smc_status_map now needs a row for every
 raw status SendRequestStatusJson can return — including the early ones
@@ -81,22 +119,24 @@ old popup-based version never saw at all. Any status text that comes back
 without a matching row falls into the "Unknown" bucket (never guessed as
 final) and is logged — check the run summary's "Unmapped statuses" line
 after the first real run and add rows for whatever shows up there.
+(Known gap in the current table: 'تأجيل الطلب لإرفاق ملف الأشعة'.)
 
-FULL-MONTH SEED REFRESH (decree_request_month_seed) — NEW
+FULL-MONTH SEED REFRESH (decree_request_month_seed)
 --------------------------------------------------------------------------
 After the open-attempt sweep above finishes, sync_seed_table() reuses the
 SAME logged-in session and the SAME SendRequestStatusJson bulk endpoint to
 refresh decree_request_month_seed (see decree_request_month_seed_schema.sql
 and decree-status-tracking.js) — the full month's SMC export used to cover
-requests that have no in-app case/attempt at all. No second login, no
-per-request lookups: that endpoint already returns any request's status for
-a date window regardless of whether this app tracked it, chunked into
-~10-day windows since seed rows can span the whole month. This replaces the
-standalone decree_request_seed_status_refresh.py stub — delete that file,
-nothing runs it anymore. A seed-refresh failure is caught and logged
-separately; it never fails the run or affects the attempt sweep above.
+requests that have no in-app case/attempt at all. No second login: that
+endpoint already returns any request's status for a date window regardless
+of whether this app tracked it, chunked into ~10-day windows since seed rows
+can span the whole month. Rows the bulk windows miss now get a capped
+targeted single lookup (see CHANGES above). This replaces the standalone
+decree_request_seed_status_refresh.py stub — delete that file, nothing runs
+it anymore. A seed-refresh failure is caught and logged separately; it never
+fails the run or affects the attempt sweep above.
 
-DECREE NUMBER EXTRACTION (decree_number) — NEW
+DECREE NUMBER EXTRACTION (decree_number)
 --------------------------------------------------------------------------
 After the sweep and the seed refresh, sync_decree_numbers() finds every row
 that is at the Approved bucket (قرار نهائى) but has no decree_number yet —
@@ -146,6 +186,11 @@ SENDING_SITE = os.environ.get("SMC_SENDING_SITE", "102233")
 
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "15"))
 MAX_SINGLE_STATUS_LOOKUPS = int(os.environ.get("MAX_SINGLE_STATUS_LOOKUPS", "300"))
+# NEW: per-run cap on targeted single lookups for seed rows the bulk windows
+# did not return (see sync_seed_table()).
+MAX_SEED_SINGLE_LOOKUPS = int(os.environ.get("MAX_SEED_SINGLE_LOOKUPS", "200"))
+# NEW: retries for a failed SendRequestStatusJson bulk-window call.
+STATUS_WINDOW_RETRIES = int(os.environ.get("STATUS_WINDOW_RETRIES", "2"))
 
 ATTEMPTS_TABLE = "decree_request_attempts"
 CASES_TABLE = "decree_request_cases"
@@ -154,10 +199,10 @@ STATUS_MAP_TABLE = "smc_status_map"
 # Full-month backfill table (see decree_request_month_seed_schema.sql /
 # decree-status-tracking.js) — most of its rows have no in-app case/attempt
 # at all, so they can't go through load_open_attempts()/process_one_attempt()
-# above. sync_seed_table() below refreshes them instead, reusing this same
-# script's session and the same SendRequestStatusJson bulk endpoint, since
-# that endpoint already returns any request's status for a date window
-# regardless of whether this app tracked it. This replaces the old
+# above. sync_seed_table() below refreshes them instead, reusing this
+# same script's session and the same SendRequestStatusJson bulk endpoint,
+# since that endpoint already returns any request's status for a date
+# window regardless of whether this app tracked it. This replaces the old
 # decree_request_seed_status_refresh.py stub — delete that file, it's no
 # longer needed as a separate script/login.
 SEED_TABLE = "decree_request_month_seed"
@@ -221,6 +266,12 @@ except Exception:
 
 def cairo_today_iso() -> str:
     return datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+
+
+def _date_part(value) -> str:
+    """'2026-09-23' / '2026-09-23T00:00:00+00:00' / a date object -> '2026-09-23'.
+    (NEW) Used wherever a stored date/timestamp is fed to strptime("%Y-%m-%d")."""
+    return str(value)[:10]
 
 
 # =====================================================================
@@ -301,11 +352,19 @@ def _row_from_record(rec: dict, fallback_date_iso: Optional[str] = None) -> Opti
     }
 
 
-def fetch_status_window(session, start_date_iso: str, end_date_iso: str) -> Dict[str, dict]:
+def fetch_status_window(session, start_date_iso: str, end_date_iso: str,
+                        retries: Optional[int] = None) -> Dict[str, dict]:
     """ONE call covering every request submitted in [start, end]. Returns a
     dict keyed by request_number so process_one_attempt() can look an
     attempt's status up with no further network call for anything inside
-    the window."""
+    the window.
+
+    (NEW) Retries on a network error or a non-200 answer (the site has
+    answered HTTP 500 for an over-wide window before) instead of returning
+    {} on the first failure — an empty result makes every row in the window
+    look "not found"."""
+    if retries is None:
+        retries = STATUS_WINDOW_RETRIES
     url = f"{BASE_URL}/smc/Reports/SendRequestStatusJson"
     payload = {
         "CitizenName": "",
@@ -317,13 +376,23 @@ def fetch_status_window(session, start_date_iso: str, end_date_iso: str) -> Dict
         "SystemUserId": "",
     }
     log.info(f"Fetching SendRequestStatusJson window {start_date_iso}..{end_date_iso} …")
-    try:
-        resp = session.post(url, data=payload, timeout=30)
-    except Exception as e:
-        log.error(f"SendRequestStatusJson (bulk window) failed: {e}")
-        return {}
-    if resp.status_code != 200:
-        log.error(f"SendRequestStatusJson (bulk window) returned HTTP {resp.status_code}")
+
+    resp = None
+    for attempt in range(1, retries + 2):
+        try:
+            candidate = session.post(url, data=payload, timeout=30)
+            if candidate.status_code == 200:
+                resp = candidate
+                break
+            log.warning(f"SendRequestStatusJson (bulk window) HTTP {candidate.status_code} "
+                        f"(attempt {attempt}/{retries + 1})")
+        except Exception as e:
+            log.warning(f"SendRequestStatusJson (bulk window) error: {e} (attempt {attempt}/{retries + 1})")
+        if attempt <= retries:
+            time.sleep(REQUEST_DELAY * attempt * 3)
+    if resp is None:
+        log.error(f"SendRequestStatusJson (bulk window {start_date_iso}..{end_date_iso}) failed "
+                  f"after {retries + 1} attempt(s).")
         return {}
 
     try:
@@ -501,20 +570,61 @@ def fetch_admin_letter_text(session, request_number: str) -> Optional[str]:
 
 
 # =====================================================================
-# Status normalization — unchanged mechanism, now fed a far more complete
-# and reliable set of raw status strings.
+# Status normalization — same mechanism, now also tolerant of Arabic
+# spelling variants (NEW) that aren't literally in smc_status_map.
 # =====================================================================
 
+_AR_NORMALIZE = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ـ": None})
+
+
+def _norm_status(text) -> str:
+    """Collapses the spelling variants the site is known to mix (أ/إ/آ ->
+    ا, ى -> ي, tatweel removed, runs of whitespace -> one space)."""
+    return re.sub(r"\s+", " ", str(text or "")).strip().translate(_AR_NORMALIZE)
+
+
+# normalized spelling -> smc_status_map row, or None when two DIFFERENT
+# buckets collide on the same normalized spelling (never guess then).
+_NORMALIZED_STATUS_INDEX: Dict[str, Optional[dict]] = {}
+
+
+def _build_normalized_index(status_map: Dict[str, dict]) -> None:
+    _NORMALIZED_STATUS_INDEX.clear()
+    for arabic, row in status_map.items():
+        key = _norm_status(arabic)
+        if not key:
+            continue
+        if key not in _NORMALIZED_STATUS_INDEX:
+            _NORMALIZED_STATUS_INDEX[key] = row
+        else:
+            existing = _NORMALIZED_STATUS_INDEX[key]
+            if existing is None or existing.get("english_bucket") != row.get("english_bucket"):
+                _NORMALIZED_STATUS_INDEX[key] = None
+
+
 def resolve_status_bucket(status_map: Dict[str, dict], arabic_status: str) -> dict:
-    return status_map.get(
-        arabic_status,
-        {"arabic_status": arabic_status, "english_bucket": "Unknown", "is_final": False, "requires_action": False},
-    )
+    """Exact match first (unchanged behavior). If that misses, try the
+    normalized spelling — only when it maps to exactly one bucket. Anything
+    else is "Unknown", which is never final."""
+    row = status_map.get(arabic_status)
+    if row is not None:
+        return row
+    if arabic_status:
+        key = _norm_status(arabic_status)
+        # Rebuild lazily if a caller passes a map the index wasn't built from.
+        if not _NORMALIZED_STATUS_INDEX and status_map:
+            _build_normalized_index(status_map)
+        hit = _NORMALIZED_STATUS_INDEX.get(key)
+        if hit is not None:
+            return hit
+    return {"arabic_status": arabic_status, "english_bucket": "Unknown", "is_final": False, "requires_action": False}
 
 
 def load_status_map() -> Dict[str, dict]:
     rows = sb.select(STATUS_MAP_TABLE, select="arabic_status,english_bucket,is_final,requires_action")
-    return {r["arabic_status"]: r for r in rows}
+    status_map = {r["arabic_status"]: r for r in rows}
+    _build_normalized_index(status_map)
+    return status_map
 
 
 def load_open_attempts() -> List[dict]:
@@ -531,13 +641,13 @@ def load_open_attempts() -> List[dict]:
         with no error, so past ~1000 open attempts the old unpaged query
         would silently only ever see the first page forever.
 
-    NEW: ordered by last_status_checked_at ascending, nulls first, rather
-    than by id. This matters now that a per-run cap
-    (MAX_SINGLE_STATUS_LOOKUPS) can mean not every stale attempt gets its
-    single-lookup budget spent on it every night — ordering by staleness
-    means the budget always goes to whichever attempts have gone longest
-    without a check, instead of the same id-ordered prefix winning (and
-    the same tail starving) every single run."""
+    Ordered by last_status_checked_at ascending, nulls first, rather than
+    by id. This matters now that a per-run cap (MAX_SINGLE_STATUS_LOOKUPS)
+    can mean not every stale attempt gets its single-lookup budget spent on
+    it every night — ordering by staleness means the budget always goes to
+    whichever attempts have gone longest without a check, instead of the
+    same id-ordered prefix winning (and the same tail starving) every
+    single run."""
     page_size = 500
     offset = 0
     rows: List[dict] = []
@@ -599,9 +709,9 @@ def _get_smc_credentials():
 # Full-month seed table (decree_request_month_seed) refresh — reuses this
 # script's already-logged-in session and the same SendRequestStatusJson
 # bulk endpoint the open-attempt sweep uses above. No second login, no
-# per-request single lookups, no separate script: that endpoint already
-# returns EVERY request's status for a date window, whether or not this
-# app has a case/attempt for it, which is exactly what a seed row is.
+# separate script: that endpoint already returns EVERY request's status
+# for a date window, whether or not this app has a case/attempt for it,
+# which is exactly what a seed row is.
 # =====================================================================
 
 def load_open_seed_rows(status_map: Dict[str, dict]) -> List[dict]:
@@ -639,30 +749,39 @@ def _chunk_date_ranges(start_iso: str, end_iso: str, chunk_days: int = 10):
     been exercised at (LOOKBACK_DAYS's default) — chunking at the same
     proven scale avoids finding out the hard way whether one huge
     single-call window gets silently truncated by the site."""
-    cur = datetime.strptime(start_iso, "%Y-%m-%d")
-    end = datetime.strptime(end_iso, "%Y-%m-%d")
+    cur = datetime.strptime(_date_part(start_iso), "%Y-%m-%d")
+    end = datetime.strptime(_date_part(end_iso), "%Y-%m-%d")
     while cur <= end:
         chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
         yield cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
         cur = chunk_end + timedelta(days=1)
 
 
-def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dict[str, int]:
+def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dict[str, object]:
     """Refreshes decree_request_month_seed the same way process_one_attempt()
     refreshes decree_request_attempts above — same session, same bulk
     endpoint, same status_map — just against a wider, chunked date window
     since seed rows can be a full month old. Only ever writes
     last_known_status/imported_at on decree_request_month_seed itself; never
     touches decree_request_cases/decree_request_attempts/decree_request_events,
-    same as the schema/JS side already assume about this table."""
-    counters = {"checked": 0, "updated": 0, "reached_final": 0}
+    same as the schema/JS side already assume about this table.
+
+    (NEW) A seed row the bulk windows did not return is no longer skipped
+    forever: up to MAX_SEED_SINGLE_LOOKUPS of them (newest requests first —
+    the ones most likely to have changed) get the same targeted single
+    lookup in-app attempts already get."""
+    counters: Dict[str, object] = {
+        "checked": 0, "updated": 0, "reached_final": 0,
+        "used_single_lookup": 0, "not_found": 0, "deferred": 0, "crashed": 0,
+        "unmapped_statuses": [],
+    }
     open_rows = load_open_seed_rows(status_map)
     if not open_rows:
         log.info("Seed refresh: no open decree_request_month_seed rows to check.")
         return counters
 
     dated_rows = [r for r in open_rows if r.get("request_date")]
-    earliest = min((r["request_date"] for r in dated_rows), default=today_iso)
+    earliest = min((_date_part(r["request_date"]) for r in dated_rows), default=today_iso)
     log.info(f"Seed refresh: {len(open_rows)} open seed row(s), window {earliest}..{today_iso}.")
 
     bulk: Dict[str, dict] = {}
@@ -670,25 +789,70 @@ def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dic
         bulk.update(fetch_status_window(session, chunk_start, chunk_end))
         time.sleep(REQUEST_DELAY)
 
-    for row in open_rows:
-        counters["checked"] += 1
-        hit = bulk.get(str(row["request_number"]))
-        if hit is None or not hit.get("request_status"):
-            continue  # not found this run (older than the site keeps, or a
-            # transient gap) — leave last_known_status as-is, retried next run
+    unmapped = set()
+
+    def _apply(row: dict, hit: dict) -> None:
         new_status = hit["request_status"]
+        bucket = resolve_status_bucket(status_map, new_status)
+        if bucket["english_bucket"] == "Unknown":
+            unmapped.add(new_status)
         if new_status == row.get("last_known_status"):
-            continue
+            return
         sb.update(SEED_TABLE, row["id"], {
             "last_known_status": new_status,
             "imported_at": datetime.now().astimezone().isoformat(),
         })
         counters["updated"] += 1
-        if resolve_status_bucket(status_map, new_status)["is_final"]:
+        if bucket["is_final"]:
             counters["reached_final"] += 1
 
+    missing: List[dict] = []
+    for row in open_rows:
+        counters["checked"] += 1
+        hit = bulk.get(str(row["request_number"]))
+        if hit is None or not hit.get("request_status"):
+            missing.append(row)   # not in any bulk window -> single-lookup fallback below
+            continue
+        try:
+            _apply(row, hit)
+        except Exception as exc:
+            counters["crashed"] += 1
+            log.error(f"  seed row {row.get('id')} (request {row.get('request_number')}) "
+                      f"raised {type(exc).__name__}: {exc}")
+
+    # Newest first: recent requests are the ones whose status is still moving,
+    # and old rows SMC no longer returns would otherwise eat the whole budget.
+    missing.sort(key=lambda r: _date_part(r.get("request_date") or ""), reverse=True)
+    budget = MAX_SEED_SINGLE_LOOKUPS
+    if missing:
+        log.info(f"Seed refresh: {len(missing)} open seed row(s) were not in the bulk windows; "
+                 f"single-looking up to {budget}.")
+    for row in missing:
+        if budget <= 0:
+            counters["deferred"] += 1
+            continue
+        budget -= 1
+        request_number = str(row["request_number"])
+        try:
+            hit = fetch_single_status(session, request_number, today_iso)
+            time.sleep(REQUEST_DELAY)
+            counters["used_single_lookup"] += 1
+            if hit is None or not hit.get("request_status"):
+                counters["not_found"] += 1
+                continue   # leave last_known_status as-is, retried next run
+            _apply(row, hit)
+        except Exception as exc:
+            counters["crashed"] += 1
+            log.error(f"  seed row {row.get('id')} (request {request_number}) "
+                      f"raised {type(exc).__name__}: {exc}")
+
+    counters["unmapped_statuses"] = sorted(unmapped)
     log.info(f"Seed refresh done. Checked {counters['checked']}, updated {counters['updated']}, "
-             f"reached a final status {counters['reached_final']}.")
+             f"reached a final status {counters['reached_final']}, single lookups "
+             f"{counters['used_single_lookup']} (not found {counters['not_found']}, deferred "
+             f"{counters['deferred']}), crashed {counters['crashed']}.")
+    if unmapped:
+        log.warning(f"Unmapped statuses seen on seed rows — add these to smc_status_map: {sorted(unmapped)}")
     return counters
 
 
@@ -1017,7 +1181,9 @@ def main():
         # decree-status-tracking.js: a seed-refresh failure never fails the
         # whole run or blocks the open-attempt sweep above, which already
         # completed successfully by this point.
-        seed_counters = {"checked": 0, "updated": 0, "reached_final": 0}
+        seed_counters = {"checked": 0, "updated": 0, "reached_final": 0,
+                         "used_single_lookup": 0, "not_found": 0, "deferred": 0,
+                         "crashed": 0, "unmapped_statuses": []}
         log.error(f"Seed table refresh failed (open-attempt sweep above still succeeded): {exc}")
 
     try:
@@ -1054,7 +1220,18 @@ def main():
                 f"- Open seed rows checked: **{seed_counters['checked']}**\n"
                 f"- Updated: **{seed_counters['updated']}**\n"
                 f"- Reached a final status this run: **{seed_counters['reached_final']}**\n"
+                f"- Not in the bulk windows → targeted single lookups: **{seed_counters.get('used_single_lookup', 0)}** "
+                f"(not found on SMC: {seed_counters.get('not_found', 0)}, "
+                f"deferred to next run: {seed_counters.get('deferred', 0)})\n"
             )
+            if seed_counters.get("crashed"):
+                f.write(f"- Crashed on an individual seed row (see log): **{seed_counters['crashed']}**\n")
+            if seed_counters.get("unmapped_statuses"):
+                f.write(f"- ⚠️ Unmapped statuses on seed rows — add to `smc_status_map`: "
+                        f"{', '.join(seed_counters['unmapped_statuses'])}\n")
+            if seed_counters.get("deferred"):
+                f.write(f"\n> {seed_counters['deferred']} seed row(s) were deferred (single-lookup cap). "
+                        f"Raise MAX_SEED_SINGLE_LOOKUPS if this stays large night after night.\n")
 
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
