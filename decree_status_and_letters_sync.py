@@ -95,6 +95,23 @@ a date window regardless of whether this app tracked it, chunked into
 standalone decree_request_seed_status_refresh.py stub — delete that file,
 nothing runs it anymore. A seed-refresh failure is caught and logged
 separately; it never fails the run or affects the attempt sweep above.
+
+DECREE NUMBER EXTRACTION (decree_number) — NEW
+--------------------------------------------------------------------------
+After the sweep and the seed refresh, sync_decree_numbers() finds every row
+that is at the Approved bucket (قرار نهائى) but has no decree_number yet —
+in decree_request_attempts AND decree_request_month_seed — opens
+GET /smc/Requests/Details/<request id> with the same logged-in session,
+and reads the issued decree number from the "القرارات" column of the
+request-history table (logic ported from the Excel script that was
+confirmed working). Because the target list is simply "approved and still
+no number", the very first run is also the one-time backfill of everything
+already approved, and a request whose page had no number yet is retried on
+later nights automatically. Capped per run at MAX_DECREE_LOOKUPS (default
+400); the rest is picked up the next night. The decree's total VALUE is NOT
+fetched here (different account) — see decree_value_sync.py.
+Needs decree_number_value_migration.sql applied once; until then this step
+logs a hint and skips, and the rest of the run is unaffected.
 """
 
 from __future__ import annotations
@@ -144,6 +161,14 @@ STATUS_MAP_TABLE = "smc_status_map"
 # decree_request_seed_status_refresh.py stub — delete that file, it's no
 # longer needed as a separate script/login.
 SEED_TABLE = "decree_request_month_seed"
+
+# Decree-number extraction (see sync_decree_numbers()). Decree numbers start
+# with the year they were issued; anything else found on the page (older
+# decrees quoted in the history table) is ignored.
+DECREE_YEAR_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("DECREE_YEAR_PREFIXES", "2026,2027").split(",") if p.strip()
+)
+MAX_DECREE_LOOKUPS = int(os.environ.get("MAX_DECREE_LOOKUPS", "400"))
 
 # decree_request_events.created_by is NOT NULL with no default. Every OTHER
 # writer in this pipeline goes through decree_common.log_event(), which
@@ -666,6 +691,137 @@ def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dic
 
 
 # =====================================================================
+# Decree number (رقم القرار) for finally-approved requests
+# =====================================================================
+
+def extract_decree_numbers(html: str) -> List[str]:
+    """Decree numbers found in the 'القرارات' column of the request-history
+    table on /smc/Requests/Details/<id>. Ignores the recommendations column
+    (التوصيات) and any numbers hard-coded inside <script> blocks (the page's
+    PrevDec() JS contains an unrelated ParamDecreeId)."""
+    soup = BeautifulSoup(html, "html.parser")
+    found: List[str] = []
+    for th in soup.find_all("th"):
+        if th.get_text(strip=True) != "القرارات":
+            continue
+        table = th.find_parent("table")
+        if table is None:
+            continue
+        for a in table.find_all("a"):
+            txt = a.get_text(strip=True)
+            if re.fullmatch(r"\d{10,}", txt):
+                found.append(txt)
+                continue
+            m = re.search(r"DecreesReadyToSend=(\d+)", a.get("onclick", ""))
+            if m:
+                found.append(m.group(1))
+    return list(dict.fromkeys(found))
+
+
+def fetch_decree_number(session_wrapper, request_number: str):
+    """Returns (ok, decree_number_or_None).
+    ok=False                  -> details page could not be fetched/validated
+    ok=True,  decree is None  -> page fine, no decree on it (yet)
+    If several year-matching decrees are listed, the LAST one is used (the
+    most recently issued) and the full list is logged."""
+    url = f"{BASE_URL}/smc/Requests/Details/{request_number}"
+    for attempt in range(1, MAX_POPUP_ATTEMPTS + 1):
+        try:
+            r = session_wrapper.s.get(url, timeout=30)
+            if r.status_code == 200 and "Home/Index" in r.url and "username" in r.text.lower():
+                log.warning("  session expired during decree lookup — re-logging in …")
+                if not session_wrapper.login():
+                    return False, None
+                r = session_wrapper.s.get(url, timeout=30)
+        except Exception as e:
+            log.warning(f"  {request_number}: details attempt {attempt}/{MAX_POPUP_ATTEMPTS} error: {e}")
+            time.sleep(REQUEST_DELAY * attempt)
+            continue
+        if r.status_code == 200 and 'id="requestID"' in r.text:
+            wanted = [d for d in extract_decree_numbers(r.text) if d.startswith(DECREE_YEAR_PREFIXES)]
+            if len(wanted) > 1:
+                log.warning(f"  {request_number}: {len(wanted)} decree numbers on page {wanted} — using the last.")
+            return True, (wanted[-1] if wanted else None)
+        log.warning(f"  {request_number}: details attempt {attempt}/{MAX_POPUP_ATTEMPTS} — "
+                    f"HTTP {r.status_code} / not the details page")
+        time.sleep(REQUEST_DELAY * attempt)
+    return False, None
+
+
+def sync_decree_numbers(session_wrapper, status_map: Dict[str, dict]) -> Dict[str, int]:
+    """Fills decree_number for every Approved row that doesn't have one yet,
+    in decree_request_attempts and decree_request_month_seed. Oldest-checked
+    first (never-checked first), capped at MAX_DECREE_LOOKUPS per run. Only
+    ever writes decree_number / decree_number_checked_at."""
+    counters = {"checked": 0, "filled": 0, "no_decree": 0, "failed": 0, "crashed": 0, "capped": 0}
+    order = "decree_number_checked_at.asc.nullsfirst,id.asc"
+    targets: List[tuple] = []   # (table, row id, request number)
+
+    try:
+        for r in sb.select(
+            ATTEMPTS_TABLE, select="id,website_request_id",
+            filters={"website_request_id": "not.is.null",
+                     "smc_status_normalized": "eq.Approved",
+                     "decree_number": "is.null"},
+            order=order, limit=MAX_DECREE_LOOKUPS,
+        ):
+            targets.append((ATTEMPTS_TABLE, r["id"], str(r["website_request_id"])))
+
+        approved_statuses = sorted(a for a, v in status_map.items() if v.get("english_bucket") == "Approved")
+        for status in approved_statuses:
+            room = MAX_DECREE_LOOKUPS - len(targets)
+            if room <= 0:
+                break
+            for r in sb.select(
+                SEED_TABLE, select="id,request_number",
+                filters={"last_known_status": f"eq.{status}", "decree_number": "is.null"},
+                order=order, limit=room,
+            ):
+                targets.append((SEED_TABLE, r["id"], str(r["request_number"])))
+    except RuntimeError as e:
+        if "decree_number" in str(e):
+            log.error("decree_number column missing — run decree_number_value_migration.sql once. "
+                      "Skipping decree extraction this run.")
+            return counters
+        raise
+
+    if not targets:
+        log.info("Decree numbers: nothing to fill.")
+        return counters
+    if len(targets) >= MAX_DECREE_LOOKUPS:
+        counters["capped"] = 1
+        log.info(f"Decree numbers: hit the per-run cap ({MAX_DECREE_LOOKUPS}); the rest continues next run.")
+
+    cache: Dict[str, Optional[tuple]] = {}   # one fetch per request number per run
+    for table, row_id, request_number in targets:
+        counters["checked"] += 1
+        try:
+            if request_number not in cache:
+                cache[request_number] = fetch_decree_number(session_wrapper, request_number)
+                time.sleep(REQUEST_DELAY)
+            ok, decree = cache[request_number]
+            fields: Dict[str, object] = {"decree_number_checked_at": datetime.now().astimezone().isoformat()}
+            if ok and decree:
+                fields["decree_number"] = decree
+                counters["filled"] += 1
+                log.info(f"  {request_number} -> decree {decree}")
+            elif ok:
+                counters["no_decree"] += 1
+                log.info(f"  {request_number}: approved but no decree number on the page yet")
+            else:
+                counters["failed"] += 1
+            sb.update(table, row_id, fields)
+        except Exception as exc:
+            counters["crashed"] += 1
+            log.error(f"  decree lookup for {request_number} raised {type(exc).__name__}: {exc}")
+
+    log.info(f"Decree numbers done. Checked {counters['checked']}, filled {counters['filled']}, "
+             f"no decree yet {counters['no_decree']}, fetch failed {counters['failed']}, "
+             f"crashed {counters['crashed']}.")
+    return counters
+
+
+# =====================================================================
 # Per-attempt processing
 # =====================================================================
 
@@ -856,6 +1012,12 @@ def main():
         seed_counters = {"checked": 0, "updated": 0, "reached_final": 0}
         log.error(f"Seed table refresh failed (open-attempt sweep above still succeeded): {exc}")
 
+    try:
+        decree_counters = sync_decree_numbers(session_wrapper, status_map)
+    except Exception as exc:
+        decree_counters = {"checked": 0, "filled": 0, "no_decree": 0, "failed": 0, "crashed": 0, "capped": 0}
+        log.error(f"Decree number extraction failed (the sweep above still succeeded): {exc}")
+
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
@@ -885,6 +1047,19 @@ def main():
                 f"- Updated: **{seed_counters['updated']}**\n"
                 f"- Reached a final status this run: **{seed_counters['reached_final']}**\n"
             )
+
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n## Decree numbers (approved requests)\n"
+                f"- Looked up: **{decree_counters['checked']}**\n"
+                f"- Decree numbers filled: **{decree_counters['filled']}**\n"
+                f"- Approved but no number on the page yet: **{decree_counters['no_decree']}**\n"
+                f"- Fetch failed: **{decree_counters['failed']}**\n"
+            )
+            if decree_counters["capped"]:
+                f.write(f"\n> Hit the per-run cap ({MAX_DECREE_LOOKUPS}); remaining approved requests "
+                        f"continue on the next run. Raise `max_decree_lookups` for a bigger backfill.\n")
 
     if attempts and crashed > len(attempts) / 2:
         log.error(f"More than half of tonight's attempts crashed ({crashed}/{len(attempts)}) — "
