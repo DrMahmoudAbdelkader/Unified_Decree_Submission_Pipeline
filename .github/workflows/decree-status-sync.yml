@@ -15,6 +15,10 @@
 #   growing without bound, and what takes a finished request out of the
 #   tracker's live list.
 #
+#   It also stores the issued decree number (decree_number) of every
+#   finally-approved request, then decree-value-sync.yml starts after it
+#   to fetch each decree's value.
+#
 #   Since 2026-09-27 it also refreshes decree_request_month_seed (the
 #   full-month backfill table decree-status-tracking.js reads) in the same
 #   run, reusing the same SMC login/session — see sync_seed_table() in
@@ -68,6 +72,10 @@ on:
         description: "Bulk-window size in days (default 15)"
         required: false
         default: "15"
+      max_decree_lookups:
+        description: "Max approved requests to pull a decree number for (default 400). Raise for the one-time backfill, e.g. 3000."
+        required: false
+        default: "400"
 
 jobs:
   sync:
@@ -117,4 +125,5 @@ jobs:
           # does int(os.environ[...]) on them.
           MAX_SINGLE_STATUS_LOOKUPS: ${{ github.event.inputs.max_single_lookups || '300' }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '15' }}
+          MAX_DECREE_LOOKUPS: ${{ github.event.inputs.max_decree_lookups || '400' }}
         run: python decree_status_and_letters_sync.py

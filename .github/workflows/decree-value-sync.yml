@@ -1,0 +1,73 @@
+# .github/workflows/decree-value-sync.yml
+# ============================================================================
+# Fills decree_value (total value of each issued decree) right after the daily
+# status sync has stored the decree numbers.
+#
+# HOW IT STARTS
+#   - Automatically: whenever "Decree Status & Letters Sync (daily)" finishes
+#     successfully — that covers the nightly schedule AND a manual run of that
+#     workflow. (GitHub only honours workflow_run for workflows on the default
+#     branch, and the name below must match that workflow's `name:` exactly.)
+#   - Manually: Actions -> "Decree Values Sync" -> Run workflow.
+#
+# REQUIRED REPOSITORY SECRETS
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME_3 / SMC_PASSWORD_3 — the DIFFERENT SMC account for this job.
+#       Falls back to _2 / the default account (with a warning) if unset.
+# ============================================================================
+
+name: Decree Values Sync
+
+concurrency:
+  group: decree-value-sync
+  cancel-in-progress: false
+
+on:
+  workflow_run:
+    workflows: ["Decree Status & Letters Sync (daily)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      max_value_lookups:
+        description: "Max decrees to value this run (default 1000)"
+        required: false
+        default: "1000"
+
+jobs:
+  values:
+    # Skip when the status sync failed; always allow a manual run.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt
+
+      - name: Run decree value sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          MAX_VALUE_LOOKUPS: ${{ github.event.inputs.max_value_lookups || '1000' }}
+        run: python decree_value_sync.py
