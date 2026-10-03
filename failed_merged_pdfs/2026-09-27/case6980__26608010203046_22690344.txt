@@ -1,0 +1,8 @@
+case_id: 6980
+national_id: 26608010203046
+mdt (pre_request_id): 22690344
+failed_at_utc: 2026-09-27T23:48:53+00:00
+error: Could not load Requests/Create page for prid=22690344 (non-200/404) - this MDT's create-request form appears unavailable, most likely because a Request was already created against it.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22690344 on the SMC site and attach it.

@@ -1,0 +1,8 @@
+case_id: 7800
+national_id: 24804051701243
+mdt (pre_request_id): 22741659
+failed_at_utc: 2026-10-02T22:57:26+00:00
+error: Merged PDF is 10.38 MB and could not be compressed under 2.04 MB (tried Ghostscript + PyMuPDF fallback) — upload to the SMC portal would be rejected.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22741659 on the SMC site and attach it.

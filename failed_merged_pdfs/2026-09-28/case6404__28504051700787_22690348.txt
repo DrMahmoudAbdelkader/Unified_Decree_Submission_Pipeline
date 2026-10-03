@@ -1,0 +1,8 @@
+case_id: 6404
+national_id: 28504051700787
+mdt (pre_request_id): 22690348
+failed_at_utc: 2026-09-28T02:30:57+00:00
+error: Requests/SearchSSN returned 'MaxNumberOfRequestsReached' for patient 28504051700787, prid=22690348 — this pre-request has hit the UHIA max-requests limit; needs the PreRequest/Edit + re-print fallback, not a plain retry.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22690348 on the SMC site and attach it.
