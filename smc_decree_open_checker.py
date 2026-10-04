@@ -32,14 +32,20 @@ import requests
 from bs4 import BeautifulSoup
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-USERNAME = os.environ.get("SMC_USERNAME_3", "")
-PASSWORD = os.environ.get("SMC_PASSWORD_3", "")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-ONLY_DECREE = os.environ.get("ONLY_DECREE", "").strip()
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-DELAY = float(os.environ.get("DELAY", "0.6"))
-TRIGGER_TYPE = os.environ.get("TRIGGER_TYPE", "local")
+def env(name, default=""):
+    """Read an env var and strip stray whitespace/newlines (a very common
+    copy-paste artefact in GitHub secrets that breaks HTTP headers)."""
+    return (os.environ.get(name, default) or "").strip()
+
+
+USERNAME = env("SMC_USERNAME_3")
+PASSWORD = env("SMC_PASSWORD_3")
+SUPABASE_URL = env("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = env("SUPABASE_SERVICE_KEY")
+ONLY_DECREE = env("ONLY_DECREE")
+DRY_RUN = env("DRY_RUN", "false").lower() == "true"
+DELAY = float(env("DELAY", "0.6"))
+TRIGGER_TYPE = env("TRIGGER_TYPE", "local")
 
 BASE_URL = "https://smc.smcegy.com"
 LOGIN_URL = BASE_URL + "/smc/Home/Index"
