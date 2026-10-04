@@ -1,0 +1,45 @@
+# Place at: .github/workflows/decree-open-check.yml
+name: Decree open-status check
+
+on:
+  schedule:
+    - cron: "0 5 * * *"        # every 24h at 05:00 UTC (07:00/08:00 Cairo) – list is ready in the morning
+  workflow_dispatch:            # manual run: Actions tab -> "Decree open-status check" -> Run workflow
+    inputs:
+      decree_number:
+        description: "Optional – check ONE decree number only"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run (read SMC and print, write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: decree-open-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install requests beautifulsoup4
+
+      - name: Run checker
+        env:
+          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ONLY_DECREE: ${{ github.event.inputs.decree_number }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          TRIGGER_TYPE: ${{ github.event_name }}
+        run: python smc_decree_open_checker.py
