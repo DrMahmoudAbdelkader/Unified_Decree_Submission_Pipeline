@@ -718,6 +718,12 @@ def main():
     cases = sb.select(common.CASES_TABLE, select="*", filters=filters, order="created_at.asc")
     log.info(f"{len(cases)} case(s) with case_status=READY_TO_SUBMIT" + (f" matching case_ids={case_ids}" if case_ids else ""))
 
+    # TOP-UP: a retry request whose cycle counts / signed invoices are not READY must not even
+    # start - preparing it creates a REAL MDT on SMC before the finalize stages would refuse it.
+    # (The edge function only gates explicit case_ids; bulk runs are gated here.)
+    import topup_gate
+    cases, topup_blocked = topup_gate.split_ready(cases)
+
     results = []
     # Performance: batch-fetch all national_ids for this run's cases in
     # one DB round-trip instead of one per case (see decree_common.py's
@@ -788,6 +794,9 @@ def main():
         # unhandled error partway through the batch, so nothing is left
         # running after this script exits.
         shutdown_shared_browser()
+    for b in topup_blocked:
+        log.warning(f"case {b['case_id']}: top-up evidence not ready - skipped ({b['message']})")
+        results.append({"case_id": b["case_id"], "status": "topup_not_ready", "message": b["message"]})
     summary = {
         "total": len(results),
         "submitted": sum(1 for r in results if r["status"] == "submitted"),

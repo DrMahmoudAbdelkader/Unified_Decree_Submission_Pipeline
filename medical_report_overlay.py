@@ -196,7 +196,8 @@ def _wrap_text(text: str, font_name: str, font_size: float, max_width: float,
 
 
 def _draw_overlay(page_width: float, page_height: float, full_name: str,
-                   national_id: str, tumor_cfg: Dict, plan_text: str) -> bytes:
+                   national_id: str, tumor_cfg: Dict, plan_text: str,
+                   cycles_statement: Optional[str] = None) -> bytes:
     """Draws the dynamic overlay (name/ID + statement) as its own PDF page
     the same size as the template, ready to be merged on top of it."""
     _register_fonts()
@@ -248,34 +249,56 @@ def _draw_overlay(page_width: float, page_height: float, full_name: str,
     c.setFillColorRGB(0, 0, 0)
 
     max_text_width = (box_x1 - box_x0) - 2 * _STATEMENT_PAD_X
-    c.setFont(_FONT_NAME_BOLD, _STATEMENT_FONT_SIZE)
 
+    # Build the lines first (nothing drawn yet) so that, when a top-up
+    # "cycles received / remaining" statement is appended, the whole text can
+    # be scaled down to still fit inside the bordered box instead of running
+    # over its edge. Without cycles_statement the scale stays 1.0 unless the
+    # plan text itself already overflowed, so normal output is unchanged.
     opening_statement = tumor_cfg.get("opening_statement")
     if opening_statement:
         # --- Explicit Arabic clinical phrase (breast / blood tumor) ---
         # Kept exactly as the template's own style: right-to-left,
         # right-aligned, plan appended after the opening phrase.
         full_sentence = f"{opening_statement} {plan_text}".strip()
-        lines = _wrap_text(full_sentence, _FONT_NAME_BOLD, _STATEMENT_FONT_SIZE,
-                            max_text_width, is_rtl_source=True)
-        text_y = to_reportlab_y(box_y0 + _STATEMENT_PAD_TOP + _STATEMENT_FONT_SIZE)
-        for line in lines:
-            shaped = _shape_arabic(line)
-            c.drawRightString(box_x1 - _STATEMENT_PAD_X, text_y, shaped)
-            text_y -= _STATEMENT_LINE_HEIGHT
+        main_rtl = True
     else:
         # --- Generic case: English cancer-type name, not Arabic. -------
         # "A patient of {English label} for {plan}" - plan inserted
         # verbatim (whatever the user put in Column B, any language).
         english_label = tumor_cfg.get("label", "").lower()
         full_sentence = f"A patient of {english_label} for {plan_text}".strip()
-        lines = _wrap_text(full_sentence, _FONT_NAME_BOLD, _STATEMENT_FONT_SIZE,
-                            max_text_width, is_rtl_source=False)
-        text_y = to_reportlab_y(box_y0 + _STATEMENT_PAD_TOP + _STATEMENT_FONT_SIZE)
-        for line in lines:
-            shaped = _shape_mixed_ltr(line)
-            c.drawString(box_x0 + _STATEMENT_PAD_X, text_y, shaped)
-            text_y -= _STATEMENT_LINE_HEIGHT
+        main_rtl = False
+
+    font_size = _STATEMENT_FONT_SIZE
+    line_height = _STATEMENT_LINE_HEIGHT
+    scale = 1.0
+    while True:
+        main_lines = _wrap_text(full_sentence, _FONT_NAME_BOLD, font_size, max_text_width,
+                                is_rtl_source=main_rtl)
+        cycle_lines = (_wrap_text(cycles_statement.strip(), _FONT_NAME_BOLD, font_size,
+                                  max_text_width, is_rtl_source=True)
+                       if cycles_statement else [])
+        needed = _STATEMENT_PAD_TOP + (len(main_lines) + len(cycle_lines)) * line_height + 4
+        # only ever shrink for a top-up statement; plain requests keep the old fixed size
+        if not cycles_statement or needed <= (box_y1 - box_y0) or scale <= 0.70:
+            break
+        scale -= 0.05
+        font_size = _STATEMENT_FONT_SIZE * scale
+        line_height = _STATEMENT_LINE_HEIGHT * scale
+
+    c.setFont(_FONT_NAME_BOLD, font_size)
+    text_y = to_reportlab_y(box_y0 + _STATEMENT_PAD_TOP + font_size)
+    for line in main_lines:
+        if main_rtl:
+            c.drawRightString(box_x1 - _STATEMENT_PAD_X, text_y, _shape_arabic(line))
+        else:
+            c.drawString(box_x0 + _STATEMENT_PAD_X, text_y, _shape_mixed_ltr(line))
+        text_y -= line_height
+    # Top-up statement: always Arabic, right-aligned, on its own lines below the plan.
+    for line in cycle_lines:
+        c.drawRightString(box_x1 - _STATEMENT_PAD_X, text_y, _shape_arabic(line))
+        text_y -= line_height
 
     c.showPage()
     c.save()
@@ -284,7 +307,7 @@ def _draw_overlay(page_width: float, page_height: float, full_name: str,
 
 
 def build_medical_report_pdf(full_name: str, national_id: str, plan_text: str,
-                              tumor_cfg: Dict) -> bytes:
+                              tumor_cfg: Dict, cycles_statement: Optional[str] = None) -> bytes:
     """Returns the finished, single-page medical report PDF as bytes:
     the template page with the dynamic name/ID/statement overlay merged
     on top of it.
@@ -295,10 +318,13 @@ def build_medical_report_pdf(full_name: str, national_id: str, plan_text: str,
         plan_text:    Column B's treatment-plan text, verbatim.
         tumor_cfg:    one entry from TUMOR_TYPE_CONFIG (must contain at
                       least "label" and "opening_statement").
+        cycles_statement: optional Arabic sentence appended under the plan for
+                      top-up (التجديد في نهاية المده) requests only - cycles
+                      received / still to be received. None = unchanged output.
     """
     page_width, page_height = _get_template_page_size()
     overlay_bytes = _draw_overlay(page_width, page_height, full_name,
-                                   national_id, tumor_cfg, plan_text)
+                                   national_id, tumor_cfg, plan_text, cycles_statement)
 
     template_reader = PdfReader(io.BytesIO(_get_template_bytes()))
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))

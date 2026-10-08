@@ -780,8 +780,17 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
     tumor_cfg = pipeline_state["tumor_cfg"]
     medical_report_text = pipeline_state["medical_report_text"]
     state = dict(pipeline_state)   # kept in step with pre_request_id whenever an MDT is re-created
+    import topup_gate   # top-up (التجديد في نهاية المده) evidence; a no-op for every normal request
 
     try:
+        # TOP-UP: refuse (-> FAILED + operator requirement) if this is a top-up retry whose
+        # cycle counts / signed invoices are not READY, then append the approved signed
+        # invoices after the patient document. Re-binding patient_pdf_path here means every
+        # re-merge in the fallbacks below includes them too. Not a top-up -> nothing changes.
+        topup_gate.assert_ready(case_id)
+        patient_pdf_path = topup_gate.with_invoices(case_id, patient_pdf_path)
+        topup_cycles_statement = topup_gate.cycles_statement(case_id)
+
         # NOTE: no DMS/CMIS archive collection happens here. That happens
         # during PREPARE (decree_submission_prepare.py's
         # resolve_patient_document()), using ONE window (ARCHIVE_WINDOW_DAYS,
@@ -810,7 +819,8 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
                 session, case_id, attempt_id, national_id, state, reason="print page returned 404")
 
         log.info("  [Stage 3] Building medical report …")
-        report_pdf_bytes = build_medical_report_pdf(full_name, national_id, medical_report_text, tumor_cfg)
+        report_pdf_bytes = build_medical_report_pdf(full_name, national_id, medical_report_text, tumor_cfg,
+                                                    cycles_statement=topup_cycles_statement)
 
         log.info("  [Stage 5] Merging MDT + report + patient document …")
         merged_pdf_path = _build_merged_pdf(national_id, pre_request_id, mdt_signed_bytes,
