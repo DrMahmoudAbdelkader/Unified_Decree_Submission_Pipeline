@@ -1,6 +1,8 @@
 # .github/workflows/topup-evidence-fetch.yml
-# Fetches the signed invoice PDFs (HospDecreeReceipts/ReadFiles) for top-up candidates.
-# Runs nightly AFTER the status sync + value sync chain, and on demand.
+# 1) drains the "فحص قرارات المريض" lookups pressed on the top-up page   (topup_decree_lookup.py - fast)
+# 2) fetches the signed invoice PDFs for top-up candidates               (topup_evidence_fetch.py)
+# Runs nightly AFTER the status sync + value sync chain, on demand, and when the top-up page's
+# buttons «جلب الفواتير الآن» / «فحص قرارات المريض» start it (workflow_dispatch, no inputs).
 # Uses SMC_USERNAME_3 (same account as the value sync) - falls back to _2 / default.
 name: Top-up Evidence Fetch
 
@@ -23,7 +25,16 @@ jobs:
   fetch:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+      SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+      SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+      SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+      SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+      SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,22 +46,29 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-      - run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
+
+      # quick, so the button on the page answers within a minute or two
+      - name: Patient decree lookups (pressed on the page)
+        continue-on-error: true
+        env:
+          MAX_LOOKUPS: "10"
+        run: python topup_decree_lookup.py
+
+      # only needed by the invoice fallback (render the printed Details page, then sign it)
+      - name: Install Chromium (invoice fallback)
+        run: playwright install --with-deps chromium
+      - name: Install Arabic font (invoice fallback)
+        run: sudo apt-get install -y fonts-hosny-amiri
+
       - name: Fetch signed invoices
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
-          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
-          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
-          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
-          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
-          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          RECEIPTS_LIST_URL_TEMPLATE: ${{ vars.RECEIPTS_LIST_URL_TEMPLATE }}
           SIGNED_MIN_IMAGES: ${{ vars.SIGNED_MIN_IMAGES }}
+          SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}
           MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '25' }}
         run: python topup_evidence_fetch.py
