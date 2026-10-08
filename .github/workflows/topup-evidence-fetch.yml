@@ -1,8 +1,12 @@
 # .github/workflows/topup-evidence-fetch.yml
-# 1) drains the "فحص قرارات المريض" lookups pressed on the top-up page   (topup_decree_lookup.py - fast)
-# 2) fetches the signed invoice PDFs for top-up candidates               (topup_evidence_fetch.py)
-# Runs nightly AFTER the status sync + value sync chain, on demand, and when the top-up page's
-# buttons «جلب الفواتير الآن» / «فحص قرارات المريض» start it (workflow_dispatch, no inputs).
+# Three steps, in this order (each needs the one before it):
+#   1) drains the "فحص قرارات المريض" lookups   (topup_decree_lookup.py  - fast; also created
+#      automatically for «يفاد بقرار اللجنه السابقه» letters)
+#   2) fetches the PREVIOUS DECREE REPORT PDF for those letters           (topup_report_fetch.py)
+#   3) fetches the signed invoice PDFs for «التجديد في نهاية المده»        (topup_evidence_fetch.py)
+# National-ID-card letters need no job: a person fixes the card and presses «تم التصحيح» on the page.
+# Runs nightly AFTER the status sync + value sync chain, on demand, and when the page's buttons
+# «جلب الفواتير الآن» / «فحص قرارات المريض» start it (workflow_dispatch, no inputs needed).
 # Uses SMC_USERNAME_3 (same account as the value sync) - falls back to _2 / default.
 name: Top-up Evidence Fetch
 
@@ -17,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       max_candidates:
-        description: "Max candidates this run (default 25)"
+        description: "Max invoice candidates this run (default 25)"
         required: false
         default: "25"
 
@@ -25,7 +29,7 @@ jobs:
   fetch:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -35,6 +39,10 @@ jobs:
       SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
       SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
       SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,26 +57,32 @@ jobs:
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
 
-      # works through the whole queue (≈7 s per patient; up to 300 / 30 min per run)
-      - name: Patient decree lookups (pressed on the page)
+      # 1) works through the whole lookup queue (≈7 s per patient; up to 300 / 30 min per run)
+      - name: Patient decree lookups (pressed on the page / new previous-report letters)
         continue-on-error: true
         env:
           MAX_LOOKUPS: "300"
           LOOKUP_TIME_BUDGET_MIN: "30"
         run: python topup_decree_lookup.py
 
-      # only needed by the invoice fallback (render the printed Details page, then sign it)
-      - name: Install Chromium (invoice fallback)
+      # Chromium + an Arabic font: the previous-decree report is PRINTED from the SMC page, and the
+      # invoice fallback renders a Details page — both need them.
+      - name: Install Chromium (report print + invoice fallback)
         run: playwright install --with-deps chromium
-      - name: Install Arabic font (invoice fallback)
+      - name: Install Arabic font
         run: sudo apt-get install -y fonts-hosny-amiri
 
+      # 2) previous decree report (letters "يفاد بقرار اللجنه السابقه")
+      - name: Fetch previous-decree reports
+        continue-on-error: true
+        env:
+          MAX_REPORTS: "40"
+          REPORT_TIME_BUDGET_MIN: "25"
+        run: python topup_report_fetch.py
+
+      # 3) signed invoices (letters "التجديد في نهاية المده")
       - name: Fetch signed invoices
         env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           SIGNED_MIN_IMAGES: ${{ vars.SIGNED_MIN_IMAGES }}
           SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}
           MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '25' }}
