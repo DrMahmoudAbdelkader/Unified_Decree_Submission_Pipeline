@@ -39,7 +39,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
-MAX_LOOKUPS = int(os.environ.get("MAX_LOOKUPS") or "10")
+MAX_LOOKUPS = int(os.environ.get("MAX_LOOKUPS") or "300")          # total per run (was a single batch of 10)
+BATCH = int(os.environ.get("LOOKUP_BATCH") or "25")                # fetched from the queue this many at a time
+TIME_BUDGET_MIN = int(os.environ.get("LOOKUP_TIME_BUDGET_MIN") or "30")  # stop starting new ones after this
 MAX_DECREES_PER_PATIENT = int(os.environ.get("MAX_DECREES_PER_PATIENT") or "40")
 MAX_SEARCH_PAGES = 6
 DELAY = 0.3
@@ -227,9 +229,12 @@ def main():
     except Exception as e:
         log.warning(f"stale release skipped: {e}")
 
-    todo = _rest("GET", CAND, params={"select": "id,patient_id", "lookup_status": "eq.PENDING",
-                                      "order": "lookup_requested_at.asc", "limit": MAX_LOOKUPS}) or []
-    log.info(f"{len(todo)} lookup(s) pending.")
+    def next_batch(n):
+        return _rest("GET", CAND, params={"select": "id,patient_id", "lookup_status": "eq.PENDING",
+                                          "order": "lookup_requested_at.asc", "limit": n}) or []
+
+    todo = next_batch(min(BATCH, MAX_LOOKUPS))
+    log.info(f"{len(todo)} lookup(s) in the first batch (cap {MAX_LOOKUPS} per run, {TIME_BUDGET_MIN} min budget).")
     if not todo:
         return
     _p.USERNAME, _p.PASSWORD = u, p
@@ -239,17 +244,27 @@ def main():
             _set(c["id"], lookup_status="ERROR", lookup_message="فشل تسجيل الدخول إلى SMC",
                  lookup_finished_at=datetime.now(timezone.utc).isoformat())
         sys.exit(1)
-    for c in todo:
-        _set(c["id"], lookup_status="RUNNING")
-        try:
-            n = lookup_one(smc, c)
-            _set(c["id"], lookup_status="DONE", lookup_message=f"{n} قرار",
-                 lookup_finished_at=datetime.now(timezone.utc).isoformat())
-            log.info(f"candidate {c['id']}: {n} decree(s)")
-        except Exception as e:
-            log.exception(f"candidate {c['id']} lookup failed")
-            _set(c["id"], lookup_status="ERROR", lookup_message=f"{type(e).__name__}: {str(e)[:200]}",
-                 lookup_finished_at=datetime.now(timezone.utc).isoformat())
+    deadline = time.time() + TIME_BUDGET_MIN * 60
+    processed = 0
+    while todo:
+        for c in todo:
+            _set(c["id"], lookup_status="RUNNING")
+            try:
+                n = lookup_one(smc, c)
+                _set(c["id"], lookup_status="DONE", lookup_message=f"{n} قرار",
+                     lookup_finished_at=datetime.now(timezone.utc).isoformat())
+                log.info(f"candidate {c['id']}: {n} decree(s)")
+            except Exception as e:
+                log.exception(f"candidate {c['id']} lookup failed")
+                _set(c["id"], lookup_status="ERROR", lookup_message=f"{type(e).__name__}: {str(e)[:200]}",
+                     lookup_finished_at=datetime.now(timezone.utc).isoformat())
+            processed += 1
+        if processed >= MAX_LOOKUPS or time.time() > deadline:
+            break
+        todo = next_batch(min(BATCH, MAX_LOOKUPS - processed))   # ERROR rows are no longer PENDING, so this always ends
+    left = len(next_batch(1000))
+    log.info(f"done: {processed} processed this run; {left} still PENDING"
+             + (" (cap/time budget reached - they run on the next press or the nightly run)" if left else "."))
 
 
 if __name__ == "__main__":
