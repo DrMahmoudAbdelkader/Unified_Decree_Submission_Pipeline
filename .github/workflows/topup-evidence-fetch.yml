@@ -25,7 +25,7 @@ jobs:
   fetch:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -49,11 +49,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
 
-      # quick, so the button on the page answers within a minute or two
+      # works through the whole queue (≈7 s per patient; up to 300 / 30 min per run)
       - name: Patient decree lookups (pressed on the page)
         continue-on-error: true
         env:
-          MAX_LOOKUPS: "10"
+          MAX_LOOKUPS: "300"
+          LOOKUP_TIME_BUDGET_MIN: "30"
         run: python topup_decree_lookup.py
 
       # only needed by the invoice fallback (render the printed Details page, then sign it)
