@@ -1,0 +1,56 @@
+# .github/workflows/topup-evidence-fetch.yml
+# Fetches the signed invoice PDFs (HospDecreeReceipts/ReadFiles) for top-up candidates.
+# Runs nightly AFTER the status sync + value sync chain, and on demand.
+# Uses SMC_USERNAME_3 (same account as the value sync) - falls back to _2 / default.
+name: Top-up Evidence Fetch
+
+concurrency:
+  group: topup-evidence-fetch
+  cancel-in-progress: false
+
+on:
+  workflow_run:
+    workflows: ["Decree Values Sync"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      max_candidates:
+        description: "Max candidates this run (default 25)"
+        required: false
+        default: "25"
+
+jobs:
+  fetch:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy
+      - name: Fetch signed invoices
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          RECEIPTS_LIST_URL_TEMPLATE: ${{ vars.RECEIPTS_LIST_URL_TEMPLATE }}
+          SIGNED_MIN_IMAGES: ${{ vars.SIGNED_MIN_IMAGES }}
+          MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '25' }}
+        run: python topup_evidence_fetch.py
