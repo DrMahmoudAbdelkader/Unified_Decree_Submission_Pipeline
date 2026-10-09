@@ -126,7 +126,15 @@ def previous_decrees(c: dict) -> list[str]:
     atts = sb.select("decree_request_attempts", select="id,decree_number",
                      filters={"case_id": "in.(" + ",".join(map(str, case_ids)) + ")",
                               "decree_number": "not.is.null"}, order="id.asc", limit=1000)
-    return list(dict.fromkeys(str(a["decree_number"]) for a in atts))
+    decrees = list(dict.fromkeys(str(a["decree_number"]) for a in atts))
+    # protocols.max_previous_decrees (e.g. 'supportive' = 1): only the NEWEST previous decrees' invoices
+    try:
+        pr = sb.select("decree_topup_protocols", select="max_previous_decrees",
+                       filters={"protocol_key": f"eq.{c['protocol_key']}"}, limit=1)
+        lim = (pr[0].get("max_previous_decrees") if pr else None)
+    except Exception as e:
+        log.warning(f"max_previous_decrees lookup skipped: {e}"); lim = None
+    return decrees[-int(lim):] if lim else decrees
 
 
 # --------------------------------------------------------------------------- SMC calls
