@@ -47,6 +47,12 @@ MAX_SEARCH_PAGES = 6
 DELAY = 0.3
 CAND, LOOK = "decree_topup_candidates", "decree_topup_decree_lookup"
 
+
+# "run only these entries": the page passes candidate ids through the workflow input candidate_ids
+# (comma separated). Empty = the whole queue (nightly run / the page's «تشغيل الطلب الآن»).
+ONLY_IDS = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
+ONLY_ID_FILTER = ("in.(" + ",".join(map(str, ONLY_IDS)) + ")") if ONLY_IDS else None
+
 _AR = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 
@@ -230,8 +236,11 @@ def main():
         log.warning(f"stale release skipped: {e}")
 
     def next_batch(n):
-        return _rest("GET", CAND, params={"select": "id,patient_id", "lookup_status": "eq.PENDING",
-                                          "order": "lookup_requested_at.asc", "limit": n}) or []
+        prm = {"select": "id,patient_id", "lookup_status": "eq.PENDING",
+               "order": "lookup_requested_at.asc", "limit": n}
+        if ONLY_ID_FILTER:
+            prm["id"] = ONLY_ID_FILTER
+        return _rest("GET", CAND, params=prm) or []
 
     todo = next_batch(min(BATCH, MAX_LOOKUPS))
     log.info(f"{len(todo)} lookup(s) in the first batch (cap {MAX_LOOKUPS} per run, {TIME_BUDGET_MIN} min budget).")

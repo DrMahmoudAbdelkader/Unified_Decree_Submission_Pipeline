@@ -404,9 +404,12 @@ def main():
         _rpc("topup_release_stale_fetching", {"p_minutes": 45})
     except Exception as e:
         log.warning(f"stale release skipped: {e}")
-    rows = sb.select(CAND, select="*", filters={"evidence_status": "eq.PENDING",
-                     "protocol_key": "not.is.null", "status": "not.in.(SUBMITTED,DISMISSED)"},
-                     order="id.asc", limit=MAX_CANDIDATES)
+    flt = {"evidence_status": "eq.PENDING", "protocol_key": "not.is.null",
+           "status": "not.in.(SUBMITTED,DISMISSED)"}
+    only = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
+    if only:                       # the page asked for these entries only
+        flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
+    rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=MAX_CANDIDATES)
     log.info(f"{len(rows)} candidate(s) to fetch evidence for.")
     s3, bucket = _r2(), os.environ["R2_BUCKET_NAME"]
     for c in rows:

@@ -49,6 +49,10 @@ MAX_REPORTS = int(os.environ.get("MAX_REPORTS") or "40")
 TIME_BUDGET_MIN = int(os.environ.get("REPORT_TIME_BUDGET_MIN") or "25")
 DELAY = 0.4
 CAND, INV, LOOKV = "decree_topup_candidates", "decree_topup_invoices", "decree_topup_lookup_view"
+# "run only these entries": the page passes candidate ids through the workflow input candidate_ids
+# (comma separated). Empty = the whole queue (nightly run / the page's «تشغيل الطلب الآن»).
+ONLY_IDS = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
+ONLY_ID_FILTER = ("in.(" + ",".join(map(str, ONLY_IDS)) + ")") if ONLY_IDS else None
 SCALES = (1.0, 0.95, 0.92, 0.9)   # first scale that keeps the print on ONE page (same as the manual print)
 
 _AR = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -276,10 +280,12 @@ def main():
     if not u:
         log.error("No SMC credentials set."); sys.exit(1)
 
-    rows = _rest("GET", CAND, params={
-        "select": "id,patient_id,manual_decree_numbers,lookup_status",
-        "kind": "eq.PREV_REPORT", "evidence_status": "eq.REPORT_PENDING",
-        "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)", "order": "id.asc", "limit": MAX_REPORTS}) or []
+    prm = {"select": "id,patient_id,manual_decree_numbers,lookup_status",
+           "kind": "eq.PREV_REPORT", "evidence_status": "eq.REPORT_PENDING",
+           "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)", "order": "id.asc", "limit": MAX_REPORTS}
+    if ONLY_ID_FILTER:
+        prm["id"] = ONLY_ID_FILTER
+    rows = _rest("GET", CAND, params=prm) or []
     log.info(f"{len(rows)} previous-decree report(s) to fetch.")
     if not rows:
         return
