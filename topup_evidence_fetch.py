@@ -432,8 +432,17 @@ _BBOX_JS = (
     "l = Math.min(l, q.left + window.scrollX); }); "
     "return { r: r, b: b, l: l === 1e9 ? 0 : l }; }"
 )
-_ROWS_JS = ("() => Array.from(document.querySelectorAll('table tr')).slice(0, 40)"
-            ".map(r => (r.innerText || '').replace(/\\s+/g, ' ').slice(0, 28))")
+# FULL text of EVERY row, cell by cell (cells joined with " | " so the date column and the hand-written
+# notes column stay separate). No length cap and no row cap. Values typed into <input>/<textarea>/<select>
+# are NOT part of innerText, so they are appended explicitly - a hand-written note may live in one of those.
+_ROWS_JS = (
+    "() => Array.from(document.querySelectorAll('table tr')).map(r => "
+    "Array.from(r.children).map(c => { "
+    "let t = (c.innerText || '').replace(/\\s+/g, ' ').trim(); "
+    "c.querySelectorAll('input,textarea,select').forEach(i => { "
+    "const v = (i.value || '').trim(); if (v && !t.includes(v)) t += ' ' + v; }); "
+    "return t; }).join(' | '))"
+)
 _LOGIN_MARKERS = ("اسم المستخدم", "كلمة السر")
 _FONT_PROBE_JS = (
     "() => { const f = (e) => e ? getComputedStyle(e).fontFamily : ''; "
@@ -528,7 +537,14 @@ def _render_once(smc: SMCSession, receipt: str, extra: int, mode: str = "proxy")
                 raise SessionExpired(f"receipt {receipt} not found on the rendered page (not the invoice)")
 
             try:
-                log.info(f"invoice {receipt}: item rows as loaded = {page.evaluate(_ROWS_JS)}")
+                rows = page.evaluate(_ROWS_JS)
+                log.info(f"invoice {receipt}: item rows as loaded ({len(rows)} rows, full text) = {rows}")
+                _rd = os.environ.get("TOPUP_ROWS_DIR")          # optional: one JSON file per invoice for parser tests
+                if _rd:
+                    import json
+                    os.makedirs(_rd, exist_ok=True)
+                    with open(os.path.join(_rd, f"{receipt}.json"), "w", encoding="utf-8") as _f:
+                        json.dump({"receipt": receipt, "rows": rows}, _f, ensure_ascii=False, indent=1)
             except Exception:
                 pass
             page.emulate_media(media="print")                      # the site's own print stylesheet FIRST
