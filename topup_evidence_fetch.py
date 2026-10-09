@@ -49,6 +49,7 @@ READ_URL = BASE_URL + "/smc/HospDecreeReceipts/ReadFiles"
 CREATE_URL = BASE_URL + "/smc/HospDecreeReceipts/Create?decreeId={decree}"   # the page that fires the listing XHR
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES") or "25")
+TIME_BUDGET_MIN = int(os.environ.get("EVIDENCE_TIME_BUDGET_MIN") or "90")   # stop STARTING new entries after this; the rest stay PENDING for the next run
 # EVERY invoice SMC lists for a previous decree is collected, whatever its status (approved, returned with an
 # approval error, pending ...). The status text is only logged and kept in `verification.listing` for reference;
 # it never decides whether the invoice is included or whether it needs review.
@@ -342,6 +343,14 @@ def sign_with_script(data: bytes):
             return f.read(), layout
 
 
+def pdf_has_number(data: bytes, number: str) -> bool:
+    """Chromium (and SMC's own prints) store Arabic-Indic digit runs in visual order, so the receipt number is
+    found REVERSED in the text layer (22750956 -> 65905722). Accept either order."""
+    t = pdf_text_digits(data)
+    n = str(number)
+    return bool(n) and (n in t or n[::-1] in t)
+
+
 def pdf_text_digits(data: bytes) -> str:
     """All text of the PDF, Arabic-Indic digits -> ASCII, whitespace removed (for number lookups)."""
     import pymupdf
@@ -443,14 +452,64 @@ def _cookies_for_browser(smc: SMCSession) -> list:
     return out
 
 
-def _render_once(smc: SMCSession, receipt: str, extra: int) -> bytes:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
-        br = pw.chromium.launch()
+_PW = None
+_BR = None
+
+
+def _browser():
+    """ONE Chromium for the whole run (launching it per invoice cost ~2 s each)."""
+    global _PW, _BR
+    if _BR is not None and not _BR.is_connected():
+        close_browser()
+    if _BR is None:
+        from playwright.sync_api import sync_playwright
+        _PW = sync_playwright().start()
+        _BR = _PW.chromium.launch()
+    return _BR
+
+
+def close_browser() -> None:
+    global _PW, _BR
+    for obj, meth in ((_BR, "close"), (_PW, "stop")):
+        try:
+            if obj is not None:
+                getattr(obj, meth)()
+        except Exception:
+            pass
+    _PW = _BR = None
+
+
+def _proxy_handler(smc: SMCSession):
+    """Every request the page makes to the SMC host is answered through the SAME `requests` session that already
+    listed the invoices and read the Details page successfully. The browser never has to log in by itself - that was
+    what sent it to the SMC login page again and again although the session was fine."""
+    def handle(route):
+        req = route.request
+        if not req.url.startswith(BASE_URL):
+            return route.continue_()
+        try:
+            hdr = {k: v for k, v in req.headers.items()
+                   if k.lower() in ("accept", "content-type", "x-requested-with", "referer", "origin", "accept-language")}
+            r = smc.s.request(req.method, req.url, data=req.post_data_buffer, headers=hdr, timeout=60, allow_redirects=True)
+            return route.fulfill(status=r.status_code, body=r.content,
+                                 headers={"content-type": r.headers.get("content-type", "application/octet-stream")})
+        except Exception as exc:
+            log.warning(f"proxy request failed for {req.url[:90]}: {exc}")
+            return route.abort()
+    return handle
+
+
+def _render_once(smc: SMCSession, receipt: str, extra: int, mode: str = "proxy") -> bytes:
+    br = _browser()
+    if True:
+        ctx = None
         try:
             # small window so layout is driven by the content, not by a 1280px browser window
             ctx = br.new_context(viewport={"width": 700, "height": 800})
-            ctx.add_cookies(_cookies_for_browser(smc))
+            if mode == "proxy":
+                ctx.route("**/*", _proxy_handler(smc))
+            else:
+                ctx.add_cookies(_cookies_for_browser(smc))
             page = ctx.new_page()
             page.goto(DETAILS_URL.format(rid=receipt), wait_until="load", timeout=60_000)
             try:
@@ -514,53 +573,11 @@ def _render_once(smc: SMCSession, receipt: str, extra: int) -> bytes:
                     f.write(pdf)
             return pdf
         finally:
-            br.close()
-
-
-def tighten_pdf(data: bytes, margin: float = 18.0, min_width: float = 420.0) -> bytes:
-    """Crop every page of the rendered invoice to its REAL content (text, images, ruled lines/shaded bands that
-    are not page-wide white backgrounds) and stack the pages into ONE page: no blank top/bottom/side areas,
-    no page-break gap. Runs on the unsigned render, before signature_script sees it."""
-    import pymupdf
-    src = pymupdf.open(stream=data, filetype="pdf")
-    try:
-        parts = []                                    # (page_index, clip rect)
-        for i, pg in enumerate(src):
-            pw, ph = pg.rect.width, pg.rect.height
-            rects = [pymupdf.Rect(w[:4]) for w in pg.get_text("words") if w[4].strip()]
-            for info in pg.get_image_info():
-                rects.append(pymupdf.Rect(info["bbox"]))
-            for d in pg.get_drawings():
-                r = d["rect"]
-                if r.width >= pw * 0.995 and r.height >= ph * 0.5:      # page-sized background, not content
-                    continue
-                if r.is_empty and r.width == 0 and r.height == 0:
-                    continue
-                rects.append(pymupdf.Rect(r))
-            rects = [r for r in rects if not r.is_infinite]
-            if not rects:
-                continue
-            u = pymupdf.Rect(rects[0])
-            for r in rects[1:]:
-                u |= r
-            u = pymupdf.Rect(max(u.x0 - 2, 0), max(u.y0 - 2, 0), min(u.x1 + 2, pw), min(u.y1 + 2, ph))
-            parts.append((i, u))
-        if not parts:
-            return data
-        x0 = min(r.x0 for _, r in parts)
-        x1 = max(r.x1 for _, r in parts)
-        cw = max(x1 - x0, min_width - 2 * margin)
-        out = pymupdf.open()
-        total_h = sum(r.height for _, r in parts) + 2 * margin
-        page = out.new_page(width=cw + 2 * margin, height=total_h)
-        y = margin
-        for i, r in parts:
-            dst = pymupdf.Rect(margin + (r.x0 - x0), y, margin + (r.x1 - x0), y + r.height)
-            page.show_pdf_page(dst, src, i, clip=r)
-            y += r.height
-        return out.tobytes(deflate=True, garbage=3)
-    finally:
-        src.close()
+            try:
+                if ctx is not None:
+                    ctx.close()
+            except Exception:
+                pass
 
 
 def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
@@ -572,19 +589,37 @@ def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
     _install_invoice_font()
     extra = int(os.environ.get("INVOICE_WIDEN_PX", "55"))
     last = None
-    for attempt in (1, 2, 3):
+    for attempt, mode in ((1, "proxy"), (2, "proxy"), (3, "cookies")):
         try:
-            return _render_once(smc, receipt, extra)
+            return _render_once(smc, receipt, extra, mode)
         except SessionExpired as e:
             last = e
-            log.warning(f"{e} - re-login and retry ({attempt}/3)")
-            time.sleep(3)
+            log.warning(f"{e} [{mode}] - re-login and retry ({attempt}/3)")
+            time.sleep(2)
             if not smc.login():
                 log.warning("SMC re-login failed")
+        except Exception as e:                                   # browser crashed / page timed out: fresh browser, try again
+            last = e
+            log.warning(f"render error [{mode}] {type(e).__name__}: {str(e)[:120]} - restarting the browser ({attempt}/3)")
+            close_browser()
     raise RuntimeError(f"could not render receipt {receipt}: {last}")
 
 
 # --------------------------------------------------------------------------- one invoice
+def friendly_error(err: str) -> str:
+    """Short Arabic hint for an invoice that could not be built (the raw error stays in verification.error)."""
+    e = (err or "").lower()
+    if "login page" in e or "not found on the rendered page" in e:
+        return "انتهت جلسة SMC أثناء طباعة الفاتورة — أعد المحاولة"
+    if "timeout" in e:
+        return "انتهت مهلة تحميل صفحة الفاتورة — أعد المحاولة"
+    if "label" in e or "detect" in e or "column" in e:
+        return "تعذّر تحديد خانات التوقيع في صفحة الفاتورة — راجع شكل الفاتورة"
+    if "signature" in e or "png" in e or "image" in e:
+        return "تعذّر تحميل صور التوقيع/الختم — راجع مخزن signature_files"
+    return "تعذّر إنشاء/توقيع الفاتورة: " + (err or "")[:90]
+
+
 def build_invoice_row(smc, cid, decree, info, nid):
     receipt = info["receipt_id"]
     v = {"listing": {k: info[k] for k in ("status_code", "status_text", "amount", "reg_date", "claim_id")},
@@ -597,13 +632,13 @@ def build_invoice_row(smc, cid, decree, info, nid):
     try:
         raw = render_details_pdf(smc, receipt)                 # the CURRENT, unsigned invoice, ONE A4 page like SMC's own print
         v["rendered"] = inspect_pdf(raw)
-        v["rendered_has_receipt"] = receipt in pdf_text_digits(raw)
+        v["rendered_has_receipt"] = pdf_has_number(raw, receipt)
         data, layout = sign_with_script(raw)
         v["layout"] = layout
     except Exception as e:
         v["error"] = f"{type(e).__name__}: {str(e)[:200]}"
         row.update(status="FAILED", verification=v,
-                   message=f"تعذر إنشاء/توقيع الفاتورة من صفحة التفاصيل: {v['error']}")
+                   message=friendly_error(v["error"]))
         return row, None
     time.sleep(DELAY)
 
@@ -635,6 +670,19 @@ def build_invoice_row(smc, cid, decree, info, nid):
                message=" | ".join(dict.fromkeys(notes)) or None,
                fetched_at=datetime.now(timezone.utc).isoformat())
     return row, data
+
+
+_SIGNED = {}      # receipt_id -> (row, pdf bytes) built earlier in THIS run (two entries often share an invoice)
+
+
+def problem_hint(items) -> str:
+    """items: [(decree, receipt_id, row)] -> one short line telling WHY the entry is not READY."""
+    bad = [(d, rid, r) for d, rid, r in items if r.get("status") != "OK"]
+    if not bad:
+        return ""
+    parts = [f"{rid}: {(r.get('message') or 'يحتاج مراجعة').split(' | ')[0]}" for _, rid, r in bad[:3]]
+    more = f" (+{len(bad) - 3} أخرى)" if len(bad) > 3 else ""
+    return f"{len(bad)} من {len(items)} فاتورة لم تكتمل — " + " ؛ ".join(parts) + more
 
 
 def save_row(cid, receipt, row):
@@ -701,19 +749,33 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
         sb.update(CAND, cid, {"evidence_status": "FAILED",
                               "evidence_message": "لا توجد فواتير على SMC للقرارات السابقة — " + " ; ".join(problems)})
         return
+    built = []
     for decree, info in work:
-        row, data = build_invoice_row(smc, cid, decree, info, nid)
+        hit = _SIGNED.get(info["receipt_id"])
+        if hit:                                              # same invoice already rendered+signed in this run
+            row, data = dict(hit[0]), hit[1]
+            row.update(candidate_id=cid, decree_number=decree)
+            log.info(f"  candidate {cid}: invoice {info['receipt_id']} reused from this run")
+        else:
+            row, data = build_invoice_row(smc, cid, decree, info, nid)
+            if data is not None:
+                _SIGNED[info["receipt_id"]] = (dict(row), data)
         if data is not None:
             key = f"topup-invoices/{cid}/{decree}_{info['receipt_id']}.pdf"
             s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/pdf")
             row["r2_key"] = key
         save_row(cid, info["receipt_id"], row)
+        built.append((decree, info["receipt_id"], row))
         log.info(f"  candidate {cid}: decree {decree} invoice {info['receipt_id']} -> {row.get('status')} "
                  f"[{row.get('signed_source')}, {row.get('page_count')} page(s), {row.get('bytes')} bytes]"
                  + (f" - {row['message']}" if row.get("message") else ""))
     _rpc("topup_recompute_evidence", {"p_id": cid})
     try:
         end = sb.select(CAND, select="evidence_status,evidence_message", filters={"id": f"eq.{cid}"}, limit=1)
+        hint = problem_hint(built)
+        if end and end[0]["evidence_status"] != "READY" and hint:       # say WHAT went wrong, in one line
+            sb.update(CAND, cid, {"evidence_message": hint[:480]})
+            end[0]["evidence_message"] = hint
         if end:
             log.info(f"  candidate {cid}: RESULT evidence_status={end[0]['evidence_status']} "
                      f"{end[0].get('evidence_message') or ''} - open the entry on the page to view the stored PDFs")
@@ -774,10 +836,16 @@ def main():
         if mode == "clear":
             return
         flt["evidence_status"] = "eq.PENDING"
-    rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=MAX_CANDIDATES)
-    log.info(f"{len(rows)} candidate(s) to fetch evidence for.")
+    requeue_no_previous(only)
+    limit = max(MAX_CANDIDATES, len(only)) if only else MAX_CANDIDATES      # an explicit selection is never cut short
+    rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=limit)
+    log.info(f"{len(rows)} candidate(s) to fetch evidence for (time budget {TIME_BUDGET_MIN} min).")
     results = []
-    for c in rows:
+    deadline = time.time() + TIME_BUDGET_MIN * 60
+    for i, c in enumerate(rows):
+        if time.time() > deadline:
+            log.warning(f"time budget reached - {len(rows) - i} entr(ies) stay PENDING for the next run")
+            break
         try:
             process(c, smc, s3, bucket)
             end = sb.select(CAND, select="evidence_status,evidence_message", filters={"id": f"eq.{c['id']}"}, limit=1)
@@ -791,5 +859,30 @@ def main():
     write_run_summary(results)
 
 
+def requeue_no_previous(only) -> int:
+    """Entries marked NO_PREVIOUS_DECREE BEFORE the patient lookup existed (or before it ran) stay stuck even though the
+    lookup now lists matching decrees. Put them back in the queue as soon as the lookup is DONE and shows a match."""
+    flt = {"evidence_status": "eq.NO_PREVIOUS_DECREE", "lookup_status": "eq.DONE", "protocol_key": "not.is.null",
+           "status": "not.in.(SUBMITTED,DISMISSED)"}
+    if only:
+        flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
+    n = 0
+    try:
+        for c in sb.select(CAND, select="id,source_case_id,kind", filters=flt, limit=500) or []:
+            if c.get("kind") == "PREV_REPORT":
+                continue
+            if _lookup_decrees(c):
+                sb.update(CAND, c["id"], {"evidence_status": "PENDING", "evidence_message": None})
+                n += 1
+    except Exception as e:
+        log.warning(f"requeue of NO_PREVIOUS_DECREE entries skipped: {e}")
+    if n:
+        log.info(f"{n} entr(ies) that had NO_PREVIOUS_DECREE now have matching decrees in the lookup - queued again")
+    return n
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        close_browser()
