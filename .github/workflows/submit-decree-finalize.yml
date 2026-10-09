@@ -1,24 +1,29 @@
 # .github/workflows/submit-decree-finalize.yml
 # ============================================================================
 # Triggered by the Supabase Edge Function `submit-decree-requests` (phase=
-# "finalize") when a user clicks "موافقة ومتابعة" (Approve & Continue) in
-# the module, after reviewing a freshly-extracted patient document. Always
-# scoped to one specific case_id a human just approved — never runs in
-# bulk, unlike the prepare workflow.
+# "finalize") when a user clicks "موافقة ومتابعة" (Approve & Continue). Always
+# scoped to the case_ids a human just approved - never runs in bulk.
 #
-# Required repository secrets: same as submit-decree-prepare.yml.
+# PARALLEL (same shape as submit-decree-prepare.yml):
+#   plan      - splits the given case_ids into groups of chunk_size (default 10),
+#               keeping one patient's cases together (chunk_cases.build_chunks).
+#               Sends the "started" notification.
+#   finalize  - one runner PER GROUP, all at once, max 15 (max-parallel). Each runs
+#               the same decree_submission_finalize.py with CASE_IDS = its group.
+#   notify    - once all groups ended: ONE completion notification.
 #
-# NOTE: the MDT-form font (Tahoma, or whatever the SMC print page's CSS
-# actually specifies) is NOT installed via a GitHub Actions secret here.
-# A GitHub secret caps out at 64 KB — far smaller than a real .ttf file —
-# so that approach never worked. The font now lives in the private
-# Supabase Storage "decree-assets" bucket (fonts/mdt_form_font.ttf and
-# fonts/mdt_form_font_bold.ttf) and is downloaded at runtime by
-# decree_common.fetch_and_configure_assets() -> supabase_storage.
-# fetch_mdt_form_font(), then installed into a user-writable font dir and
-# registered with fontconfig from Python — no sudo, no workflow step
-# needed. Upload the font to that bucket path once; see
-# supabase_storage.py's docstring for the one-time setup.
+# NOTE ON SPEED: a click that approves ONE case still gets one runner, plus the
+# ~20 s plan job and ~20 s notify job around it. The gain is for approvals of many
+# cases at once.
+#
+# Max 15 runners so 5 of GitHub's 20 slots stay free for other workflows.
+# Required repository secrets: same as submit-decree-prepare.yml. Optional
+# SMC_POOL_USERNAME_<n> / SMC_POOL_PASSWORD_<n> give runners their own SMC
+# accounts (smc_account_count); otherwise every runner uses SMC_USERNAME.
+#
+# The MDT-form font is NOT a GitHub secret (64 KB cap): it lives in the private
+# Supabase Storage bucket "decree-assets" and is installed at runtime by
+# decree_common.fetch_and_configure_assets().
 # ============================================================================
 
 name: Submit Decree Requests (Finalize)
@@ -27,44 +32,38 @@ on:
   workflow_dispatch:
     inputs:
       case_ids:
-        description: "Comma-separated decree_request_cases.id list — REQUIRED, this never runs in bulk"
+        description: "Comma-separated decree_request_cases.id list - REQUIRED, this never runs in bulk"
         required: true
       run_ref:
         description: "Set by the submit-decree-requests edge function (notification tracking). Leave blank when running by hand."
         required: false
         default: ""
+      chunk_size:
+        description: "Cases per parallel runner (default 10). A patient's cases are never split, so a group can exceed this."
+        required: false
+        default: "10"
+      max_shards:
+        description: "Max runners in parallel (default 15)"
+        required: false
+        default: "15"
+      smc_account_count:
+        description: "How many SMC_POOL_USERNAME_<n> logins exist (default 1 = every runner uses SMC_USERNAME)"
+        required: false
+        default: "1"
 
 jobs:
-  finalize:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      # SUPERSEDES the old wkhtmltopdf install - see
-      # render_print_page_to_pdf()'s docstring and submit-decree-prepare.yml
-      # for why: wkhtmltopdf's frozen WebKit engine (not just cookie
-      # handling) was the actual source of the disrupted/disoriented MDT
-      # form, so this step now installs a real Chromium via Playwright.
-      - name: Set up pip cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Install Playwright's Chromium
-        run: playwright install --with-deps chromium
+      - run: pip install --disable-pip-version-check --quiet requests
 
       - name: Report run started (notifications)
         continue-on-error: true
@@ -74,71 +73,129 @@ jobs:
           RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python run_notify.py started
 
-      # fonts-hosny-amiri stays for medical_report_overlay.py's SEPARATE
-      # report PDF (already calibrated). The MDT form's own font (Tahoma
-      # or whatever the SMC print page's CSS asks for) is fetched from
-      # Supabase Storage and installed at runtime by
-      # fetch_and_configure_assets() in the Python step below — no
-      # separate workflow step needed.
-      - name: Install Amiri font (medical report PDF)
-        run: sudo apt-get install -y fonts-hosny-amiri
+      - name: Plan groups
+        id: plan
+        env:
+          MODE: finalize
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CASE_IDS: ${{ github.event.inputs.case_ids }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '10' }}
+          MAX_SHARDS: ${{ github.event.inputs.max_shards || '15' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
+        run: python shard_plan.py
 
-      # Needed by compress_pdf_under_limit.py (called from decree_common.
-      # run_finalize_stages right before the Stage 6 upload). Its preferred
-      # compression path shells out to the `gs` binary. Without this, every
-      # merged PDF over the ~1MB SMC upload cap falls straight to the
-      # PyMuPDF fallback (rasterizes each page - larger quality loss,
-      # non-selectable text).
-      - name: Install Ghostscript (PDF compression, preferred path)
-        run: sudo apt-get install -y ghostscript
+  finalize:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    name: finalize (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false      # one failing group must not cancel the others mid-upload
+      max-parallel: 15
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
 
-      - name: Run finalize (sign + report + merge + upload)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt
+
+      # Chromium via Playwright (replaced wkhtmltopdf - see render_print_page_to_pdf()).
+      # The browser download is cached so parallel runners don't each fetch ~130 MB.
+      - name: Cache Playwright browsers
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+      - name: Install Playwright's Chromium (cold cache)
+        if: steps.pw.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+      - name: Install Playwright's Chromium (warm cache)
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: playwright install chromium
+
+      # fonts-hosny-amiri: medical_report_overlay.py's report PDF.
+      # Ghostscript: compress_pdf_under_limit.py's preferred path (else the lossy PyMuPDF fallback).
+      - name: Install Ghostscript + Amiri font (skipped if already present)
+        run: |
+          need=""
+          command -v gs >/dev/null 2>&1 || need="$need ghostscript"
+          fc-list 2>/dev/null | grep -qi amiri || need="$need fonts-hosny-amiri"
+          if [ -n "$need" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq -o Acquire::Retries=3 $need
+          else
+            echo "ghostscript and fonts-hosny-amiri already present - skipping apt."
+          fi
+
+      - name: Stagger login (runner ${{ matrix.shard.n }})
+        run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
+
+      - name: Run finalize (sign + report + merge + upload) - ${{ matrix.shard.name }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
-          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SMC_USERNAME: ${{ secrets[format('SMC_POOL_USERNAME_{0}', matrix.shard.slot)] || secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets[format('SMC_POOL_PASSWORD_{0}', matrix.shard.slot)] || secrets.SMC_PASSWORD }}
           HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
           HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          CASE_IDS: ${{ github.event.inputs.case_ids }}
+          # this runner's own group - never blank (finalize refuses to run without it)
+          CASE_IDS: ${{ matrix.shard.ids }}
           RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_finalize.py
 
-      # One mini notification per finished case; when it was the last
-      # finalize still running, the "all finished" message follows. `if:
-      # always()` so a crash or a cancel still reports. job.status is the
-      # result of the steps above (success / failure / cancelled).
-      - name: Post completion notification
+      # /tmp/decree_merged/** = every merged PDF built this run; /tmp/decree_failed_merged/**
+      # = copies of the FAILED cases' PDFs + a .txt saying why. Artifact name must be unique per runner.
+      - name: Upload run artifacts (logs, debug dumps, if any)
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decree-finalize-run-${{ github.run_id }}-${{ matrix.shard.name }}
+          path: |
+            /tmp/decree_merged/**
+            /tmp/decree_failed_merged/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  notify:
+    needs: [plan, finalize]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - name: Post completion notification
         continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           RUN_REF: ${{ github.event.inputs.run_ref }}
           PHASE: finalize
-          OUTCOME: ${{ job.status }}
+          # same values the old single job reported (success / failure / cancelled)
+          OUTCOME: ${{ needs.plan.result != 'success' && 'failure' || needs.finalize.result }}
         run: python run_notify.py finish
-
-      # /tmp/decree_merged/** carries every merged PDF built this run
-      # (success or failure - decree_common._build_merged_pdf always
-      # writes there). /tmp/decree_failed_merged/** carries, additionally,
-      # a copy of just the FAILED cases' merged PDFs plus a small .txt
-      # explaining why each failed and how to submit it by hand (see
-      # decree_common._keep_failed_merged_pdf) - previously that folder
-      # was pushed to the repo's `failed-pdfs` branch by a separate
-      # publish_failed_pdfs.py step, which was removed for being slow;
-      # it's included here instead so the reason .txt isn't lost.
-      - name: Upload run artifacts (logs, debug dumps, if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: decree-finalize-run-${{ github.run_id }}
-          path: |
-            /tmp/decree_merged/**
-            /tmp/decree_failed_merged/**
-          if-no-files-found: ignore
-          retention-days: 14

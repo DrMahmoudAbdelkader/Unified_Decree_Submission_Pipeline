@@ -1,60 +1,53 @@
 # .github/workflows/decree-status-sync.yml
 # ============================================================================
-# The daily status sweep that decree_status_and_letters_sync.py's docstring
-# has always referred to. Note that this file did NOT exist in the set of
-# workflows you have — which means the sync has only ever run when someone
-# ran it by hand. That alone explains a tracker page that looked frozen.
+# The daily status sweep (decree_status_and_letters_sync.py), now PARALLEL.
 #
-# WHAT IT DOES
+# WHAT IT DOES (unchanged)
 #   Re-checks every decree_request_attempts row that has a website_request_id
 #   and has NOT yet reached a final status, pulls its current SMC status (and
-#   the letter text, for خطاب ادارى), normalizes it through smc_status_map,
-#   and stamps decree_request_cases.case_status when the status is final.
-#   Once an attempt reaches a final status, status_is_final flips to true and
-#   it is never re-checked again — that is what keeps a nightly sweep from
-#   growing without bound, and what takes a finished request out of the
-#   tracker's live list.
+#   the letter text for خطاب ادارى), normalizes it through smc_status_map and
+#   stamps decree_request_cases.case_status when final. Also refreshes
+#   decree_request_month_seed and stores the issued decree number of every
+#   approved request - decree-value-sync.yml starts after it (workflow_run), then
+#   topup-evidence-fetch.yml after that.
 #
-#   It also stores the issued decree number (decree_number) of every
-#   finally-approved request, then decree-value-sync.yml starts after it
-#   to fetch each decree's value.
+# PARALLEL
+#   plan  - shard_plan.py (MODE=status) counts the open attempts + seed rows and
+#           starts ceil(count / chunk_size) runners (default 40 each, max 15).
+#   sync  - one runner per slice, all at once. Each runs the SAME script with
+#           SHARD_INDEX / SHARD_COUNT; sharding.py splits the work like this:
+#             open attempts   by CASE id  (all attempts of a case stay together,
+#                                          because case_status is written per case)
+#             seed rows       by request number
+#             decree numbers  by request number
+#           Per-run budgets are shared, not multiplied: the single-lookup budget
+#           is divided by the runner count, and MAX_DECREE_LOOKUPS is applied to
+#           the whole queue before it is sliced.
+#   Every runner fetches the bulk status windows itself (a handful of calls) -
+#   that duplicated read is the price of not needing a shared cache.
 #
-#   Since 2026-09-27 it also refreshes decree_request_month_seed (the
-#   full-month backfill table decree-status-tracking.js reads) in the same
-#   run, reusing the same SMC login/session — see sync_seed_table() in
-#   decree_status_and_letters_sync.py. No new secrets or steps needed here:
-#   it's the same script invocation below. decree_request_seed_status_refresh.py,
-#   if it's still in this repo, is no longer used and can be deleted.
+# The downstream workflows start only when EVERY runner succeeded (a workflow_run
+# is 'completed' once all jobs end); one failed runner skips them, as one failed
+# job did before.
 #
-# SCHEDULE — 23:00 UTC
-#   GitHub cron is UTC only; it has no notion of Africa/Cairo. Egypt is
-#   UTC+2 in winter and UTC+3 during DST (Apr–Oct), so 23:00 UTC lands at
-#   01:00 local in winter and 02:00 local in summer. Both are comfortably
-#   inside "start of a new day" and well clear of working hours, which is
-#   what actually matters here. Chasing an exact 01:00 year-round would mean
-#   two crons plus an in-script hour guard, for no practical gain.
-#
-#   GitHub also delays scheduled runs under platform load — a few minutes,
-#   occasionally longer, and on rare occasions a scheduled run is dropped
-#   entirely. That is normal and harmless for this job: nothing here is
-#   date-windowed, so a missed night simply means tomorrow's run picks up
-#   two nights' worth of changes. The manual trigger below is there for when
-#   you don't want to wait.
+# SCHEDULE - 23:00 UTC (01:00 Cairo winter / 02:00 summer). GitHub may delay a
+# scheduled run by minutes; nothing here is date-windowed, so a missed night is
+# picked up the next night.
 #
 # REQUIRED REPOSITORY SECRETS
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-#   SMC_USERNAME_2 / SMC_PASSWORD_2   — strongly recommended. The script
-#       prefers this dedicated account precisely so a long sweep never
-#       shares a login session with a submission run. Falls back to
-#       SMC_USERNAME / SMC_PASSWORD when unset, which is functional but
-#       means an overlapping submission run can fight it for the session.
-#   SMC_SENDING_SITE                  — optional, defaults to 102233.
+#   SMC_USERNAME_2 / SMC_PASSWORD_2 - dedicated account, so a long sweep never
+#       shares a session with a submission run (falls back to SMC_USERNAME).
+#   SMC_SENDING_SITE - optional, defaults to 102233.
+#   Optional: SMC_POOL_USERNAME_<n> / SMC_POOL_PASSWORD_<n> - one SMC account per
+#       runner slot (set smc_account_count). If the portal allows only one live
+#       session per account, runners sharing _2 will log each other out.
+#
+# Max 15 runners (max-parallel) so 5 of GitHub's 20 slots stay free for other workflows.
 # ============================================================================
 
 name: Decree Status & Letters Sync (daily)
 
-# A second copy of this sweep running while the first is mid-flight would
-# re-check the same attempts and write the same rows twice. Queue instead.
 concurrency:
   group: decree-status-sync
   cancel-in-progress: false
@@ -65,7 +58,7 @@ on:
   workflow_dispatch:
     inputs:
       max_single_lookups:
-        description: "Max targeted lookups for requests older than the bulk window (default 300). Raise for the first big backlog run, e.g. 1000."
+        description: "Max targeted lookups for requests older than the bulk window, in TOTAL across all runners (default 300). Raise for a big backlog, e.g. 1000."
         required: false
         default: "1000"
       lookback_days:
@@ -73,18 +66,59 @@ on:
         required: false
         default: "30"
       max_decree_lookups:
-        description: "Max approved requests to pull a decree number for (default 400). Raise for the one-time backfill, e.g. 3000."
+        description: "Max approved requests to pull a decree number for, in TOTAL (default 400). Raise for the one-time backfill, e.g. 3000."
         required: false
         default: "3000"
+      chunk_size:
+        description: "Open attempts + seed rows per parallel runner (default 40)"
+        required: false
+        default: "40"
+      max_shards:
+        description: "Max runners in parallel (default 15)"
+        required: false
+        default: "15"
+      smc_account_count:
+        description: "How many SMC_POOL_USERNAME_<n> logins exist (default 1)"
+        required: false
+        default: "1"
 
 jobs:
-  sync:
+  plan:
     runs-on: ubuntu-latest
-    # The sweep is one SearchRecommendationRequest + one _PrintLetters per
-    # open attempt, with a 0.3s delay between calls — roughly 1s per attempt.
-    # 600 open attempts is ~10 minutes; 60 gives a wide margin as the backlog
-    # grows without letting a hung session burn a whole hour.
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - name: Plan shards
+        id: plan
+        env:
+          MODE: status
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '40' }}
+          MAX_SHARDS: ${{ github.event.inputs.max_shards || '15' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
+        run: python shard_plan.py
+
+  sync:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    name: sync (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    # ~1 s per attempt; a runner holds ~40-100 of them. 60 min is a wide margin that
+    # still stops a hung session from burning a whole hour per runner.
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -102,28 +136,29 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # This script needs requests + beautifulsoup4 only. It imports
-      # Unified_Decree_Submission_Pipeline for SMCSession, which pulls that
-      # module's own imports in at import time, so the full requirements file
-      # is the safe choice — but there is NO Playwright, Ghostscript, font or
-      # asset setup here on purpose: this job never renders an MDT, never
-      # builds a report PDF and never uploads anything to SMC. It only reads.
+      # requests + beautifulsoup4 are all this needs, but it imports
+      # Unified_Decree_Submission_Pipeline for SMCSession, so the full file is
+      # the safe choice. NO Playwright/Ghostscript: this job only reads.
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt
 
-      - name: Run status & letters sync
+      - name: Stagger login (runner ${{ matrix.shard.n }})
+        run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
+
+      - name: Run status & letters sync - ${{ matrix.shard.name }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
-          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME_2: ${{ secrets[format('SMC_POOL_USERNAME_{0}', matrix.shard.slot)] || secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets[format('SMC_POOL_PASSWORD_{0}', matrix.shard.slot)] || secrets.SMC_PASSWORD_2 }}
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
           SMC_SENDING_SITE: ${{ secrets.SMC_SENDING_SITE }}
-          # On the nightly schedule there are no inputs, so these fall back
-          # to the defaults. They must never be an empty string — the script
-          # does int(os.environ[...]) on them.
+          # On the nightly schedule there are no inputs, so these fall back to the
+          # defaults. They must never be an empty string (int(os.environ[...])).
           MAX_SINGLE_STATUS_LOOKUPS: ${{ github.event.inputs.max_single_lookups || '300' }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '15' }}
           MAX_DECREE_LOOKUPS: ${{ github.event.inputs.max_decree_lookups || '400' }}
+          SHARD_INDEX: ${{ matrix.shard.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard.shard_count }}
         run: python decree_status_and_letters_sync.py

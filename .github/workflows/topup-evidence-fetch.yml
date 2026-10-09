@@ -1,17 +1,40 @@
 # .github/workflows/topup-evidence-fetch.yml
-# Three steps, in this order (each needs the one before it):
-#   1) drains the "فحص قرارات المريض" lookups   (topup_decree_lookup.py  - fast; also created
-#      automatically for «يفاد بقرار اللجنه السابقه» letters)
-#   2) fetches the PREVIOUS DECREE REPORT PDF for those letters           (topup_report_fetch.py)
-#   3) builds the signed invoice PDFs for «التجديد في نهاية المده»          (topup_evidence_fetch.py)
-#      — every invoice is rendered from its CURRENT unsigned Details page and signed with signature_script.py
-#        (SMC's own signed attachment is never used: an invoice that is not yet معتمد can still change)
-# National-ID-card letters need no job: a person fixes the card and presses «تم التصحيح» on the page.
-# Runs nightly AFTER the status sync + value sync chain, on demand, and when the page's buttons
-# «جلب الفواتير الآن» / «فحص قرارات المريض» start it (workflow_dispatch, no inputs needed).
-# Uses SMC_USERNAME_3 (same account as the value sync) - falls back to _2 / default.
+# ============================================================================
+# PARALLEL version: plan -> N runners at once -> each handles ~10 entries.
+#
+#   plan   one cheap job (~20 s). shard_plan.py (MODE=topup) lists every top-up
+#          entry that needs ANY of the three steps below and splits them into
+#          groups of `chunk_size` (default 10), keeping one patient's entries
+#          together. With candidate_ids set (the page's buttons) it splits
+#          exactly those ids instead.
+#   fetch  matrix job: one runner PER GROUP, all started together, never more
+#          than 15 at once (max-parallel). Each runner runs the SAME three
+#          scripts as before, in the same order, with CANDIDATE_IDS = its own
+#          group:
+#            1) topup_decree_lookup.py    - «فحص قرارات المريض»
+#            2) topup_report_fetch.py     - previous-decree report PDF
+#            3) topup_evidence_fetch.py   - signed invoice PDFs
+#          No Python change was needed: all three already honour CANDIDATE_IDS.
+#
+# 15, NOT 20: GitHub allows 20 concurrent jobs on Free/Pro (the limit is shared
+# by ALL workflows in the account). Capping this at 15 leaves 5 runners free so
+# a different workflow started meanwhile does not sit in the queue.
+#
+# SMC LOGINS: every runner logs in on its own. If smc.smcegy.com allows ONE
+# live session per account, runners sharing an account kick each other out
+# (see the long note in submit-decree-prepare.yml). To give runners their own
+# accounts add secrets SMC_POOL_USERNAME_1/SMC_POOL_PASSWORD_1, _2, _3 ... and
+# set smc_account_count to how many you added; runners rotate over them. With
+# none set every runner uses SMC_USERNAME_3 as before.
+#
+# Runs nightly AFTER the status sync + value sync chain, on demand, and when
+# the page's buttons «جلب الفواتير الآن» / «فحص قرارات المريض» start it.
+# ============================================================================
 name: Top-up Evidence Fetch
 
+# Two overlapping runs would plan the same entries twice. Queue instead.
+# (GitHub keeps only ONE waiting run per group: a third dispatch replaces the
+# second. Runs are much shorter now, so this is rarer than before.)
 concurrency:
   group: topup-evidence-fetch
   cancel-in-progress: false
@@ -23,9 +46,9 @@ on:
   workflow_dispatch:
     inputs:
       max_candidates:
-        description: "Max invoice candidates this run (default 80; a selection sent by the page is never cut short)"
+        description: "Safety cap of entries PER RUNNER (default 50; a runner only exceeds chunk_size when one patient has many entries)"
         required: false
-        default: "80"
+        default: "50"
       candidate_ids:
         description: "Optional: only these decree_topup_candidates ids (comma separated). Empty = the whole queue. Set by the page's buttons."
         required: false
@@ -34,17 +57,66 @@ on:
         description: "Optional with candidate_ids: refetch = delete the stored invoices of those entries and rebuild them; clear = delete them only. Empty = normal run."
         required: false
         default: ""
+      chunk_size:
+        description: "Entries per parallel runner (default 10)"
+        required: false
+        default: "10"
+      max_shards:
+        description: "Max runners in parallel (default 15; the hard ceiling is max-parallel: 15 below)"
+        required: false
+        default: "15"
+      smc_account_count:
+        description: "How many SMC_POOL_USERNAME_<n> logins exist (default 1 = every runner uses SMC_USERNAME_3)"
+        required: false
+        default: "1"
 
 jobs:
-  fetch:
+  # ==========================================================================
+  plan:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - name: Plan shards
+        id: plan
+        env:
+          MODE: topup
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '10' }}
+          MAX_SHARDS: ${{ github.event.inputs.max_shards || '15' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
+        run: python shard_plan.py
+
+  # ==========================================================================
+  fetch:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    name: fetch (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60            # per runner (~10 entries); was 120 for the whole queue
+    strategy:
+      # fail-fast OFF: one bad runner must not cancel its healthy siblings.
+      fail-fast: false
+      # THE CAP. 15 runners at most, so 5 of the 20 slots stay free.
+      max-parallel: 15
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
-      SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+      # This runner's SMC login: its pool account if that secret exists, else the usual _3 account.
+      SMC_USERNAME_3: ${{ secrets[format('SMC_POOL_USERNAME_{0}', matrix.shard.slot)] || secrets.SMC_USERNAME_3 }}
+      SMC_PASSWORD_3: ${{ secrets[format('SMC_POOL_PASSWORD_{0}', matrix.shard.slot)] || secrets.SMC_PASSWORD_3 }}
       SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
       SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
       SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
@@ -53,7 +125,8 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
+      # ALWAYS this runner's own group (blank only in the planner's one-runner fallback).
+      CANDIDATE_IDS: ${{ matrix.shard.ids }}
       EVIDENCE_MODE: ${{ github.event.inputs.mode }}
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +142,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
 
-      # 1) works through the whole lookup queue (≈7 s per patient; up to 300 / 30 min per run)
+      # Runners finish setup within seconds of each other; without this they would all
+      # hit the SMC login in the same instant.
+      - name: Stagger login (runner ${{ matrix.shard.n }})
+        run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
+
+      # 1) lookups for this runner's entries (≈7 s per patient)
       - name: Patient decree lookups (pressed on the page / new previous-report letters)
         continue-on-error: true
         env:
@@ -77,12 +155,22 @@ jobs:
           LOOKUP_TIME_BUDGET_MIN: "30"
         run: python topup_decree_lookup.py
 
-      # Chromium + an Arabic font: the previous-decree report is PRINTED from the SMC page, and EVERY invoice is
-      # rendered from its Details page before signing — both need them.
-      - name: Install Chromium (report print + invoice rendering)
+      # Playwright's browser download is cached: 15 runners must not each fetch ~130 MB every run.
+      - name: Cache Playwright browsers
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+      - name: Install Chromium (cold cache - with system libraries)
+        if: steps.pw.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
-      - name: Install Arabic font
-        run: sudo apt-get install -y fonts-hosny-amiri
+      - name: Install Chromium (warm cache)
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: playwright install chromium
+      - name: Install Arabic font (skipped if already present)
+        run: |
+          fc-list 2>/dev/null | grep -qi amiri || { sudo apt-get update -qq && sudo apt-get install -y -qq -o Acquire::Retries=3 fonts-hosny-amiri; }
 
       # 2) previous decree report (letters "يفاد بقرار اللجنه السابقه")
       - name: Fetch previous-decree reports
@@ -92,25 +180,23 @@ jobs:
           REPORT_TIME_BUDGET_MIN: "25"
         run: python topup_report_fetch.py
 
-      # 3) signed invoices (letters "التجديد في نهاية المده") — rendered unsigned, then signed (needs signature_script.py in the repo root)
+      # 3) signed invoices (letters "التجديد في نهاية المده") - rendered unsigned, then signed
       - name: Build signed invoices
         env:
-          # all optional repo variables; empty = the script's defaults
-          SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}        # blue ink the signing must ADD to the page (default 2500)
-          LAYOUT_MIN_SPAN_FRAC: ${{ vars.LAYOUT_MIN_SPAN_FRAC }}    # label columns must span this share of the page width (default 0.35)
-          SIGNATURE_BASE_URL: ${{ vars.SIGNATURE_BASE_URL }}        # default: the public signature_files bucket
-          MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '80' }}
-          EVIDENCE_TIME_BUDGET_MIN: "110"        # stop starting new entries after this; the rest stay PENDING for the next run
-          # Tahoma is fetched from decree-assets/fonts inside the script (same as the MDT form).
-          TOPUP_DEBUG_DIR: /tmp/topup_debug       # raw unsigned renders, kept as an artifact for layout checks
-          INVOICE_WIDEN_PX: "55"                  # same +55px rule as the MDT fix; "0" disables
+          SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}
+          LAYOUT_MIN_SPAN_FRAC: ${{ vars.LAYOUT_MIN_SPAN_FRAC }}
+          SIGNATURE_BASE_URL: ${{ vars.SIGNATURE_BASE_URL }}
+          MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '50' }}
+          TOPUP_DEBUG_DIR: /tmp/topup_debug
+          INVOICE_WIDEN_PX: "55"
         run: python topup_evidence_fetch.py
 
+      # artifact names must be unique per runner in one run (upload-artifact@v4)
       - name: Upload raw invoice renders (layout check)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: invoice-raw-renders
+          name: invoice-raw-renders-${{ matrix.shard.name }}
           path: /tmp/topup_debug
           if-no-files-found: ignore
           retention-days: 3

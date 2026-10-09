@@ -3,17 +3,26 @@
 # Fills decree_value (total value of each issued decree) right after the daily
 # status sync has stored the decree numbers.
 #
+# PARALLEL: plan -> up to 15 runners at once. The planner counts the decrees
+# still waiting for a value and starts ceil(count / chunk_size) runners (default
+# 60 decrees each: at ~1 s per decree a runner's ~40 s of setup is the cost to
+# beat, so 10 per runner would be mostly setup). Each runner runs the SAME
+# decree_value_sync.py with SHARD_INDEX / SHARD_COUNT set; sharding.py keeps only
+# the decrees whose number hashes to that runner, so no decree is fetched twice.
+# MAX_VALUE_LOOKUPS stays the TOTAL cap for the whole run.
+#
 # HOW IT STARTS
-#   - Automatically: whenever "Decree Status & Letters Sync (daily)" finishes
-#     successfully — that covers the nightly schedule AND a manual run of that
-#     workflow. (GitHub only honours workflow_run for workflows on the default
-#     branch, and the name below must match that workflow's `name:` exactly.)
+#   - Automatically when "Decree Status & Letters Sync (daily)" finishes
+#     successfully (nightly AND manual runs of it).
 #   - Manually: Actions -> "Decree Values Sync" -> Run workflow.
 #
 # REQUIRED REPOSITORY SECRETS
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-#   SMC_USERNAME_3 / SMC_PASSWORD_3 — the DIFFERENT SMC account for this job.
-#       Falls back to _2 / the default account (with a warning) if unset.
+#   SMC_USERNAME_3 / SMC_PASSWORD_3 (falls back to _2 / the default account).
+#   Optional: SMC_POOL_USERNAME_<n> / SMC_POOL_PASSWORD_<n> so runners use
+#   different SMC accounts (set smc_account_count to how many you added).
+#
+# Max 15 runners (max-parallel) so 5 of GitHub's 20 slots stay free for other workflows.
 # ============================================================================
 
 name: Decree Values Sync
@@ -29,16 +38,61 @@ on:
   workflow_dispatch:
     inputs:
       max_value_lookups:
-        description: "Max decrees to value this run (default 1000)"
+        description: "Max decrees to value this run, in TOTAL (default 1000)"
         required: false
         default: "1000"
+      chunk_size:
+        description: "Decrees per parallel runner (default 60)"
+        required: false
+        default: "60"
+      max_shards:
+        description: "Max runners in parallel (default 15)"
+        required: false
+        default: "15"
+      smc_account_count:
+        description: "How many SMC_POOL_USERNAME_<n> logins exist (default 1)"
+        required: false
+        default: "1"
 
 jobs:
-  values:
+  plan:
     # Skip when the status sync failed; always allow a manual run.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - name: Plan shards
+        id: plan
+        env:
+          MODE: value
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MAX_VALUE_LOOKUPS: ${{ github.event.inputs.max_value_lookups || '1000' }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '60' }}
+          MAX_SHARDS: ${{ github.event.inputs.max_shards || '15' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
+        run: python shard_plan.py
+
+  values:
+    needs: plan
+    # count 0 = nothing waiting for a value (an empty matrix is a hard error in Actions)
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    name: values (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -59,15 +113,20 @@ jobs:
       - name: Install Python dependencies
         run: pip install --disable-pip-version-check --quiet -r requirements.txt
 
-      - name: Run decree value sync
+      - name: Stagger login (runner ${{ matrix.shard.n }})
+        run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
+
+      - name: Run decree value sync - ${{ matrix.shard.name }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
-          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SMC_USERNAME_3: ${{ secrets[format('SMC_POOL_USERNAME_{0}', matrix.shard.slot)] || secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets[format('SMC_POOL_PASSWORD_{0}', matrix.shard.slot)] || secrets.SMC_PASSWORD_3 }}
           SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
           SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
           SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
           MAX_VALUE_LOOKUPS: ${{ github.event.inputs.max_value_lookups || '1000' }}
+          SHARD_INDEX: ${{ matrix.shard.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard.shard_count }}
         run: python decree_value_sync.py

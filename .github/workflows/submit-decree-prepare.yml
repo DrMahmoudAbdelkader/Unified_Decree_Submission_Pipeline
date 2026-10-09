@@ -55,7 +55,7 @@
 #      across logins is not available and max_batches must stay at 1. The
 #      fix is more accounts, not more runners.
 #
-# The default below is max_batches=10, which is what you asked for. It is
+# The default below is max_batches=15 (hard ceiling: max-parallel: 15 on the job). It is
 # the right setting for case A and for case B once tested.
 # ---------------------------------------------------------------------------
 #
@@ -100,9 +100,9 @@ on:
         required: false
         default: "10"
       max_batches:
-        description: "Max runners in parallel (default 10). If the queue needs more batches than this, batch size grows instead. See the SMC LOGINS note in this file."
+        description: "Max runners in parallel (default 15 - leaves 5 of GitHub's 20 slots for other workflows). If the queue needs more batches than this, batch size grows instead. See the SMC LOGINS note in this file."
         required: false
-        default: "10"
+        default: "15"
       smc_account_count:
         description: "How many SMC logins you have as secrets (SMC_USERNAME, SMC_USERNAME_2, ...). Default 1 = every batch shares the primary account."
         required: false
@@ -155,7 +155,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CASE_IDS: ${{ github.event.inputs.case_ids }}
           CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '10' }}
-          MAX_BATCHES: ${{ github.event.inputs.max_batches || '10' }}
+          MAX_BATCHES: ${{ github.event.inputs.max_batches || '15' }}
           SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
         run: python chunk_cases.py
@@ -188,6 +188,9 @@ jobs:
       # otherwise abort nine healthy ones mid-submission, possibly between
       # "MDT created on SMC" and "result written to Supabase".
       fail-fast: false
+      # Hard ceiling: never more than 15 of these at once, whatever max_batches says,
+      # so 5 of the account's 20 concurrent-job slots stay free for your other workflows.
+      max-parallel: 15
       matrix:
         batch: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:

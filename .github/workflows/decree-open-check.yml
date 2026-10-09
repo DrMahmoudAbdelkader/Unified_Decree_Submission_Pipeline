@@ -1,28 +1,94 @@
 # Place at: .github/workflows/decree-open-check.yml
+# ============================================================================
+# Decree open-status check, now PARALLEL.
+#
+#   plan   shard_plan.py (MODE=open) counts the decrees with pending Enhanced-
+#          Monitor entries, starts ceil(count / chunk_size) runners (default 40
+#          each, max 15) and creates the ONE decree_check_runs row for the day.
+#   check  one runner per slice, all at once. Same smc_decree_open_checker.py;
+#          each runner takes the decrees whose number hashes to its slice.
+#          Runner 1 alone closes orphan cycles (against the FULL pending list).
+#          Each runner saves its counters as a small JSON artifact instead of
+#          touching the run row.
+#   finish adds the counters up and completes that one run row, so the tracker
+#          page still sees ONE run per day with the combined numbers.
+#
+# Max 15 runners (max-parallel) so 5 of GitHub's 20 slots stay free.
+# SMC logins: SMC_USERNAME_3 as before; optional SMC_POOL_USERNAME_<n> /
+# SMC_POOL_PASSWORD_<n> give runners their own accounts (smc_account_count).
+# ============================================================================
 name: Decree open-status check
 
 on:
   schedule:
-    - cron: "0 5 * * *"        # every 24h at 05:00 UTC (07:00/08:00 Cairo) – list is ready in the morning
+    - cron: "0 5 * * *"        # every 24h at 05:00 UTC (07:00/08:00 Cairo) - list is ready in the morning
   workflow_dispatch:            # manual run: Actions tab -> "Decree open-status check" -> Run workflow
     inputs:
       decree_number:
-        description: "Optional – check ONE decree number only"
+        description: "Optional - check ONE decree number only"
         required: false
         default: ""
       dry_run:
         description: "Dry run (read SMC and print, write nothing)"
         type: boolean
         default: false
+      chunk_size:
+        description: "Decrees per parallel runner (default 40)"
+        required: false
+        default: "40"
+      max_shards:
+        description: "Max runners in parallel (default 15)"
+        required: false
+        default: "15"
+      smc_account_count:
+        description: "How many SMC_POOL_USERNAME_<n> logins exist (default 1)"
+        required: false
+        default: "1"
 
 concurrency:
   group: decree-open-check
   cancel-in-progress: false
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - name: Plan shards (and create the run row)
+        id: plan
+        env:
+          MODE: open
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          # this workflow's secret is named SUPABASE_SERVICE_KEY; supabase_client.py expects the ROLE_KEY name
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ONLY_DECREE: ${{ github.event.inputs.decree_number }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          TRIGGER_TYPE: ${{ github.event_name }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '40' }}
+          MAX_SHARDS: ${{ github.event.inputs.max_shards || '15' }}
+          SMC_ACCOUNT_COUNT: ${{ github.event.inputs.smc_account_count || '1' }}
+        run: python shard_plan.py
+
   check:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    name: check (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,13 +99,55 @@ jobs:
 
       - run: pip install requests beautifulsoup4
 
-      - name: Run checker
+      - name: Stagger login (runner ${{ matrix.shard.n }})
+        run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
+
+      - name: Run checker - ${{ matrix.shard.name }}
         env:
-          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
-          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SMC_USERNAME_3: ${{ secrets[format('SMC_POOL_USERNAME_{0}', matrix.shard.slot)] || secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets[format('SMC_POOL_PASSWORD_{0}', matrix.shard.slot)] || secrets.SMC_PASSWORD_3 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           ONLY_DECREE: ${{ github.event.inputs.decree_number }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           TRIGGER_TYPE: ${{ github.event_name }}
+          RUN_ID: ${{ needs.plan.outputs.run_id }}
+          OPEN_STATS_FILE: /tmp/open-stats/shard-${{ matrix.shard.n }}.json
+          SHARD_INDEX: ${{ matrix.shard.shard_index }}
+          SHARD_COUNT: ${{ matrix.shard.shard_count }}
         run: python smc_decree_open_checker.py
+
+      - name: Upload this runner's counters
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-stats-${{ matrix.shard.n }}
+          path: /tmp/open-stats/shard-${{ matrix.shard.n }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  finish:
+    needs: [plan, check]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --disable-pip-version-check --quiet requests
+      - uses: actions/download-artifact@v4
+        continue-on-error: true      # no artifact at all (every runner died early) is reported by the script, not a crash here
+        with:
+          pattern: open-stats-*
+          merge-multiple: true
+          path: open-stats
+      - name: Complete the run row
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RUN_ID: ${{ needs.plan.outputs.run_id }}
+          OPEN_STATS_DIR: open-stats
+          EXPECTED_SHARDS: ${{ needs.plan.outputs.count }}
+        run: python open_check_finish.py
