@@ -104,11 +104,9 @@ def national_id_of(patient_id) -> str:
 
 
 # --------------------------------------------------------------------------- which decrees
-def previous_decrees(c: dict) -> list[str]:
-    """Manual numbers win. Otherwise: decrees on the patient's EARLIER cases whose
-    plan carries the same top-up protocol, excluding the declined request itself."""
-    if c.get("manual_decree_numbers"):
-        return list(dict.fromkeys(str(x) for x in c["manual_decree_numbers"]))
+def _db_decrees(c: dict) -> list[str]:
+    """Decrees stored by THIS app: attempts of the patient's earlier cases whose plan carries the
+    same top-up protocol (excluding the declined request itself). Oldest first."""
     if not (c.get("patient_id") and c.get("protocol_key")):
         return []
     cases = sb.select("decree_request_cases", select="id,treatment_plan_id",
@@ -126,14 +124,80 @@ def previous_decrees(c: dict) -> list[str]:
     atts = sb.select("decree_request_attempts", select="id,decree_number",
                      filters={"case_id": "in.(" + ",".join(map(str, case_ids)) + ")",
                               "decree_number": "not.is.null"}, order="id.asc", limit=1000)
-    decrees = list(dict.fromkeys(str(a["decree_number"]) for a in atts))
-    # protocols.max_previous_decrees (e.g. 'supportive' = 1): only the NEWEST previous decrees' invoices
+    return list(dict.fromkeys(str(a["decree_number"]) for a in atts))
+
+
+def _ensure_lookup(c: dict, smc) -> None:
+    """The patient's decrees as SMC itself lists them (the page's «فحص قرارات المريض»). Done here
+    when it has not been done for this entry yet, so one press fetches everything."""
+    if smc is None or c.get("lookup_status") == "DONE":
+        return
     try:
-        pr = sb.select("decree_topup_protocols", select="max_previous_decrees",
-                       filters={"protocol_key": f"eq.{c['protocol_key']}"}, limit=1)
-        lim = (pr[0].get("max_previous_decrees") if pr else None)
+        import topup_decree_lookup as lk
+        n = lk.lookup_one(smc, {"id": c["id"], "patient_id": c.get("patient_id")})
+        sb.update(CAND, c["id"], {"lookup_status": "DONE", "lookup_message": f"{n} قرار",
+                                  "lookup_finished_at": datetime.now(timezone.utc).isoformat()})
+        c["lookup_status"] = "DONE"
+        log.info(f"  candidate {c['id']}: patient lookup done inline ({n} decree(s))")
     except Exception as e:
-        log.warning(f"max_previous_decrees lookup skipped: {e}"); lim = None
+        log.warning(f"  candidate {c['id']}: inline patient lookup failed: {type(e).__name__}: {e}")
+
+
+def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
+    """[(issue_date 'YYYY-MM-DD' or '', decree_number)] of the patient's decrees on SMC that belong to
+    the same PLAN / PROTOCOL (match computed in the DB view), issued on or before the declined
+    request. Oldest first."""
+    try:
+        rows = sb.select("decree_topup_lookup_view", select="decree_number,decree_date,match_kind",
+                         filters={"candidate_id": f"eq.{c['id']}", "match_kind": "not.is.null"},
+                         order="decree_date.asc.nullsfirst", limit=200)
+    except Exception as e:
+        log.warning(f"  lookup view not readable (migration 06?): {e}")
+        return []
+    cutoff = ""
+    if c.get("source_case_id"):
+        try:
+            src = sb.select("decree_request_cases", select="created_at",
+                            filters={"id": f"eq.{c['source_case_id']}"}, limit=1)
+            cutoff = (src[0].get("created_at") or "")[:10] if src else ""
+        except Exception:
+            cutoff = ""
+    out = []
+    for r in rows or []:
+        d = (r.get("decree_date") or "")[:10]
+        if cutoff and d and d > cutoff:
+            continue                       # issued AFTER the declined request: not a "previous" decree
+        out.append((d, str(r["decree_number"])))
+    return out
+
+
+def previous_decrees(c: dict, smc=None) -> list[str]:
+    """Manual numbers win. Otherwise the union of
+         (a) decrees this app stored for the patient's earlier cases on the same protocol, and
+         (b) decrees SMC lists for the patient on the same plan/protocol (the patient lookup),
+    oldest first; protocols.max_previous_decrees then keeps only the NEWEST N."""
+    if c.get("manual_decree_numbers"):
+        return list(dict.fromkeys(str(x) for x in c["manual_decree_numbers"]))
+    _ensure_lookup(c, smc)
+    from_db = _db_decrees(c)
+    from_smc = _lookup_decrees(c)
+    dates = {n: d for d, n in from_smc}
+    merged = list(dict.fromkeys(from_db + [n for _, n in from_smc]))
+    # oldest first by issue date (unknown dates count as oldest); stable for ties
+    decrees = sorted(merged, key=lambda n: dates.get(n, ""))
+    if not decrees:
+        return []
+    log.info(f"  candidate {c['id']}: previous decrees {len(from_db)} from the app + {len(from_smc)} from SMC "
+             f"-> {len(decrees)} distinct")
+    # protocols.max_previous_decrees (e.g. 'supportive' = 1): only the NEWEST previous decrees' invoices
+    lim = None
+    if c.get("protocol_key"):
+        try:
+            pr = sb.select("decree_topup_protocols", select="max_previous_decrees",
+                           filters={"protocol_key": f"eq.{c['protocol_key']}"}, limit=1)
+            lim = (pr[0].get("max_previous_decrees") if pr else None)
+        except Exception as e:
+            log.warning(f"max_previous_decrees lookup skipped: {e}")
     return decrees[-int(lim):] if lim else decrees
 
 
@@ -348,11 +412,11 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
     cid = c["id"]
     sb.update(CAND, cid, {"evidence_status": "FETCHING"})
     nid = national_id_of(c.get("patient_id"))
-    decrees = previous_decrees(c)
+    decrees = previous_decrees(c, smc)
     manual_receipts = [str(x) for x in (c.get("manual_receipt_ids") or [])]
     if not decrees and not manual_receipts:
         sb.update(CAND, cid, {"evidence_status": "NO_PREVIOUS_DECREE",
-                              "evidence_message": "لا يوجد قرار سابق بنفس البروتوكول — أدخل أرقام القرارات يدوياً"})
+                              "evidence_message": "لا يوجد قرار سابق بنفس الخطة/البروتوكول لا في سجلات النظام ولا في قرارات المريض على SMC — أدخل أرقام القرارات يدوياً"})
         return
 
     work, problems = [], []          # work: (decree, listing_info)
