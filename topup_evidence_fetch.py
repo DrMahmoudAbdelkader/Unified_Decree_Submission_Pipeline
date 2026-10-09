@@ -353,8 +353,6 @@ def pdf_text_digits(data: bytes) -> str:
 
 
 _FONT_READY = False
-A4_FIT_MIN_SCALE = float(os.environ.get("A4_FIT_MIN_SCALE", "0.62"))   # below this, text would be too small on A4 -> tall page
-_TALL_FALLBACK: set = set()     # receipts rendered as a tall page (only these get cropped by tighten_pdf)
 _HAVE_TNR = False          # real Times New Roman installed from the bucket?
 
 
@@ -497,31 +495,19 @@ def _render_once(smc: SMCSession, receipt: str, extra: int) -> bytes:
 
             dbg = os.environ.get("TOPUP_DEBUG_DIR")
             pdf = b""
-            # A4 like SMC's own print (the "original"): ONE A4 page, content centred, scaled DOWN only when it
-            # would not fit. No cropping afterwards, so the white space under the signature labels (where the
-            # stamp/signatures are drawn) and the page proportions stay as in the original.
-            A4_W, A4_H = 793.7, 1122.5                       # CSS px at 96 dpi
+            # A4 exactly like SMC's own print: scale 1 (only shrunk if the page is WIDER than A4), content centred,
+            # and a long invoice simply continues on page 2, 3 ... as in the original. No cropping, no tall page.
+            # signature_script signs the LAST content page (the one with the signature labels).
+            A4_W = 793.7                                     # CSS px at 96 dpi
             MT, MB, MSIDE = 40.0, 40.0, 10.0
-            scale = min(1.0, (A4_W - 2 * MSIDE) / w, (A4_H - MT - MB) / (h + 4))
-            if scale >= A4_FIT_MIN_SCALE:
-                side = max((A4_W - w * scale) / 2.0, 0.0)
-                pdf = page.pdf(width="210mm", height="297mm", scale=round(scale, 4),
-                               margin={"top": f"{MT}px", "bottom": f"{MB}px", "left": f"{side}px", "right": f"{side}px"},
-                               print_background=True)
-                n_pages = len(re.findall(rb"/Type\s*/Page[^s]", pdf))
-                log.info(f"invoice {receipt}: A4 render, scale {scale:.3f}, pages={n_pages}")
-                if n_pages > 1:
-                    pdf = b""                                   # did not fit after all -> tall-page fallback below
-            else:
-                log.info(f"invoice {receipt}: needs scale {scale:.2f} < {A4_FIT_MIN_SCALE} for one A4 page - using tall page")
-            if not pdf:
-                _TALL_FALLBACK.add(receipt)
-                for slack in (30, 90, 200, 400):          # one single tall page; grow until it really is 1 page
-                    pdf = page.pdf(width=f"{w / 96:.3f}in", height=f"{(h + slack) / 96:.3f}in",
-                                   margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
-                                   print_background=True)
-                    if len(re.findall(rb"/Type\s*/Page[^s]", pdf)) <= 1:
-                        break
+            scale = min(1.0, (A4_W - 2 * MSIDE) / w)
+            side = max((A4_W - w * scale) / 2.0, 0.0)
+            page.add_style_tag(content="tr,img{page-break-inside:avoid;break-inside:avoid} thead{display:table-row-group}")
+            pdf = page.pdf(width="210mm", height="297mm", scale=round(scale, 4),
+                           margin={"top": f"{MT}px", "bottom": f"{MB}px", "left": f"{side}px", "right": f"{side}px"},
+                           print_background=True)
+            n_pages = len(re.findall(rb"/Type\s*/Page[^s]", pdf))
+            log.info(f"invoice {receipt}: A4 render, scale {scale:.3f}, pages={n_pages}")
             if dbg:
                 os.makedirs(dbg, exist_ok=True)
                 with open(os.path.join(dbg, f"invoice_{receipt}_00_raw_render.pdf"), "wb") as f:
@@ -610,8 +596,6 @@ def build_invoice_row(smc, cid, decree, info, nid):
     notes, data = [], None
     try:
         raw = render_details_pdf(smc, receipt)                 # the CURRENT, unsigned invoice, ONE A4 page like SMC's own print
-        if receipt in _TALL_FALLBACK:                          # only a very long invoice: crop the tall page to its content
-            raw = tighten_pdf(raw)
         v["rendered"] = inspect_pdf(raw)
         v["rendered_has_receipt"] = receipt in pdf_text_digits(raw)
         data, layout = sign_with_script(raw)
