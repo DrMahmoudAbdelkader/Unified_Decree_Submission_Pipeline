@@ -3,7 +3,9 @@
 #   1) drains the "فحص قرارات المريض" lookups   (topup_decree_lookup.py  - fast; also created
 #      automatically for «يفاد بقرار اللجنه السابقه» letters)
 #   2) fetches the PREVIOUS DECREE REPORT PDF for those letters           (topup_report_fetch.py)
-#   3) fetches the signed invoice PDFs for «التجديد في نهاية المده»        (topup_evidence_fetch.py)
+#   3) builds the signed invoice PDFs for «التجديد في نهاية المده»          (topup_evidence_fetch.py)
+#      — every invoice is rendered from its CURRENT unsigned Details page and signed with signature_script.py
+#        (SMC's own signed attachment is never used: an invoice that is not yet معتمد can still change)
 # National-ID-card letters need no job: a person fixes the card and presses «تم التصحيح» on the page.
 # Runs nightly AFTER the status sync + value sync chain, on demand, and when the page's buttons
 # «جلب الفواتير الآن» / «فحص قرارات المريض» start it (workflow_dispatch, no inputs needed).
@@ -70,9 +72,9 @@ jobs:
           LOOKUP_TIME_BUDGET_MIN: "30"
         run: python topup_decree_lookup.py
 
-      # Chromium + an Arabic font: the previous-decree report is PRINTED from the SMC page, and the
-      # invoice fallback renders a Details page — both need them.
-      - name: Install Chromium (report print + invoice fallback)
+      # Chromium + an Arabic font: the previous-decree report is PRINTED from the SMC page, and EVERY invoice is
+      # rendered from its Details page before signing — both need them.
+      - name: Install Chromium (report print + invoice rendering)
         run: playwright install --with-deps chromium
       - name: Install Arabic font
         run: sudo apt-get install -y fonts-hosny-amiri
@@ -85,17 +87,17 @@ jobs:
           REPORT_TIME_BUDGET_MIN: "25"
         run: python topup_report_fetch.py
 
-      # 3) signed invoices (letters "التجديد في نهاية المده")
-      - name: Fetch signed invoices
+      # 3) signed invoices (letters "التجديد في نهاية المده") — rendered unsigned, then signed (needs signature_script.py in the repo root)
+      - name: Build signed invoices
         env:
-          SIGNED_MIN_IMAGES: ${{ vars.SIGNED_MIN_IMAGES }}
-          SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}
+          # all optional repo variables; empty = the script's defaults
+          SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}        # blue ink the signing must ADD to the page (default 2500)
+          LAYOUT_MIN_SPAN_FRAC: ${{ vars.LAYOUT_MIN_SPAN_FRAC }}    # label columns must span this share of the page width (default 0.35)
+          SIGNATURE_BASE_URL: ${{ vars.SIGNATURE_BASE_URL }}        # default: the public signature_files bucket
           MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '25' }}
           # Tahoma is fetched from decree-assets/fonts inside the script (same as the MDT form).
-          # Raw (unsigned) renders are kept as an artifact so the layout can be compared.
-          TOPUP_DEBUG_DIR: /tmp/topup_debug
-          # px added to hard-coded 300-900px widths (same +55 as the MDT fix); 0 disables.
-          INVOICE_WIDEN_PX: "55"
+          TOPUP_DEBUG_DIR: /tmp/topup_debug       # raw unsigned renders, kept as an artifact for layout checks
+          INVOICE_WIDEN_PX: "55"                  # same +55px rule as the MDT fix; "0" disables
         run: python topup_evidence_fetch.py
 
       - name: Upload raw invoice renders (layout check)
