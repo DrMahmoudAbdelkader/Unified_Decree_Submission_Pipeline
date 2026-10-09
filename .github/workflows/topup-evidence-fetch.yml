@@ -23,9 +23,9 @@ on:
   workflow_dispatch:
     inputs:
       max_candidates:
-        description: "Max invoice candidates this run (default 25)"
+        description: "Max invoice candidates this run (default 80; a selection sent by the page is never cut short)"
         required: false
-        default: "25"
+        default: "80"
       candidate_ids:
         description: "Optional: only these decree_topup_candidates ids (comma separated). Empty = the whole queue. Set by the page's buttons."
         required: false
@@ -39,7 +39,7 @@ jobs:
   fetch:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 200
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -99,7 +99,8 @@ jobs:
           SIGNED_MIN_BLUE_PX: ${{ vars.SIGNED_MIN_BLUE_PX }}        # blue ink the signing must ADD to the page (default 2500)
           LAYOUT_MIN_SPAN_FRAC: ${{ vars.LAYOUT_MIN_SPAN_FRAC }}    # label columns must span this share of the page width (default 0.35)
           SIGNATURE_BASE_URL: ${{ vars.SIGNATURE_BASE_URL }}        # default: the public signature_files bucket
-          MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '25' }}
+          MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '80' }}
+          EVIDENCE_TIME_BUDGET_MIN: "110"        # stop starting new entries after this; the rest stay PENDING for the next run
           # Tahoma is fetched from decree-assets/fonts inside the script (same as the MDT form).
           TOPUP_DEBUG_DIR: /tmp/topup_debug       # raw unsigned renders, kept as an artifact for layout checks
           INVOICE_WIDEN_PX: "55"                  # same +55px rule as the MDT fix; "0" disables
