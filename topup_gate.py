@@ -151,22 +151,38 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"], region_name="auto")
     bucket = os.environ["R2_BUCKET_NAME"]
 
+    import io
     writer = PdfWriter()
-    for page in PdfReader(patient_pdf_path).pages:
-        writer.add_page(page)
     added = 0
+    # evidence FIRST: the pipeline puts MDT form + medical report in front of whatever this returns,
+    # so the final order is  MDT -> report -> invoices (-> manual bill) -> patient document.
     for d in docs:
         body = s3.get_object(Bucket=bucket, Key=d["r2_key"])["Body"].read()
-        import io
         for page in PdfReader(io.BytesIO(body)).pages:
             writer.add_page(page)
             added += 1
+    # manual "كشف حساب" page — only when the previous decree still has dispensings waiting to be billed
+    # in Enhanced Monitor. Placed right after the invoices. A failure here must never block the request.
+    bill_pages = 0
+    if g.get("kind") in TOPUP_LIKE:
+        try:
+            import topup_manual_bill
+            bill = topup_manual_bill.bill_pdf_for_candidate(int(g["candidate_id"]))
+            if bill:
+                for page in PdfReader(io.BytesIO(bill)).pages:
+                    writer.add_page(page)
+                    bill_pages += 1
+        except Exception as exc:
+            log.warning(f"  [top-up] manual bill skipped for case {case_id}: {exc}")
+    for page in PdfReader(patient_pdf_path).pages:
+        writer.add_page(page)
     out_dir = tempfile.mkdtemp(prefix="topup_merge_")
     out_path = os.path.join(out_dir, os.path.basename(patient_pdf_path))
     with open(out_path, "wb") as f:
         writer.write(f)
-    log.info(f"  [top-up/{g.get('kind')}] case {case_id}: appended {len(docs)} document(s) / {added} page(s) "
-             f"after the patient document.")
+    log.info(f"  [top-up/{g.get('kind')}] case {case_id}: placed {len(docs)} document(s) / {added} page(s) "
+             f"before the patient document (right after MDT + report)"
+             f"{' + ' + str(bill_pages) + ' manual-bill page(s)' if bill_pages else ''}.")
     return out_path
 
 

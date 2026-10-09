@@ -532,7 +532,7 @@ def _refresh_local_pdf_by_window_core(national_id: str, existing_local_pdf_path:
     tmp_path = existing_local_pdf_path + ".refresh_tmp"
     with open(existing_local_pdf_path, "rb") as f:
         existing_bytes = f.read()
-    ok = _merge_pdf_bytes_list([existing_bytes] + new_pdf_bytes, tmp_path)
+    ok = _merge_pdf_bytes_list(new_pdf_bytes + [existing_bytes], tmp_path)  # new DMS pages FIRST
     if not ok:
         log.warning(f"  [DMS archive refresh] Merge failed for MR {mr} - local file left unchanged.")
         if os.path.exists(tmp_path):
@@ -772,7 +772,7 @@ def merge_new_archive_docs_by_id(national_id: str, existing_local_pdf_path: str,
     tmp_path = existing_local_pdf_path + ".refresh_tmp"
     with open(existing_local_pdf_path, "rb") as f:
         existing_bytes = f.read()
-    ok = _merge_pdf_bytes_list([existing_bytes] + new_pdf_bytes, tmp_path)
+    ok = _merge_pdf_bytes_list(new_pdf_bytes + [existing_bytes], tmp_path)  # new DMS pages FIRST
     if not ok:
         log.warning(f"  [DMS archive diff] Merge failed for MR {mr} - local file left unchanged.")
         if os.path.exists(tmp_path):

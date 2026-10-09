@@ -176,7 +176,7 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
     """Manual numbers win. Otherwise the union of
          (a) decrees this app stored for the patient's earlier cases on the same protocol, and
          (b) decrees SMC lists for the patient on the same plan/protocol (the patient lookup),
-    oldest first; protocols.max_previous_decrees then keeps only the NEWEST N."""
+    oldest first; then ONLY the newest one is kept (unless all_previous_decrees is set)."""
     if c.get("manual_decree_numbers"):
         return list(dict.fromkeys(str(x) for x in c["manual_decree_numbers"]))
     _ensure_lookup(c, smc)
@@ -190,16 +190,20 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
         return []
     log.info(f"  candidate {c['id']}: previous decrees {len(from_db)} from the app + {len(from_smc)} from SMC "
              f"-> {len(decrees)} distinct")
-    # protocols.max_previous_decrees (e.g. 'supportive' = 1): only the NEWEST previous decrees' invoices
-    lim = None
-    if c.get("protocol_key"):
-        try:
-            pr = sb.select("decree_topup_protocols", select="max_previous_decrees",
-                           filters={"protocol_key": f"eq.{c['protocol_key']}"}, limit=1)
-            lim = (pr[0].get("max_previous_decrees") if pr else None)
-        except Exception as e:
-            log.warning(f"max_previous_decrees lookup skipped: {e}")
-    return decrees[-int(lim):] if lim else decrees
+    # GENERAL RULE: only the invoices of the single most recent previous decree of the same plan.
+    # Extraordinary override: candidate.all_previous_decrees = true -> every previous decree
+    # (still capped by protocols.max_previous_decrees when that is > 1).
+    if c.get("all_previous_decrees"):
+        lim = None
+        if c.get("protocol_key"):
+            try:
+                pr = sb.select("decree_topup_protocols", select="max_previous_decrees",
+                               filters={"protocol_key": f"eq.{c['protocol_key']}"}, limit=1)
+                lim = (pr[0].get("max_previous_decrees") if pr else None)
+            except Exception as e:
+                log.warning(f"max_previous_decrees lookup skipped: {e}")
+        return decrees[-int(lim):] if lim and int(lim) > 1 else decrees
+    return decrees[-1:]
 
 
 # --------------------------------------------------------------------------- SMC calls
