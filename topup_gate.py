@@ -42,8 +42,12 @@ SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 # sentence, copy it here — nothing else depends on it.
 CYCLES_TEMPLATE = "المستلم من القرار السابق: {received} ({unit})، والمتبقي المطلوب: {remaining} ({unit})."
 
-KIND_LABEL = {"TOPUP": "تجديد في نهاية المدة", "PREV_REPORT": "طلب تقرير القرار السابق",
+KIND_LABEL = {"TOPUP": "تجديد في نهاية المدة", "PREV_INCLUSIVE": "القرار السابق شامل", "PREV_REPORT": "طلب تقرير القرار السابق",
               "ID_CARD": "بطاقة الرقم القومي"}
+
+
+# kinds that run the same workflow: cycle counts + signed invoices + report sentence
+TOPUP_LIKE = ("TOPUP", "PREV_INCLUSIVE")
 
 
 class TopupNotReady(Exception):
@@ -117,7 +121,7 @@ def assert_ready(case_id: int) -> None:
 
 def cycles_statement(case_id: int) -> Optional[str]:
     g = _gate(case_id)
-    if not g.get("is_topup") or g.get("kind") != "TOPUP":
+    if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE:
         return None
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
@@ -130,7 +134,7 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
     written to a NEW temp file — the patient's permanent cached file is never modified. For a
     normal request or an ID_CARD letter the original path is returned untouched."""
     g = _gate(case_id)
-    if not g.get("is_topup") or g.get("kind") not in ("TOPUP", "PREV_REPORT"):
+    if not g.get("is_topup") or g.get("kind") not in ("TOPUP", "PREV_INCLUSIVE", "PREV_REPORT"):
         return patient_pdf_path
     docs = _documents(int(g["candidate_id"]))
     if not docs:
