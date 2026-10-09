@@ -504,6 +504,52 @@ def _render_once(smc: SMCSession, receipt: str, extra: int) -> bytes:
             br.close()
 
 
+def tighten_pdf(data: bytes, margin: float = 18.0, min_width: float = 420.0) -> bytes:
+    """Crop every page of the rendered invoice to its REAL content (text, images, ruled lines/shaded bands that
+    are not page-wide white backgrounds) and stack the pages into ONE page: no blank top/bottom/side areas,
+    no page-break gap. Runs on the unsigned render, before signature_script sees it."""
+    import pymupdf
+    src = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        parts = []                                    # (page_index, clip rect)
+        for i, pg in enumerate(src):
+            pw, ph = pg.rect.width, pg.rect.height
+            rects = [pymupdf.Rect(w[:4]) for w in pg.get_text("words") if w[4].strip()]
+            for info in pg.get_image_info():
+                rects.append(pymupdf.Rect(info["bbox"]))
+            for d in pg.get_drawings():
+                r = d["rect"]
+                if r.width >= pw * 0.995 and r.height >= ph * 0.5:      # page-sized background, not content
+                    continue
+                if r.is_empty and r.width == 0 and r.height == 0:
+                    continue
+                rects.append(pymupdf.Rect(r))
+            rects = [r for r in rects if not r.is_infinite]
+            if not rects:
+                continue
+            u = pymupdf.Rect(rects[0])
+            for r in rects[1:]:
+                u |= r
+            u = pymupdf.Rect(max(u.x0 - 2, 0), max(u.y0 - 2, 0), min(u.x1 + 2, pw), min(u.y1 + 2, ph))
+            parts.append((i, u))
+        if not parts:
+            return data
+        x0 = min(r.x0 for _, r in parts)
+        x1 = max(r.x1 for _, r in parts)
+        cw = max(x1 - x0, min_width - 2 * margin)
+        out = pymupdf.open()
+        total_h = sum(r.height for _, r in parts) + 2 * margin
+        page = out.new_page(width=cw + 2 * margin, height=total_h)
+        y = margin
+        for i, r in parts:
+            dst = pymupdf.Rect(margin + (r.x0 - x0), y, margin + (r.x1 - x0), y + r.height)
+            page.show_pdf_page(dst, src, i, clip=r)
+            y += r.height
+        return out.tobytes(deflate=True, garbage=3)
+    finally:
+        src.close()
+
+
 def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
     """Print the CURRENT (unsigned) Details page with Chromium, using the MDT-form method
     (print media first, widen hard-coded px widths, size the canvas to the real content) plus:
@@ -536,7 +582,7 @@ def build_invoice_row(smc, cid, decree, info, nid):
     row = {"candidate_id": cid, "decree_number": decree, "receipt_id": receipt, "signed_source": "rendered_signed"}
     notes, data = [], None
     try:
-        raw = render_details_pdf(smc, receipt)                # the CURRENT, unsigned invoice
+        raw = tighten_pdf(render_details_pdf(smc, receipt))    # the CURRENT, unsigned invoice, cropped to its real content on ONE page
         v["rendered"] = inspect_pdf(raw)
         v["rendered_has_receipt"] = receipt in pdf_text_digits(raw)
         data, layout = sign_with_script(raw)
@@ -581,6 +627,25 @@ def build_invoice_row(smc, cid, decree, info, nid):
 def save_row(cid, receipt, row):
     ex = sb.select(INV, select="id", filters={"candidate_id": f"eq.{cid}", "receipt_id": f"eq.{receipt}"}, limit=1)
     (sb.update(INV, ex[0]["id"], row) if ex else sb.insert(INV, row))
+
+
+
+def purge_candidate(cid, s3, bucket):
+    """Remove the stored INVOICES of this entry (R2 file + decree_topup_invoices row). Previous-decree REPORT rows
+    (doc_kind = PREV_REPORT, owned by topup_report_fetch.py) are never touched."""
+    rows = sb.select(INV, select="id,r2_key", limit=500,
+                     filters={"candidate_id": f"eq.{cid}", "or": "(doc_kind.is.null,doc_kind.neq.PREV_REPORT)"})
+    hdr = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
+    for r in rows:
+        if r.get("r2_key"):
+            try:
+                s3.delete_object(Bucket=bucket, Key=r["r2_key"])
+            except Exception as e:
+                log.warning(f"  candidate {cid}: could not delete {r['r2_key']}: {e}")
+        resp = requests.delete(f"{SUPABASE_URL}/rest/v1/{INV}?id=eq.{r['id']}", headers=hdr, timeout=30)
+        resp.raise_for_status()
+    log.info(f"  candidate {cid}: purged {len(rows)} stored invoice(s)")
+    return len(rows)
 
 
 # --------------------------------------------------------------------------- one candidate
@@ -682,9 +747,22 @@ def main():
     only = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
     if only:                       # the page asked for these entries only
         flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
+    s3, bucket = _r2(), os.environ["R2_BUCKET_NAME"]
+    mode = (os.environ.get("EVIDENCE_MODE") or "").strip().lower()      # "" | "refetch" | "clear"  (set by the page's buttons)
+    if only and mode in ("refetch", "clear"):
+        flt.pop("evidence_status", None)                                # any state: the old files are being replaced/removed
+        for cid in only:
+            purge_candidate(cid, s3, bucket)
+            if mode == "refetch":
+                sb.update(CAND, cid, {"evidence_status": "PENDING", "evidence_message": None})
+            else:
+                sb.update(CAND, cid, {"evidence_status": "NO_PREVIOUS_DECREE",
+                                      "evidence_message": "تم حذف الفواتير المخزنة يدوياً — أعد الطلب أو أدخل القرارات/الإيصالات الصحيحة"})
+        if mode == "clear":
+            return
+        flt["evidence_status"] = "eq.PENDING"
     rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=MAX_CANDIDATES)
     log.info(f"{len(rows)} candidate(s) to fetch evidence for.")
-    s3, bucket = _r2(), os.environ["R2_BUCKET_NAME"]
     results = []
     for c in rows:
         try:
