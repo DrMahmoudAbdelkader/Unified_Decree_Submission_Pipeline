@@ -17,24 +17,15 @@ CONFIRMED SMC FLOW (all from the HAR):
   3. signed attachment    GET  {BASE}/smc/HospDecreeReceipts/ReadFiles?ReceiptId=<receiptId>
                           = the hospital's own upload of the signed invoice.
 
-WHAT THE REAL ATTACHMENTS LOOK LIKE: a one-page SCAN (producer "Toshiba e-STUDIO",
-one full-page image, NO text layer). So "signed?" cannot be decided from text or from
-the number of images. Rules used here:
-  - scan (no text layer): signed  <=>  enough BLUE-INK pixels on the page (wet-ink
-    signatures + stamp are blue, the printed text is grey).  Measured on 3 real signed
-    invoices: ~7,700 blue px each vs ~600 on the same page with the signature block
-    blanked.  Threshold SIGNED_MIN_BLUE_PX (default 2500).
-  - born-digital PDF (has text): signed <=> >= SIGNED_MIN_IMAGES (default 4) images on
-    the last text page (what signature_script.py draws).
-Because a scan has no text, the invoice is tied to the decree / patient through the
-Details page (digits normalised) and the listing's own DECREEID field instead.
-
-FALLBACK LADDER (every rung below the first ends in status REVIEW, never OK):
-  A  attachment present and looks signed ............ keep it                 (smc_attachment)
-  B  attachment present but NOT signed .............. sign it with
-                                                      signature_script.sign_pdf (rendered_fallback)
-  C  no attachment / download failed / not a PDF .... render Details/<id> with
-                                                      Chromium, then sign it    (rendered_fallback)
+SIGNING POLICY (v3): the signed attachment on SMC is NEVER used as evidence. An invoice that is not yet
+"معتمد" can still be edited after it was signed, so a scanned signed copy may be missing lines that the
+current invoice has. For EVERY invoice, whatever its status:
+  1. render the CURRENT Details/<id> page to PDF with Chromium (the unsigned invoice, as printed today)
+  2. detect the signature-label row and place sig1-4 + stamp with signature_script.sign_pdf
+     (signature images: public bucket signature_files = 1b/2b/3b/4b.png + stamp.png)
+  3. verify: the rendered PDF really is this receipt, ink was added, the 4 label columns look sane
+Result row: signed_source='rendered_signed'; status OK when every check passes, otherwise REVIEW
+(file kept, message says which check failed); FAILED only if rendering/signing itself raised.
 Nothing is ever uploaded back to SMC.
 """
 from __future__ import annotations
@@ -64,7 +55,11 @@ MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES") or "25")
 APPROVED_RE = re.compile(os.environ.get("APPROVED_STATUS_REGEX") or r"معتمد")
 NOT_APPROVED_RE = re.compile(r"غير\s*معتمد|مرفوض|ملغ|رفض")
 SIGNED_MIN_IMAGES = int(os.environ.get("SIGNED_MIN_IMAGES") or "4")
-SIGNED_MIN_BLUE_PX = int(os.environ.get("SIGNED_MIN_BLUE_PX") or "2500")
+SIGNED_MIN_BLUE_PX = int(os.environ.get("SIGNED_MIN_BLUE_PX") or "2500")   # blue px the signing must ADD (100 dpi)
+LAYOUT_MIN_SPAN_FRAC = float(os.environ.get("LAYOUT_MIN_SPAN_FRAC") or "0.35")  # label columns must span this much of the page width
+SIGNATURE_BASE_URL = (os.environ.get("SIGNATURE_BASE_URL") or
+                      "https://qayhkvtgkflxvlhstiuz.supabase.co/storage/v1/object/public/signature_files").rstrip("/")
+SIGNATURE_FILES = {"sig1": "1b.png", "sig2": "2b.png", "sig3": "3b.png", "sig4": "4b.png", "stamp": "stamp.png"}
 DELAY = 0.4
 CAND, INV = "decree_topup_candidates", "decree_topup_invoices"
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
@@ -306,25 +301,55 @@ _ASSETS = {}
 
 
 def _assets() -> dict:
+    """Download the 5 signing images from the public signature_files bucket (once per run)."""
     if not _ASSETS:
-        import supabase_storage
-        _ASSETS.update(supabase_storage.fetch_signing_and_template_assets(
-            os.path.join(tempfile.gettempdir(), "topup_assets")))
+        from PIL import Image
+        d = os.path.join(tempfile.gettempdir(), "topup_signature_assets")
+        os.makedirs(d, exist_ok=True)
+        got = {}
+        for key, fn in SIGNATURE_FILES.items():
+            r = requests.get(f"{SIGNATURE_BASE_URL}/{fn}", timeout=60)
+            r.raise_for_status()
+            path = os.path.join(d, fn)
+            with open(path, "wb") as f:
+                f.write(r.content)
+            Image.open(path).verify()                      # must really be an image, not an error page
+            got[key] = path
+        _ASSETS.update(got)
     return _ASSETS
 
 
-def sign_with_script(data: bytes) -> bytes:
-    """signature_script.sign_pdf: detects the label row from rendered pixels (works on text
-    PDFs AND on scans) and draws sig1-4 + stamp from the Supabase 'decree-assets' bucket."""
+def sign_with_script(data: bytes):
+    """signature_script.sign_pdf: finds the label row from the rendered page and draws sig1-4 + stamp.
+    Returns (signed_bytes, layout) where layout describes where the 4 label columns were found."""
     import signature_script as ss
+    from pypdf import PdfReader
     a = _assets()
     with tempfile.TemporaryDirectory() as td:
         src, dst = os.path.join(td, "in.pdf"), os.path.join(td, "out.pdf")
         with open(src, "wb") as f:
             f.write(data)
+        total = len(PdfReader(src).pages)
+        page = ss._find_last_content_page(src, total) if total > 1 else 0   # same rule sign_pdf uses
+        det = ss.detect_label_row(src, page_index=page)
+        centers = [round(float(det["columns"][k]["x_center"]), 1) for k in ("stamp", "sig2", "sig1", "sig3") if k in det["columns"]]
+        span = float((max(centers) - min(centers)) / det["pdf_w"]) if len(centers) > 1 else 0.0
+        layout = {"page_index": page, "pages": total, "centers": centers, "columns": len(centers),
+                  "span_frac": round(span, 3), "label_bottom_frac": round(float(det["label_bot_y"]) / float(det["pdf_h"]), 3),
+                  "ascending": all(x < y for x, y in zip(centers, centers[1:]))}
         ss.sign_pdf(src, dst, a["sig1"], a["sig2"], a["sig3"], a["sig4"], a["stamp"])
         with open(dst, "rb") as f:
-            return f.read()
+            return f.read(), layout
+
+
+def pdf_text_digits(data: bytes) -> str:
+    """All text of the PDF, Arabic-Indic digits -> ASCII, whitespace removed (for number lookups)."""
+    import pymupdf
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        return re.sub(r"\s+", "", ar2en("".join(pg.get_text() for pg in doc)))
+    finally:
+        doc.close()
 
 
 _FONT_READY = False
@@ -426,57 +451,51 @@ def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
 # --------------------------------------------------------------------------- one invoice
 def build_invoice_row(smc, cid, decree, info, nid):
     receipt = info["receipt_id"]
-    v = {"listing": {k: info[k] for k in ("status_code", "status_text", "amount", "reg_date", "claim_id")}}
+    v = {"listing": {k: info[k] for k in ("status_code", "status_text", "amount", "reg_date", "claim_id")},
+         "smc_attachment_ignored": bool(info["has_attachment"])}
     v["details"] = check_details(smc, receipt, decree, nid)
     time.sleep(DELAY)
 
-    data, source, notes = None, "smc_attachment", []
-    if info["has_attachment"]:
-        raw, err = download_attachment(smc, receipt)
-        time.sleep(DELAY)
-        if raw is None:
-            notes.append(f"تعذر تحميل المرفق: {err}")
-        else:
-            v["attachment"] = inspect_pdf(raw)
-            if v["attachment"]["looks_signed"]:
-                data = raw                                        # rung A
-            else:
-                try:                                              # rung B
-                    data, source = sign_with_script(raw), "rendered_fallback"
-                    notes.append("مرفق SMC غير موقّع — تم التوقيع تلقائياً")
-                except Exception as e:
-                    v["sign_error"] = f"{type(e).__name__}: {str(e)[:160]}"
-                    notes.append("مرفق SMC غير موقّع وفشل التوقيع التلقائي")
-    else:
-        notes.append("لا يوجد مرفق للفاتورة على SMC")
-    if data is None:                                              # rung C
-        try:
-            data, source = sign_with_script(render_details_pdf(smc, receipt)), "rendered_fallback"
-            notes.append("تم إنشاء الفاتورة من صفحة التفاصيل وتوقيعها تلقائياً")
-        except Exception as e:
-            v["render_error"] = f"{type(e).__name__}: {str(e)[:160]}"
-
-    row = {"candidate_id": cid, "decree_number": decree, "receipt_id": receipt, "signed_source": source}
-    if data is None:
-        row.update(status="FAILED", message=" | ".join(notes) or "تعذر الحصول على الفاتورة", verification=v)
+    row = {"candidate_id": cid, "decree_number": decree, "receipt_id": receipt, "signed_source": "rendered_signed"}
+    notes, data = [], None
+    try:
+        raw = render_details_pdf(smc, receipt)                # the CURRENT, unsigned invoice
+        v["rendered"] = inspect_pdf(raw)
+        v["rendered_has_receipt"] = receipt in pdf_text_digits(raw)
+        data, layout = sign_with_script(raw)
+        v["layout"] = layout
+    except Exception as e:
+        v["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        row.update(status="FAILED", verification=v,
+                   message=f"تعذر إنشاء/توقيع الفاتورة من صفحة التفاصيل: {v['error']}")
         return row, None
+    time.sleep(DELAY)
+
     final = inspect_pdf(data)
     v["final"] = final
+    added_blue = final["blue_px"] - v["rendered"]["blue_px"]
+    v["added_blue_px"] = added_blue
     d = v["details"]
     ties_ok = bool(d.get("details_ok") and d.get("receipt_in_details")
                    and d.get("decree_in_details") is not False and d.get("nid_in_details") is not False)
     listing_ok = info["decree_id"] in ("", decree)
-    good = (source == "smc_attachment" and final["looks_signed"] and ties_ok and listing_ok)
+    signed_ok = added_blue >= SIGNED_MIN_BLUE_PX
+    lay = v["layout"]
+    layout_ok = lay["columns"] >= 4 and lay["ascending"] and lay["span_frac"] >= LAYOUT_MIN_SPAN_FRAC
+    page_ok = bool(v["rendered_has_receipt"])
+
     if not ties_ok:
         notes.append("لم يتطابق رقم الفاتورة/القرار/الرقم القومي مع صفحة التفاصيل — راجع الملف")
     if not listing_ok:
         notes.append(f"الفاتورة مسجلة على قرار آخر ({info['decree_id']})")
-    if source == "rendered_fallback":
-        notes.append("راجع الملف قبل الاعتماد")
-    elif not final["looks_signed"]:
-        notes.append("لم يتم التحقق من وجود التوقيعات — راجع الملف")
+    if not page_ok:
+        notes.append("نص الـ PDF المُنشأ لا يحتوي رقم الفاتورة (قد تكون صفحة غير صحيحة) — راجع الملف")
+    if not signed_ok:
+        notes.append("لم تُضَف التوقيعات بشكل كافٍ على الصفحة — راجع الملف")
+    if not layout_ok:
+        notes.append("مواضع خانات التوقيع غير معتادة (قد تكون التوقيعات في مكان خاطئ) — راجع الملف")
     row.update(bytes=len(data), page_count=final["pages"], sha256=hashlib.sha256(data).hexdigest(),
-               verification=v, status="OK" if good else "REVIEW",
+               verification=v, status="OK" if (ties_ok and listing_ok and page_ok and signed_ok and layout_ok) else "REVIEW",
                message=" | ".join(dict.fromkeys(notes)) or None,
                fetched_at=datetime.now(timezone.utc).isoformat())
     return row, data
