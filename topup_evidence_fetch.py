@@ -58,6 +58,11 @@ READ_URL = BASE_URL + "/smc/HospDecreeReceipts/ReadFiles"
 CREATE_URL = BASE_URL + "/smc/HospDecreeReceipts/Create?decreeId={decree}"   # the page that fires the listing XHR
 
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES") or "25")
+# EVERY invoice SMC lists for a previous decree is collected, whatever its status (approved, returned with an
+# approval error, pending ...). The status text is only logged and kept in `verification.listing` for reference;
+# it never decides whether the invoice is included or whether it needs review.
+APPROVED_RE = re.compile(os.environ.get("APPROVED_STATUS_REGEX") or r"معتمد")
+NOT_APPROVED_RE = re.compile(r"غير\s*معتمد|مرفوض|ملغ|رفض")
 SIGNED_MIN_IMAGES = int(os.environ.get("SIGNED_MIN_IMAGES") or "4")
 SIGNED_MIN_BLUE_PX = int(os.environ.get("SIGNED_MIN_BLUE_PX") or "2500")
 DELAY = 0.4
@@ -242,7 +247,7 @@ def parse_receipt_table(html: str) -> list[dict]:
             amount = float(m.group(0).replace(",", "")) if m else None
         out.append({"receipt_id": rid, "decree_id": hid("DECREEID"), "claim_id": hid("CLAIMID"),
                     "status_code": hid("STATUSID"), "status_text": status_text,
-                    "approved": "معتمد" in status_text,
+                    "approved": bool(APPROVED_RE.search(status_text)) and not NOT_APPROVED_RE.search(status_text),
                     "amount": amount, "reg_date": txt[2] if len(txt) > 2 else "",
                     "has_attachment": att is not None})
     return out
@@ -426,12 +431,13 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
         except Exception as e:
             problems.append(f"{d}: {type(e).__name__}: {str(e)[:80]}"); continue
         time.sleep(DELAY)
-        approved = [x for x in rows if x["approved"]]
+        log.info(f"  candidate {cid}: decree {d}: {len(rows)} invoice(s) listed on SMC (all are collected, whatever their status)")
+        for x in rows:
+            log.info(f"      invoice {x['receipt_id']}: status_code={x['status_code']!r} status_text={x['status_text']!r} "
+                     f"amount={x['amount']} attachment={'yes' if x['has_attachment'] else 'no'}")
         if not rows:
             problems.append(f"{d}: لا توجد فواتير")
-        elif not approved:
-            problems.append(f"{d}: لا توجد فواتير معتمدة")
-        work.extend((d, x) for x in approved)
+        work.extend((d, x) for x in rows)
     # manually typed receipt ids: decree is read off the invoice page itself
     for rid in manual_receipts:
         if any(x["receipt_id"] == rid for _, x in work):
@@ -444,7 +450,7 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
 
     if not work:
         sb.update(CAND, cid, {"evidence_status": "FAILED",
-                              "evidence_message": "لا توجد فواتير معتمدة للقرارات السابقة — " + " ; ".join(problems)})
+                              "evidence_message": "لا توجد فواتير على SMC للقرارات السابقة — " + " ; ".join(problems)})
         return
     for decree, info in work:
         row, data = build_invoice_row(smc, cid, decree, info, nid)
@@ -453,7 +459,39 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
             s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/pdf")
             row["r2_key"] = key
         save_row(cid, info["receipt_id"], row)
+        log.info(f"  candidate {cid}: decree {decree} invoice {info['receipt_id']} -> {row.get('status')} "
+                 f"[{row.get('signed_source')}, {row.get('page_count')} page(s), {row.get('bytes')} bytes]"
+                 + (f" - {row['message']}" if row.get("message") else ""))
     _rpc("topup_recompute_evidence", {"p_id": cid})
+    try:
+        end = sb.select(CAND, select="evidence_status,evidence_message", filters={"id": f"eq.{cid}"}, limit=1)
+        if end:
+            log.info(f"  candidate {cid}: RESULT evidence_status={end[0]['evidence_status']} "
+                     f"{end[0].get('evidence_message') or ''} - open the entry on the page to view the stored PDFs")
+    except Exception:
+        pass
+
+
+def write_run_summary(results):
+    """The job itself stays green when an ENTRY ends FAILED / NEEDS_REVIEW (that is a data outcome shown
+    on the page, not a crash) - so say it loudly here: warning annotations + the run's summary tab."""
+    if not results:
+        return
+    good = [r for r in results if r[1] == "READY"]
+    bad = [r for r in results if r[1] != "READY"]
+    log.info(f"SUMMARY: {len(good)} READY, {len(bad)} need attention out of {len(results)}")
+    for cid, st, msg in bad:
+        print(f"::warning title=Top-up entry {cid} - {st}::{msg or 'see the entry on the page'}")
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf8") as f:
+                f.write(f"### Top-up invoices: {len(good)} READY / {len(bad)} need attention\n\n"
+                        "| entry | result | note |\n|---|---|---|\n")
+                for cid, st, msg in results:
+                    f.write(f"| {cid} | {st} | {str(msg).replace('|', '/')[:300]} |\n")
+        except Exception:
+            pass
 
 
 def main():
@@ -476,13 +514,19 @@ def main():
     rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=MAX_CANDIDATES)
     log.info(f"{len(rows)} candidate(s) to fetch evidence for.")
     s3, bucket = _r2(), os.environ["R2_BUCKET_NAME"]
+    results = []
     for c in rows:
         try:
             process(c, smc, s3, bucket)
+            end = sb.select(CAND, select="evidence_status,evidence_message", filters={"id": f"eq.{c['id']}"}, limit=1)
+            results.append((c["id"], (end[0]["evidence_status"] if end else "?"),
+                            (end[0].get("evidence_message") or "") if end else ""))
         except Exception as e:
             log.exception(f"candidate {c['id']} failed")
             sb.update(CAND, c["id"], {"evidence_status": "FAILED",
                                       "evidence_message": f"{type(e).__name__}: {str(e)[:200]}"})
+            results.append((c["id"], "FAILED", f"{type(e).__name__}: {str(e)[:200]}"))
+    write_run_summary(results)
 
 
 if __name__ == "__main__":
