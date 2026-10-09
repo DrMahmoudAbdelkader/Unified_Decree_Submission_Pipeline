@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import Unified_Decree_Submission_Pipeline as _pipeline_module
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
+import sharding   # SHARD_COUNT/SHARD_INDEX: parallel slices (no-op when unset)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_value_sync")
@@ -159,6 +160,11 @@ def load_targets() -> list:
             order=order, limit=room,
         )
         targets.extend((table, r["id"], str(r["decree_number"]).strip()) for r in rows)
+    # keyed by DECREE NUMBER: the same decree on an attempt row and a seed row stays in one shard (one fetch)
+    if sharding.enabled():
+        before = len(targets)
+        targets = [t for t in targets if sharding.in_shard(t[2])]
+        log.info(f"{sharding.describe()}: {len(targets)} of {before} decree(s) belong to this shard.")
     return targets
 
 

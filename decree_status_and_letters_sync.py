@@ -172,6 +172,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import Unified_Decree_Submission_Pipeline as _pipeline_module
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
+import sharding   # SHARD_COUNT/SHARD_INDEX: parallel slices (no-op when unset)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_status_and_letters_sync")
@@ -740,6 +741,7 @@ def load_open_seed_rows(status_map: Dict[str, dict]) -> List[dict]:
     return [
         r for r in rows
         if not resolve_status_bucket(status_map, r.get("last_known_status") or "")["is_final"]
+        and sharding.in_shard(r.get("request_number"))
     ]
 
 
@@ -823,7 +825,7 @@ def sync_seed_table(session, status_map: Dict[str, dict], today_iso: str) -> Dic
     # Newest first: recent requests are the ones whose status is still moving,
     # and old rows SMC no longer returns would otherwise eat the whole budget.
     missing.sort(key=lambda r: _date_part(r.get("request_date") or ""), reverse=True)
-    budget = MAX_SEED_SINGLE_LOOKUPS
+    budget = sharding.share_of(MAX_SEED_SINGLE_LOOKUPS)
     if missing:
         log.info(f"Seed refresh: {len(missing)} open seed row(s) were not in the bulk windows; "
                  f"single-looking up to {budget}.")
@@ -951,10 +953,13 @@ def sync_decree_numbers(session_wrapper, status_map: Dict[str, dict]) -> Dict[st
             return counters
         raise
 
+    pre_shard_total = len(targets)          # the cap was applied BEFORE slicing: N shards share it, not multiply it
+    if sharding.enabled():
+        targets = [t for t in targets if sharding.in_shard(t[2])]
     if not targets:
         log.info("Decree numbers: nothing to fill.")
         return counters
-    if len(targets) >= MAX_DECREE_LOOKUPS:
+    if pre_shard_total >= MAX_DECREE_LOOKUPS:
         counters["capped"] = 1
         log.info(f"Decree numbers: hit the per-run cap ({MAX_DECREE_LOOKUPS}); the rest continues next run.")
 
@@ -1121,10 +1126,14 @@ def main():
         time.sleep(REQUEST_DELAY)
 
     attempts = load_open_attempts()
+    if sharding.enabled():
+        _all = len(attempts)
+        attempts = [a for a in attempts if sharding.in_shard(a["case_id"] if a.get("case_id") is not None else a.get("website_request_id"))]
+        log.info(f"{sharding.describe()}: {len(attempts)} of {_all} open attempts belong to this shard.")
     log.info(f"{len(attempts)} open attempt(s) to check "
              f"(bulk window covers submissions {start_iso}..{today_iso}).")
 
-    lookup_budget = {"remaining": MAX_SINGLE_STATUS_LOOKUPS}
+    lookup_budget = {"remaining": sharding.share_of(MAX_SINGLE_STATUS_LOOKUPS)}
 
     checked = updated = letters_fetched = reached_final = 0
     used_bulk = used_single = budget_exhausted = not_found = crashed = 0

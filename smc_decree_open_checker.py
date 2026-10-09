@@ -31,6 +31,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 from bs4 import BeautifulSoup
 
+import json
+import sharding   # SHARD_COUNT/SHARD_INDEX: parallel slices (no-op when unset)
+
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 def env(name, default=""):
     """Read an env var and strip stray whitespace/newlines (a very common
@@ -276,12 +279,26 @@ def main():
     cycles = {c["decree_number"]: c for c in
               sb_get_all("decree_open_tracker?select=*&cleared_at=is.null")}
 
-    run = sb_post("decree_check_runs", {"trigger_type": TRIGGER_TYPE, "decrees_total": len(pend)},
-                  return_rep=True)
-    run_id = run[0]["id"] if run else None
+    SHARDED = sharding.enabled()
+    if os.environ.get("RUN_ID", "").strip():
+        # sharded run: the planner created the ONE decree_check_runs row; open_check_finish.py completes it
+        rid = os.environ["RUN_ID"].strip()
+        run_id = int(rid) if rid.isdigit() else rid
+    else:
+        run = sb_post("decree_check_runs", {"trigger_type": TRIGGER_TYPE, "decrees_total": len(pend)},
+                      return_rep=True)
+        run_id = run[0]["id"] if run else None
+
+    def write_shard_stats(stats, newly, over):
+        path = os.environ.get("OPEN_STATS_FILE")
+        if SHARDED and path:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"checked": len(pend), **stats, "newly_opened_list": newly,
+                           "overage_list": over}, fh, ensure_ascii=False)
 
     # safety net: live cycles whose decree has nothing pending any more
-    if not ONLY_DECREE:
+    if not ONLY_DECREE and sharding.SHARD_INDEX == 0:     # once per run, against the FULL pending set
         for d, c in cycles.items():
             if d not in pend:
                 sb_patch(f"decree_open_tracker?id=eq.{c['id']}",
@@ -289,9 +306,16 @@ def main():
                           "cleared_open": c["smc_status"] == "open", "updated_at": now_iso()})
                 log(f"  closed orphan cycle for {d}")
 
+    if SHARDED:
+        _total = len(pend)
+        pend = {d: g for d, g in pend.items() if sharding.in_shard(d)}
+        log(f"{sharding.describe()}: {len(pend)} of {_total} decree(s) belong to this shard.")
+
     if not pend:
         log("Nothing pending – done.")
-        if run_id:
+        stats0 = dict(open=0, closed=0, newly_opened=0, errors=0, overage=0)
+        write_shard_stats(stats0, [], [])
+        if run_id and not SHARDED:
             sb_patch(f"decree_check_runs?id=eq.{run_id}", {"finished_at": now_iso()})
         return
 
@@ -363,7 +387,8 @@ def main():
             sb_patch(f"decree_open_tracker?id=eq.{c['id']}", upd)
         time.sleep(DELAY)
 
-    if run_id:
+    write_shard_stats(stats, newly_opened_list, overage_list)
+    if run_id and not SHARDED:
         sb_patch(f"decree_check_runs?id=eq.{run_id}", {
             "finished_at": now_iso(), "decrees_open": stats["open"],
             "decrees_closed": stats["closed"], "newly_opened": stats["newly_opened"],
