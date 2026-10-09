@@ -353,27 +353,45 @@ def pdf_text_digits(data: bytes) -> str:
 
 
 _FONT_READY = False
+_HAVE_TNR = False          # real Times New Roman installed from the bucket?
 
 
 def _install_invoice_font() -> None:
-    """Same font setup as the MDT form (decree_common._install_mdt_form_font): download the
-    Tahoma files from the private 'decree-assets/fonts' bucket and register them with
-    fontconfig. Without it Chromium falls back to a wider font and the invoice wraps."""
-    global _FONT_READY
+    """Fonts for the invoice print. The SMC invoice page is set in Times New Roman (the original
+    PDF embeds TimesNewRomanRegular/Bold), NOT Tahoma. On the runner 'Times New Roman' becomes
+    Liberation Serif for Latin, but Liberation has no Arabic, so Arabic falls back to the much wider
+    DejaVu Sans -> longer lines, wrapped cells, a different layout.
+    Best fix: the real files in the private bucket  decree-assets/fonts/times.ttf  and
+    fonts/timesbd.ttf  (copy them from C:\\Windows\\Fonts). Optional: without them we fall back to
+    an Arabic-capable family (Amiri) appended to the page's own font list."""
+    global _FONT_READY, _HAVE_TNR
     if _FONT_READY:
         return
     _FONT_READY = True
     try:
         import subprocess, supabase_storage
         font_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "fonts")
-        paths = supabase_storage.fetch_mdt_form_font(font_dir)
-        if paths:
-            subprocess.run(["fc-cache", "-f", font_dir], check=False, capture_output=True)
-            log.info(f"Installed invoice font(s): {list(paths.values())}")
-        else:
-            log.warning("No MDT-form font available - invoice will render with a fallback font")
+        os.makedirs(font_dir, exist_ok=True)
+        got = []
+        for obj in ("fonts/times.ttf", "fonts/timesbd.ttf", "fonts/timesi.ttf", "fonts/timesbi.ttf"):
+            try:
+                if supabase_storage.download(supabase_storage.ASSETS_BUCKET, obj,
+                                             os.path.join(font_dir, os.path.basename(obj))):
+                    got.append(obj)
+            except Exception:
+                pass
+        _HAVE_TNR = "fonts/times.ttf" in got
+        try:
+            supabase_storage.fetch_mdt_form_font(font_dir)       # Tahoma (MDT form) - harmless extra
+        except Exception:
+            pass
+        subprocess.run(["fc-cache", "-f", font_dir], check=False, capture_output=True)
+        log.info(f"invoice fonts: real Times New Roman installed={_HAVE_TNR} ({got})")
+        if not _HAVE_TNR:
+            log.warning("fonts/times.ttf is NOT in decree-assets - Arabic text will use a fallback font "
+                        "(upload Windows' times.ttf + timesbd.ttf there for an exact match)")
     except Exception as exc:
-        log.warning(f"Font install failed ({exc}) - continuing with fallback font")
+        log.warning(f"Font install failed ({exc}) - continuing with fallback fonts")
 
 
 _WIDEN_JS = (
@@ -389,56 +407,94 @@ _WIDEN_JS = (
     "const nw = bump(el.style.width); if (nw) { el.style.width = nw; count++; } }); "
     "return count; }"
 )
-_DIMS_JS = (
-    "() => ({ w: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), "
-    "h: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0) })"
+# Real extent of the VISIBLE content (union of element boxes). scrollWidth/scrollHeight are useless
+# here: they never go below the browser window, which is how the PDF ended up 924pt wide with the
+# invoice floating in the middle and spilling onto a 2nd page.
+_BBOX_JS = (
+    "() => { let r = 0, b = 0, l = 1e9; "
+    "document.querySelectorAll('body *').forEach(el => { "
+    "const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden') return; "
+    "const q = el.getBoundingClientRect(); if (q.width < 1 || q.height < 1) return; "
+    "r = Math.max(r, q.right + window.scrollX); b = Math.max(b, q.bottom + window.scrollY); "
+    "l = Math.min(l, q.left + window.scrollX); }); "
+    "return { r: r, b: b, l: l === 1e9 ? 0 : l }; }"
+)
+_LOGIN_MARKERS = ("اسم المستخدم", "كلمة السر")
+_FONT_PROBE_JS = (
+    "() => { const f = (e) => e ? getComputedStyle(e).fontFamily : ''; "
+    "return { body: f(document.body), td: f(document.querySelector('td')) }; }"
 )
 
 
-def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
-    """Print the (unsigned) Details page with Chromium using the SAME method that finally made
-    the MDT form match the manual print (Unified pipeline render_print_page_to_pdf):
-      1. real Tahoma installed via fontconfig (no forced @font-face),
-      2. emulate print media FIRST (the site's own print stylesheet),
-      3. widen hard-coded 300-900px widths (+INVOICE_WIDEN_PX, default 55),
-      4. measure scrollWidth/scrollHeight in print mode,
-      5. size the PDF canvas to that content (5mm margins, backgrounds on)."""
+class SessionExpired(Exception):
+    pass
+
+
+def _cookies_for_browser(smc: SMCSession) -> list:
     from urllib.parse import urlparse
-    from playwright.sync_api import sync_playwright
-    _install_invoice_font()
-    extra = int(os.environ.get("INVOICE_WIDEN_PX", "55"))
     host = urlparse(BASE_URL).hostname
-    cookies = [{"name": c.name, "value": c.value, "domain": host, "path": "/"} for c in smc.s.cookies]
+    out = []
+    for c in smc.s.cookies:
+        dom = (c.domain or host).lstrip(".") or host
+        out.append({"name": c.name, "value": c.value, "domain": dom, "path": c.path or "/",
+                    "secure": bool(getattr(c, "secure", False))})
+    return out
+
+
+def _render_once(smc: SMCSession, receipt: str, extra: int) -> bytes:
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         br = pw.chromium.launch()
         try:
-            ctx = br.new_context()
-            ctx.add_cookies(cookies)
+            # small window so layout is driven by the content, not by a 1280px browser window
+            ctx = br.new_context(viewport={"width": 700, "height": 800})
+            ctx.add_cookies(_cookies_for_browser(smc))
             page = ctx.new_page()
             page.goto(DETAILS_URL.format(rid=receipt), wait_until="load", timeout=60_000)
-            page.emulate_media(media="print")
-            page.add_style_tag(content="body{background:#fff !important}")
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            html = page.content()
+            # a logged-out page must NEVER be printed as if it were the invoice
+            if all(m in html for m in _LOGIN_MARKERS) or "OTP-Auth" in html:
+                raise SessionExpired(f"browser landed on the SMC login page for receipt {receipt}")
+            if receipt not in ar2en(re.sub(r"\s+", " ", BeautifulSoup(html, "html.parser").get_text(" "))):
+                raise SessionExpired(f"receipt {receipt} not found on the rendered page (not the invoice)")
+
+            page.emulate_media(media="print")                      # the site's own print stylesheet FIRST
+            page.add_style_tag(content="html,body{background:#fff !important;margin:0}")
+            if not _HAVE_TNR:
+                # no real Times New Roman: keep the page's own font, just append an Arabic-capable
+                # family so Arabic text does not fall back to the wide DejaVu Sans
+                page.add_style_tag(content="html,body,table,td,th,div,span,p,b,strong,label"
+                                           "{font-family:'Times New Roman','Liberation Serif','Amiri','Noto Naskh Arabic',serif !important}")
             if extra:
                 try:
-                    n = page.evaluate(_WIDEN_JS, extra)
-                    log.info(f"invoice {receipt}: widened {n} px-width rule(s) by {extra}px")
+                    log.info(f"invoice {receipt}: widened {page.evaluate(_WIDEN_JS, extra)} px-width rule(s) by {extra}px")
                 except Exception as exc:
                     log.warning(f"width widening failed ({exc})")
             try:
-                d = page.evaluate(_DIMS_JS)
-                w, h = d.get("w"), d.get("h")
+                log.info(f"invoice {receipt}: fonts requested by page {page.evaluate(_FONT_PROBE_JS)}")
             except Exception:
-                w = h = None
-            log.info(f"invoice {receipt}: print-mode content {w}x{h}px")
-            kw = dict(margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"},
-                      print_background=True)
-            if w and h:
-                kw["width"] = f"{(w + 40) / 96:.2f}in"
-                kw["height"] = f"{(h + 60) / 96:.2f}in"
-            else:
-                kw["format"] = "A4"
-            pdf = page.pdf(**kw)
+                pass
+
+            bb = page.evaluate(_BBOX_JS)
+            w = int(bb["r"] + max(bb["l"], 10)) + 4            # mirror the left gap on the right
+            w = max(w, 500)
+            page.set_viewport_size({"width": w, "height": 800})   # re-flow at exactly that width
+            bb = page.evaluate(_BBOX_JS)
+            h = int(bb["b"]) + 20
+            log.info(f"invoice {receipt}: content box {w}x{h}px")
+
             dbg = os.environ.get("TOPUP_DEBUG_DIR")
+            pdf = b""
+            for slack in (30, 90, 200, 400):          # one single tall page; grow until it really is 1 page
+                pdf = page.pdf(width=f"{w / 96:.3f}in", height=f"{(h + slack) / 96:.3f}in",
+                               margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
+                               print_background=True)
+                if len(re.findall(rb"/Type\s*/Page[^s]", pdf)) <= 1:
+                    break
             if dbg:
                 os.makedirs(dbg, exist_ok=True)
                 with open(os.path.join(dbg, f"invoice_{receipt}_00_raw_render.pdf"), "wb") as f:
@@ -446,6 +502,27 @@ def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
             return pdf
         finally:
             br.close()
+
+
+def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
+    """Print the CURRENT (unsigned) Details page with Chromium, using the MDT-form method
+    (print media first, widen hard-coded px widths, size the canvas to the real content) plus:
+      * login-page guard: if the browser lands on the SMC login screen -> re-login and retry,
+        never print it as an invoice;
+      * content-box sizing (see _BBOX_JS) so the PDF is exactly one invoice page."""
+    _install_invoice_font()
+    extra = int(os.environ.get("INVOICE_WIDEN_PX", "55"))
+    last = None
+    for attempt in (1, 2, 3):
+        try:
+            return _render_once(smc, receipt, extra)
+        except SessionExpired as e:
+            last = e
+            log.warning(f"{e} - re-login and retry ({attempt}/3)")
+            time.sleep(3)
+            if not smc.login():
+                log.warning("SMC re-login failed")
+    raise RuntimeError(f"could not render receipt {receipt}: {last}")
 
 
 # --------------------------------------------------------------------------- one invoice
