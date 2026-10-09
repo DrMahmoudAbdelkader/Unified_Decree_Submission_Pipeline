@@ -67,15 +67,15 @@ on:
       max_single_lookups:
         description: "Max targeted lookups for requests older than the bulk window (default 300). Raise for the first big backlog run, e.g. 1000."
         required: false
-        default: "300"
+        default: "1000"
       lookback_days:
         description: "Bulk-window size in days (default 15)"
         required: false
-        default: "15"
+        default: "30"
       max_decree_lookups:
         description: "Max approved requests to pull a decree number for (default 400). Raise for the one-time backfill, e.g. 3000."
         required: false
-        default: "400"
+        default: "3000"
 
 jobs:
   sync:
