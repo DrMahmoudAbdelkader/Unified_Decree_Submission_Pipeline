@@ -30,6 +30,10 @@ on:
         description: "Optional: only these decree_topup_candidates ids (comma separated). Empty = the whole queue. Set by the page's buttons."
         required: false
         default: ""
+      mode:
+        description: "Optional with candidate_ids: refetch = delete the stored invoices of those entries and rebuild them; clear = delete them only. Empty = normal run."
+        required: false
+        default: ""
 
 jobs:
   fetch:
@@ -50,6 +54,7 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
+      EVIDENCE_MODE: ${{ github.event.inputs.mode }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
