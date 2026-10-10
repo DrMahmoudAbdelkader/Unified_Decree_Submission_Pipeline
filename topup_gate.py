@@ -41,6 +41,9 @@ SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 # Placeholder wording for the report sentence. If your previous topup_gate.py used a different
 # sentence, copy it here — nothing else depends on it.
 CYCLES_TEMPLATE = "المستلم من القرار السابق: {received} ({unit})، والمتبقي المطلوب: {remaining} ({unit})."
+# Used when the automatic dose count knows how many doses the previous decrees authorised in total.
+CYCLES_TEMPLATE_TOTALS = ("إجمالي الجرعات المعتمدة بالقرارات السابقة: {supposed} ({unit})، المستلم منها: {received}، "
+                          "والمتبقي: {remaining}.")
 
 KIND_LABEL = {"TOPUP": "تجديد في نهاية المدة", "PREV_INCLUSIVE": "القرار السابق شامل", "PREV_REPORT": "طلب تقرير القرار السابق",
               "ID_CARD": "بطاقة الرقم القومي"}
@@ -112,11 +115,33 @@ def not_ready_message(g: dict) -> str:
     return head + " و".join(missing or ["بيانات غير مكتملة"]) + ". أكملها من صفحة «متابعة الخطابات الإداريه»."
 
 
+# --------------------------------------------------------------------------- automatic dose count
+def _dose_hold(case_id: int, g: dict) -> Optional[str]:
+    """Review hold of the automatic dose count (topup_dose_calc.py), or None. First recounts with the CURRENT unbilled
+    orders so a dispensing saved after the evidence run is included. Never raises: any problem = no hold."""
+    try:
+        if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE or not g.get("candidate_id"):
+            return None
+        import topup_dose_calc as dc
+        if not dc.enabled():
+            return None
+        cid = int(g["candidate_id"])
+        if dc.refresh_unbilled(cid):
+            g = _gate(case_id)                              # the numbers written to the entry changed
+        return dc.hold_message(cid, g.get("cycles_received"), g.get("cycles_remaining"))
+    except Exception as exc:
+        log.warning(f"dose-count hold skipped for case {case_id}: {type(exc).__name__}: {exc}")
+        return None
+
+
 # --------------------------------------------------------------------------- entry points
 def assert_ready(case_id: int) -> None:
     g = _gate(case_id)
     if g.get("is_topup") and not g.get("ready"):
         raise TopupNotReady(not_ready_message(g))
+    hold = _dose_hold(case_id, g)
+    if hold:
+        raise TopupNotReady(hold)
 
 
 def cycles_statement(case_id: int) -> Optional[str]:
@@ -125,8 +150,17 @@ def cycles_statement(case_id: int) -> Optional[str]:
         return None
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
-    return CYCLES_TEMPLATE.format(received=g["cycles_received"], remaining=g["cycles_remaining"],
-                                  unit=_unit_word(g.get("protocol_key")))
+    unit = _unit_word(g.get("protocol_key"))
+    try:
+        import topup_dose_calc as dc
+        sup = dc.supposed_for(int(g["candidate_id"]), g["cycles_received"], g["cycles_remaining"]) if dc.enabled() else None
+    except Exception as exc:
+        log.warning(f"dose totals unavailable for case {case_id}: {exc}")
+        sup = None
+    if sup is not None:
+        return CYCLES_TEMPLATE_TOTALS.format(supposed=f"{sup:g}", received=g["cycles_received"],
+                                             remaining=g["cycles_remaining"], unit=unit)
+    return CYCLES_TEMPLATE.format(received=g["cycles_received"], remaining=g["cycles_remaining"], unit=unit)
 
 
 def with_invoices(case_id: int, patient_pdf_path: str) -> str:
@@ -192,8 +226,12 @@ def split_ready(cases: List[dict]) -> Tuple[List[dict], List[dict]]:
     ready, blocked = [], []
     for c in cases:
         g = _gate(c["id"])
+        msg = None
         if g.get("is_topup") and not g.get("ready"):
             msg = not_ready_message(g)
+        elif g.get("is_topup"):
+            msg = _dose_hold(c["id"], g)
+        if msg:
             blocked.append({"case_id": c["id"], "message": msg, "kind": g.get("kind")})
             try:
                 import decree_common as common
