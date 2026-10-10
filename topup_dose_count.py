@@ -11,7 +11,7 @@ topup_dose_count.py (v3) - pure functions (no DB, no network) that count the DOS
  * Chain: received = all doses under ALL decrees of the regimen, supposed = sum of the doses those decrees authorised,
          remaining = max(supposed - received, 0).
  * Quantity never creates a dose; qty / qty_per_dose is only a cross-check (INFO flag).
- BLOCKING flags (request held until a person reviews): received > authorised, a decree whose plan is not in the map,
+ BLOCKING flags (request held until a person reviews): an unbilled dispensing on the same date as an invoiced dose, received > authorised, a decree whose plan is not in the map,
  no dose found at all. INFO flags are only displayed.
 """
 from __future__ import annotations
@@ -190,11 +190,17 @@ def compute_chain(decrees: List[dict], idx: Dict[str, dict], matcher: Matcher) -
             info.append(f"القرار {d['decree_number']}: لا توجد فواتير على SMC")
         for o in sorted(d.get("pending") or [], key=lambda x: (x["date"] is None, x["date"] or dt.date.min)):
             row["unbilled"].append(dict(date=o["date"], value=o.get("value")))
-            if o["date"] and o["date"] in seen:
-                info.append(f"صرف غير مفوتر بتاريخ {o['date']:%d/%m/%Y} يطابق تاريخ جرعة مفوترة")
         row["doses"] = len(mine) + len(row["unbilled"])
         received += row["doses"]
         per.append(row)
+    # An unbilled dispensing dated the SAME day as a dose that is already on an invoice (of any decree in the chain) is most
+    # likely the same dose entered twice -> BLOCKING: the request is held until a person reviews it. It is still counted.
+    invoiced_days = set(seen)
+    for row in per:
+        for u in row["unbilled"]:
+            if u["date"] and u["date"] in invoiced_days:
+                blocking.append(f"القرار {row['decree_number']}: صرف غير مفوتر بتاريخ {u['date']:%d/%m/%Y} يطابق جرعة موجودة في فاتورة بنفس التاريخ "
+                                f"(احتمال تكرار نفس الجرعة) — راجع قبل الإرسال")
     if counting and received == 0 and supposed_known:
         blocking.append("لم يُحتسب أي جرعة: لا يوجد دواء أساسي في الفواتير ولا صرف غير مفوتر — راجع الأسماء/الفواتير")
     if supposed_known and received > supposed:

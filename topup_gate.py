@@ -9,7 +9,7 @@ calls — decree_common.run_finalize_stages() and decree_submission_prepare.py n
 
     assert_ready(case_id)                 raise (-> FAILED + operator requirement) when not ready
     with_invoices(case_id, patient_pdf)   path of the PDF to merge after the MDT + report
-    cycles_statement(case_id)             Arabic sentence for the medical report (TOPUP only)
+    cycles_statement(case_id)             English, dated dose sentence for the medical report (TOPUP only)
     split_ready(cases)                    (ready_cases, blocked) for prepare's bulk run
 
 What each kind needs before its retry request may be sent (answer of the DB function
@@ -144,23 +144,37 @@ def assert_ready(case_id: int) -> None:
         raise TopupNotReady(hold)
 
 
+_UNIT_EN = {"جرعه": "dose", "جرعة": "dose", "دورة": "cycle", "دوره": "cycle"}
+
+
+def _plural(n, word: str) -> str:
+    return f"{word}" if float(n) == 1 else f"{word}s"
+
+
 def cycles_statement(case_id: int) -> Optional[str]:
+    """English sentence for the medical report:
+         Patient had received X doses on the following dates: a, b, c. Y doses are yet to be received by the patient.
+    X / Y are the numbers on the entry (typed or calculated); the dates are the counted dose dates (invoices + unbilled
+    orders) and are listed only when they agree with X, so the sentence never contradicts itself."""
     g = _gate(case_id)
     if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE:
         return None
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
-    unit = _unit_word(g.get("protocol_key"))
+    rec, rem = int(g["cycles_received"]), int(g["cycles_remaining"])
+    word = _UNIT_EN.get(_unit_word(g.get("protocol_key")), "dose")
+    dates = []
     try:
         import topup_dose_calc as dc
-        sup = dc.supposed_for(int(g["candidate_id"]), g["cycles_received"], g["cycles_remaining"]) if dc.enabled() else None
+        if dc.enabled():
+            dates = dc.dose_dates(int(g["candidate_id"]))
     except Exception as exc:
-        log.warning(f"dose totals unavailable for case {case_id}: {exc}")
-        sup = None
-    if sup is not None:
-        return CYCLES_TEMPLATE_TOTALS.format(supposed=f"{sup:g}", received=g["cycles_received"],
-                                             remaining=g["cycles_remaining"], unit=unit)
-    return CYCLES_TEMPLATE.format(received=g["cycles_received"], remaining=g["cycles_remaining"], unit=unit)
+        log.warning(f"dose dates unavailable for case {case_id}: {exc}")
+    if dates and len(dates) == rec:
+        first = f"Patient had received {rec} {_plural(rec, word)} on the following {'date' if rec == 1 else 'dates'}: " + ", ".join(d.strftime("%d/%m/%Y") for d in dates) + "."
+    else:
+        first = f"Patient had received {rec} {_plural(rec, word)}."
+    return f"{first} {rem} {_plural(rem, word)} {'is' if rem == 1 else 'are'} yet to be received by the patient."
 
 
 def with_invoices(case_id: int, patient_pdf_path: str) -> str:

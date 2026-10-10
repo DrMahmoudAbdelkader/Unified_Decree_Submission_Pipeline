@@ -228,6 +228,33 @@ def _calc_row(cid: int) -> Optional[dict]:
         return None
 
 
+def dose_dates(cid: int, decrees: Optional[List[str]] = None) -> List[date]:
+    """Every counted dose date (invoice doses + unbilled orders) of the stored chain, oldest first, one entry per date.
+    decrees = restrict to these decree numbers (None = the whole chain)."""
+    try:
+        r = sb.select(CALC, select="chain", filters={"candidate_id": f"eq.{cid}"}, limit=1)
+        out = set()
+        for d in ((r[0].get("chain") if r else None) or []):
+            if decrees is not None and str(d.get("decree_number")) not in {str(x) for x in decrees}:
+                continue
+            for x in d.get("invoice_dates") or []:
+                if _to_date(x):
+                    out.add(_to_date(x))
+            for u in d.get("unbilled") or []:
+                if _to_date(u.get("date")):
+                    out.add(_to_date(u.get("date")))
+        return sorted(out)
+    except Exception as e:
+        log.warning(f"[dose-calc] dose dates unavailable for candidate {cid}: {type(e).__name__}: {str(e)[:120]}")
+        return []
+
+
+def dose_span(cid: int, decrees: Optional[List[str]] = None) -> Optional[Tuple[date, date]]:
+    """(first dose date, last dose date) of the given decrees, or None when nothing is stored."""
+    ds = dose_dates(cid, decrees)
+    return (ds[0], ds[-1]) if ds else None
+
+
 def hold_message(cid: int, cur_received, cur_remaining) -> Optional[str]:
     """Blocking flags that nobody has reviewed. Editing the numbers or pressing «راجعت العدد» on the page releases it."""
     dc = _calc_row(cid)

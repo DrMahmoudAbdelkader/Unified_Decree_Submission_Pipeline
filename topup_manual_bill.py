@@ -140,8 +140,15 @@ def collect(candidate_id: int) -> Optional[dict]:
     pat = _get("patients", {"select": "*", "id": f"eq.{cand[0]['patient_id']}", "limit": 1})
     p = pat[0] if pat else {}
     name = p.get("name") or p.get("full_name") or p.get("patient_name") or ""
+    period = None
+    try:                         # first dose date .. last dose date of THIS decree's dispensings (invoiced + unbilled)
+        import topup_dose_calc as dc
+        span = dc.dose_span(candidate_id, decrees) if dc.enabled() else None
+        period = (span[0].isoformat(), span[1].isoformat()) if span else None
+    except Exception as e:
+        log.warning(f"dose span unavailable ({e}) - period taken from the table rows")
     return {"patient_name": name, "national_id": str(p.get("national_id") or ""),
-            "invoices": lines, "unbilled": unbilled}
+            "invoices": lines, "unbilled": unbilled, "period": period}
 
 
 def _table_rows(bill: dict) -> List[dict]:
@@ -161,6 +168,8 @@ def render_html(bill: dict) -> str:
     rows = _table_rows(bill)
     grand = sum(r["value"] or 0 for r in rows)
     dates = sorted((r["date"] for r in rows if r["date"] and _date_key(r["date"]) != date.min), key=_date_key)
+    if bill.get("period"):                                  # first .. last dose date of the decree (not the invoice registration days)
+        dates = [bill["period"][0], bill["period"][1]]
     period = (f"<div class='row'><b>عن الفترة من</b> &nbsp;<bdi dir='ltr'>{e(dates[0])}</bdi>"
               f" &nbsp; <b>إلى</b> &nbsp;<bdi dir='ltr'>{e(dates[-1])}</bdi></div>" if dates else "")
     body = ""
