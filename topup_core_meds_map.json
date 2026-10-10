@@ -1,0 +1,3211 @@
+{
+ "labels": {
+  "hormonal": "علاج هرموني",
+  "hormonal_zoladex": "علاج هرموني + زولاديكس",
+  "zoladex": "زولاديكس",
+  "tamoxifen": "تاموكسيفين (خط أول)",
+  "tamoxifen_zoladex": "تاموكسيفين + زولاديكس",
+  "aromasin": "أروماسين (خط ثالث)",
+  "fulvestrant": "فلفسترانت (± CDK4/6)",
+  "anthracyclines": "أنثراسيكلين",
+  "taxanes": "تاكسانات",
+  "cdk46": "مثبطات CDK4/6 فقط"
+ },
+ "keys": {
+  "paclitaxel": {
+   "unified": [
+    "PACLITAXEL 300MG"
+   ],
+   "names": [
+    "Paclitaxel 100 mg",
+    "Paclitaxel 100mg/16.5ml",
+    "Paclitaxel 150 mg / 25 ml",
+    "Paclitaxel 30 mg",
+    "Paclitaxel 300 mg",
+    "Unitaxel",
+    "Unitaxel 100 mg"
+   ],
+   "regex": "pacl?itaxel|taxol\\b|unitaxel|باكليتاكسل|تاكسول|paclitaxel|unitaxel"
+  },
+  "zoledronic_acid": {
+   "unified": [
+    "ZOLEDRONIC ACID 4MG/5ML"
+   ],
+   "names": [
+    "Metadronic",
+    "Zoledronic Acid 4 mg"
+   ],
+   "regex": "metadronic|zoledronic\\s+acid"
+  },
+  "cyclosporin": {
+   "unified": [
+    "Cyclosporin 50MG"
+   ],
+   "names": [
+    "Cyclosporin Preformed Microemulsion 50 mg For Autoimmune"
+   ],
+   "regex": "cyclosporin\\s+preformed\\s+microemulsion"
+  },
+  "lorlatinib": {
+   "unified": [
+    "Loratinib 100MG"
+   ],
+   "names": [
+    "loratinib"
+   ],
+   "regex": "loratinib"
+  },
+  "acalabrutinib": {
+   "unified": [
+    "Acalabrutinib 100MG"
+   ],
+   "names": [
+    "Acalabrutinib 100 MG"
+   ],
+   "regex": "acalabrutinib"
+  },
+  "ibrutinib": {
+   "unified": [
+    "Ibrutinib 140mg"
+   ],
+   "names": [
+    "Ibrutinib 140mg"
+   ],
+   "regex": "ibrutinib"
+  },
+  "bortezomib": {
+   "unified": [
+    "BORTEZOMIB 3.5MG"
+   ],
+   "names": [
+    "BORTEZOMIB 3.5MG"
+   ],
+   "regex": "bortezomib"
+  },
+  "lenalidomide": {
+   "unified": [
+    "LENALIDOMIDE 25MG"
+   ],
+   "names": [
+    "lenalidomide 5 mg"
+   ],
+   "regex": "lenalidomide"
+  },
+  "abiraterone_acetate": {
+   "unified": [
+    "ABIRATERONE ACETATE 500MG"
+   ],
+   "names": [
+    "ABIRATERONE ACETATE 500"
+   ],
+   "regex": "abiraterone\\s+acetate"
+  },
+  "azacitidine": {
+   "unified": [
+    "AZACITIDINE 100MG"
+   ],
+   "names": [
+    "Azacitidine 100mg"
+   ],
+   "regex": "azacitidine"
+  },
+  "bevacizumab": {
+   "unified": [
+    "BEVACIZUMAB 100MG/4ML"
+   ],
+   "names": [
+    "bevacizumab",
+    "bevacizumab 100 mg"
+   ],
+   "regex": "bevacizumab"
+  },
+  "capecitabine": {
+   "unified": [
+    "CAPECITABINE 500MG"
+   ],
+   "names": [
+    "CAPECITABINE-ACCORD 500MG tab",
+    "Capecitabine 500 mg",
+    "Capecitabine 500mg"
+   ],
+   "regex": "capecitabine\\-accord|capecitabine"
+  },
+  "olaparib": {
+   "unified": [
+    "Olaparib 150MG"
+   ],
+   "names": [
+    "lyparanez 150 mg"
+   ],
+   "regex": "lyparanez"
+  },
+  "pazopanib": {
+   "unified": [
+    "PAZOPANIB 400MG"
+   ],
+   "names": [
+    "PAZOPANIB 400MG"
+   ],
+   "regex": "pazopanib"
+  },
+  "rituximab": {
+   "unified": [
+    "RITUXIMAB 100MG",
+    "RITUXIMAB 500MG"
+   ],
+   "names": [
+    "Rituximab 100 mg",
+    "Rituximab 500 mg"
+   ],
+   "regex": "rituximab"
+  },
+  "doxorubicin": {
+   "unified": [
+    "DOXORUBICIN 50MG"
+   ],
+   "names": [
+    "Doxorubicin 10 mg",
+    "Doxorubicin 10mg/5ml",
+    "Doxorubicin 50 mg",
+    "Doxorubicin 50mg/25ml"
+   ],
+   "regex": "doxo?r?ubicin|doxirubicin|adriamycin|adrimycin|ادريامايسين|ادرياميسين|دوكسوروبيسين|doxorubicin"
+  },
+  "cisplatin": {
+   "unified": [
+    "CISPLATIN VIAL"
+   ],
+   "names": [
+    "Cisplatin 10mg",
+    "Cisplatin 50 mg",
+    "Cisplatin 50mg"
+   ],
+   "regex": "cisplatin"
+  },
+  "pemetrexed": {
+   "unified": [
+    "PEMETREXED 500MG"
+   ],
+   "names": [
+    "Pemetrexed 500 mg",
+    "alimta 500mg",
+    "pemetrexed"
+   ],
+   "regex": "pemetrexade?|alimta|pemetrexed|alimta"
+  },
+  "vinblastine": {
+   "unified": [
+    "VINBLASTINE 10MG"
+   ],
+   "names": [
+    "VINBLASTINE 10MG/10ML",
+    "Vinblastine 10 mg / 10 ml",
+    "Vinblastine 1mg/1ml"
+   ],
+   "regex": "vinblastine"
+  },
+  "ado_trastuzumab": {
+   "unified": [
+    "ADO-TRASTUZUMAB EMTANSINE 100MG"
+   ],
+   "names": [
+    "Ado - Trastuzumab"
+   ],
+   "regex": "ado\\s+\\-\\s+trastuzumab"
+  },
+  "bicalutamide": {
+   "unified": [
+    "Bicalutamide 50MG"
+   ],
+   "names": [
+    "Bicalutamide 50mg"
+   ],
+   "regex": "bicalutamide"
+  },
+  "goserelin": {
+   "unified": [
+    "GOSERELIN ACETATE 10.8MG"
+   ],
+   "names": [
+    "Gonadorelin analogues (LHRH)",
+    "Goserelin 10.8 mg",
+    "Goserolin Acetate 10.8 mg",
+    "Zoladex 10.8 mg",
+    "Zoladex Depot 3.6"
+   ],
+   "regex": "goser\\w*|zoladex|gonadorelin|lhrh|زولاديكس|جوسيريلين|gonadorelin\\s+analogues|goserelin|goserolin\\s+acetate|zoladex|zoladex\\s+depot"
+  },
+  "everolimus": {
+   "unified": [
+    "Everolimus 5mg"
+   ],
+   "names": [
+    "Everolimus 10 mg",
+    "Everolimus 5 mg"
+   ],
+   "regex": "everloimus|everolimus|afinitor|everolimus"
+  },
+  "imatinib": {
+   "unified": [
+    "IMATINIB 400MG"
+   ],
+   "names": [
+    "Imatinib100mg",
+    "imatinib 400 mg"
+   ],
+   "regex": "imatinib"
+  },
+  "dasatinib": {
+   "unified": [
+    "Dasatinib 50mg"
+   ],
+   "names": [
+    "Sprycel 50mg"
+   ],
+   "regex": "sprycel"
+  },
+  "sunitinib": {
+   "unified": [
+    "Sunitinib 12.5MG"
+   ],
+   "names": [
+    "Sunitinib 12.5mg"
+   ],
+   "regex": "sunitinib"
+  },
+  "lapatinib": {
+   "unified": [
+    "LAPATINIB TABLETS"
+   ],
+   "names": [
+    "Lapatinib 250 mg",
+    "Tykerb 250 mg"
+   ],
+   "regex": "lapatinib|tykerb"
+  },
+  "hydroxyurea": {
+   "unified": [
+    "Hydroxyurea 500mg"
+   ],
+   "names": [
+    "Hydroxyurea 500mg"
+   ],
+   "regex": "hydroxyurea"
+  },
+  "panitumumab": {
+   "unified": [
+    "Vectibex 100mg",
+    "Vectibix 400mg"
+   ],
+   "names": [
+    "Panitumumab 100mg",
+    "Panitumumab 400mg"
+   ],
+   "regex": "panitumumab"
+  },
+  "nilotinib": {
+   "unified": [
+    "NILOTINIB 200MG"
+   ],
+   "names": [
+    "Nilotinib 150 mg",
+    "Nilotinib 200 mg"
+   ],
+   "regex": "nilotinib"
+  },
+  "carboplatin": {
+   "unified": [
+    "CARBOPLATIN 450MG/45ML"
+   ],
+   "names": [
+    "Carboplatin 150 mg / 15 ml",
+    "Carboplatin 450 mg / 45 ml",
+    "Carboplatin 450mg/45ml",
+    "Carbotinol 150 mg / 15 ml",
+    "Carbotinol 450mg/45ml"
+   ],
+   "regex": "carboplatin|carbotinol|paraplatin|كاربوبلاتين|carboplatin|carbotinol"
+  },
+  "dacarbazine": {
+   "unified": [
+    "DACARBAZINE 200MG"
+   ],
+   "names": [
+    "Dacarbazine 200 mg",
+    "dacarbazine",
+    "dacarbazine medac 200mg"
+   ],
+   "regex": "dacarbazine|dacarbazine\\s+medac"
+  },
+  "vinorelbine": {
+   "unified": [
+    "Vinorelbine 20mg",
+    "Vinorelbine 30mg"
+   ],
+   "names": [
+    "Navelbine 20mg Cap",
+    "Vinorelbine 10 mg",
+    "Vinorelbine 10mg/1ml",
+    "Vinorelbine 20 mg",
+    "Vinorelbine 30 mg",
+    "Vinorelbine 50 mg"
+   ],
+   "regex": "navelbine|vinorelbine"
+  },
+  "pembrolizumab": {
+   "unified": [
+    "PEMBROLIZUMAB 100MG"
+   ],
+   "names": [
+    "pembrolizumab"
+   ],
+   "regex": "pembrolizumab"
+  },
+  "trastuzumab": {
+   "unified": [
+    "TRASTUZUMAB 440MG",
+    "TRASTUZUMAB 600MG"
+   ],
+   "names": [
+    "HERCEPTIN 440MG VIAL",
+    "Herceptin600-Perjeta420",
+    "Trastuzumab 440mg",
+    "Trastuzumab 600 mg"
+   ],
+   "regex": "herceptin|trastuzumab"
+  },
+  "pertuzumab_trastuzumab": {
+   "unified": [
+    "PERTUZUMAB 1200MG + TRASTUZUMAB 600MG",
+    "PERTUZUMAB 600MG + TRASTUZUMAB 600MG"
+   ],
+   "names": [
+    "Trastuzumab 600- Pertzumab",
+    "pertuzumab/trastuzumab 1200ةل"
+   ],
+   "regex": "trastuzumab|pertuzumab/trastuzumab"
+  },
+  "alfacalcidol": {
+   "unified": [
+    "ALFACALCIDOL 1MCG"
+   ],
+   "names": [
+    "ALFACALCIDIOL",
+    "AlfaCalcidol 0.5 mcg",
+    "AlfaCalcidol 1 mcg",
+    "Alfacalcidol 0.25mcg",
+    "Alfacalcidol 1mcg",
+    "Alfacalcidol 2 mcg/ml"
+   ],
+   "regex": "alfacalcidiol|alfacalcidol"
+  },
+  "fluorouracil": {
+   "unified": [
+    "FLUOROURACIL 500MG/10 ML"
+   ],
+   "names": [
+    "Flurouracil 250 mg"
+   ],
+   "regex": "flurouracil"
+  },
+  "oxaliplatin": {
+   "unified": [
+    "OXALIPLATIN VIAL"
+   ],
+   "names": [
+    "OXALIPLATIN 100MG",
+    "Oxaliplatin 100 mg",
+    "Oxaliplatin 50 mg",
+    "Oxaliplatin 50mg"
+   ],
+   "regex": "oxaliplatin"
+  },
+  "erlotinib": {
+   "unified": [
+    "Erlotinib 14MG"
+   ],
+   "names": [
+    "irlubtunub 150mg"
+   ],
+   "regex": "irlubtunub"
+  },
+  "letrozole": {
+   "unified": [
+    "LETROZOLE 2.5 MG"
+   ],
+   "names": [
+    "Aromatase enzyme inhibitor",
+    "Letrozole",
+    "Letrozole 2.5 mg"
+   ],
+   "regex": "letrozole|femara|aromatase\\s+enzyme\\s+inhibitor|فيمارا|ليتروزول|aromatase\\s+enzyme\\s+inhibitor|letrozole"
+  },
+  "bleomycin": {
+   "unified": [
+    "BLEOMYCIN 15 IU"
+   ],
+   "names": [
+    "BLEOCIP 15 IU VIAL",
+    "Bleomycin 15 I.U.",
+    "Bleomycin 15mg"
+   ],
+   "regex": "bleocip|bleomycin"
+  },
+  "vincristine": {
+   "unified": [
+    "VINCRISTINE 1MG"
+   ],
+   "names": [
+    "Vinarcin 1mg/1ml",
+    "Vincristine 1 mg / 1 ml",
+    "vincristin  sulphate 2 mg/2ml"
+   ],
+   "regex": "vinarcin|vincristine|vincristin\\s+sulphate"
+  },
+  "gemcitabine": {
+   "unified": [
+    "GEMCITABINE VIAL"
+   ],
+   "names": [
+    "Gemcitabine 1000 mg",
+    "Gemcitabine HCL 1g",
+    "Gemzar 1gm",
+    "gemcitabine 2 gm"
+   ],
+   "regex": "gemicitabine|gemcitabine|gemzar|gemcitabine|gemcitabine\\s+hcl|gemzar"
+  },
+  "ifosfamide": {
+   "unified": [
+    "IFOSFAMIDE 1G",
+    "IFOSFAMIDE 2G"
+   ],
+   "names": [
+    "Ifosfamide 1 gm",
+    "Ifosfamide 2 gm",
+    "ifosfamide 1mg"
+   ],
+   "regex": "ifosfamide"
+  },
+  "mesna": {
+   "unified": [
+    "MESNA 400MG"
+   ],
+   "names": [
+    "MESNA 400mg"
+   ],
+   "regex": "mesna"
+  },
+  "cyclophosphamide": {
+   "unified": [
+    "CYCLOPHOSPHAMIDE 1G"
+   ],
+   "names": [
+    "Cyclophosphamide",
+    "Cyclophosphamide 1 gm",
+    "Endoxan",
+    "cyclophosphamide 1mg",
+    "cyclophosphamide 50mg"
+   ],
+   "regex": "cyclophosphamid\\w*|endoxan\\w*|اندوكسان|اندوكسين|سيكلوفوسفاميد|cyclophosphamide|endoxan"
+  },
+  "methotrexate": {
+   "unified": [
+    "METHOTREXATE 500MG/2ML",
+    "METHOTREXATE 50MG/2ML",
+    "Methotrexate 5G"
+   ],
+   "names": [
+    "Methotrexate 2.5mg",
+    "Methotrexate 500 mg",
+    "Methotrexate 500mg/5ml",
+    "Methotrexate 50mg",
+    "Methotrexate 50mg/2ml"
+   ],
+   "regex": "methotrexate"
+  },
+  "docetaxel": {
+   "unified": [
+    "DOCETAXEL 80MG"
+   ],
+   "names": [
+    "DOCETAXEL 20mg/2ml",
+    "DOCETAXEL 80mg/8ml",
+    "Docetaxel 20mg/0.5ml",
+    "Docetaxel 80 mg",
+    "Eutaxer 80mg",
+    "docetaxel 80mg"
+   ],
+   "regex": "docetaxel|docitaxel|taxotere|eutaxer|دوسيتاكسيل|دوسيتاكل|تاكسوتير|docetaxel|eutaxer"
+  },
+  "etoposide": {
+   "unified": [
+    "ETOPOSIDE 100MG"
+   ],
+   "names": [
+    "etoposide 50 mg"
+   ],
+   "regex": "etoposide"
+  },
+  "irinotecan": {
+   "unified": [
+    "IRINOTECAN 100MG/5ML"
+   ],
+   "names": [
+    "Irinotecan 100mg"
+   ],
+   "regex": "irinotecan"
+  },
+  "tamoxifen": {
+   "unified": [
+    "TAMOXIFEN 10MG"
+   ],
+   "names": [
+    "Tamoxifen 10 mg",
+    "Tamoxifen 10mg"
+   ],
+   "regex": "tamoxifen|tamoxiphen|tamoxifene|nolvadex|tamox\\w*|تاموكسيفين|تاموكسفين|نولفادكس|tamoxifen"
+  },
+  "exemestane": {
+   "unified": [
+    "EXEMESTANE 25MG"
+   ],
+   "names": [
+    "Aromasin 25mg",
+    "Exemestane 25 mg",
+    "exemstane"
+   ],
+   "regex": "exemestane|exemstane|exemest\\w*|aromasin|aromazin|nateran|natran|nateren|اروماسين|ارومازين|اكسيميستان|ناتيران|aromasin|exemestane|exemstane"
+  },
+  "mitoxantrone": {
+   "unified": [
+    "MITOXANTRONE 20MG"
+   ],
+   "names": [
+    "Mitoxantrone 2mg/ml"
+   ],
+   "regex": "mitoxantrone"
+  },
+  "anastrozole": {
+   "unified": [
+    "ANASTROZOL 1MG"
+   ],
+   "names": [
+    "Anastrozole 1 mg",
+    "Anastrozole 1mg",
+    "Arimidex 1 mg"
+   ],
+   "regex": "anastrozol\\w*|arimidex|اراميدكس|اناستروزول|anastrozole|arimidex"
+  },
+  "tacrolimus": {
+   "unified": [
+    "Tacrolimus 1MG"
+   ],
+   "names": [
+    "tacrolimus 0.03%"
+   ],
+   "regex": "tacrolimus"
+  },
+  "fulvestrant": {
+   "unified": [
+    "Fulvestrant 250MG"
+   ],
+   "names": [
+    "faslodex 250 mg",
+    "fulvestrant 250 mg"
+   ],
+   "regex": "fulvest\\w*|faslodex|فلفسترانت|فاسلوديكس|faslodex|fulvestrant"
+  },
+  "palbociclib": {
+   "unified": [
+    "PALBOCICLIB 100MG",
+    "PALBOCICLIB 125MG"
+   ],
+   "names": [
+    "Ibrance 125 mg",
+    "Palbociclib 100 mg",
+    "Palbociclib 125 mg",
+    "Palbociclib 75 mg"
+   ],
+   "regex": "palbociclib|palbo\\w*|ibrance|ايبرانس|ibrance|palbociclib"
+  }
+ },
+ "exact": {
+  "unitaxel": "paclitaxel",
+  "zoledronicacid4mg": "zoledronic_acid",
+  "metadronic": "zoledronic_acid",
+  "cyclosporinpreformedmicroemulsion50mgforautoimmune": "cyclosporin",
+  "loratinib": "lorlatinib",
+  "acalabrutinib100mg": "acalabrutinib",
+  "ibrutinib140mg": "ibrutinib",
+  "bortezomib35mg": "bortezomib",
+  "lenalidomide5mg": "lenalidomide",
+  "abirateroneacetate500": "abiraterone_acetate",
+  "azacitidine100mg": "azacitidine",
+  "bevacizumab100mg": "bevacizumab",
+  "bevacizumab": "bevacizumab",
+  "capecitabine500mg": "capecitabine",
+  "lyparanez150mg": "olaparib",
+  "pazopanib400mg": "pazopanib",
+  "rituximab100mg": "rituximab",
+  "doxorubicin10mg": "doxorubicin",
+  "rituximab500mg": "rituximab",
+  "cisplatin50mg": "cisplatin",
+  "pemetrexed500mg": "pemetrexed",
+  "pemetrexed": "pemetrexed",
+  "alimta500mg": "pemetrexed",
+  "vinblastine10mg10ml": "vinblastine",
+  "adotrastuzumab": "ado_trastuzumab",
+  "bicalutamide50mg": "bicalutamide",
+  "goserolinacetate108mg": "goserelin",
+  "everolimus10mg": "everolimus",
+  "everolimus5mg": "everolimus",
+  "imatinib100mg": "imatinib",
+  "imatinib400mg": "imatinib",
+  "sprycel50mg": "dasatinib",
+  "sunitinib125mg": "sunitinib",
+  "lapatinib250mg": "lapatinib",
+  "hydroxyurea500mg": "hydroxyurea",
+  "panitumumab100mg": "panitumumab",
+  "panitumumab400mg": "panitumumab",
+  "nilotinib200mg": "nilotinib",
+  "nilotinib150mg": "nilotinib",
+  "carboplatin150mg15ml": "carboplatin",
+  "dacarbazine": "dacarbazine",
+  "vinorelbine10mg": "vinorelbine",
+  "pembrolizumab": "pembrolizumab",
+  "trastuzumab600mg": "trastuzumab",
+  "trastuzumab600pertzumab": "pertuzumab_trastuzumab",
+  "alfacalcidiol": "alfacalcidol",
+  "pertuzumabtrastuzumab1200ةل": "pertuzumab_trastuzumab",
+  "alfacalcidol1mcg": "alfacalcidol",
+  "herceptin600perjeta420": "trastuzumab",
+  "herceptin440mgvial": "trastuzumab",
+  "trastuzumab440mg": "trastuzumab",
+  "flurouracil250mg": "fluorouracil",
+  "oxaliplatin100mg": "oxaliplatin",
+  "oxaliplatin50mg": "oxaliplatin",
+  "goserelin108mg": "goserelin",
+  "zoladexdepot36": "goserelin",
+  "zoladex108mg": "goserelin",
+  "gonadorelinanalogueslhrh": "goserelin",
+  "dacarbazine200mg": "dacarbazine",
+  "irlubtunub150mg": "erlotinib",
+  "letrozole": "letrozole",
+  "bleomycin15iu": "bleomycin",
+  "bleomycin15mg": "bleomycin",
+  "bleocip15iuvial": "bleomycin",
+  "dacarbazinemedac200mg": "dacarbazine",
+  "vinarcin1mg1ml": "vincristine",
+  "gemcitabine2gm": "gemcitabine",
+  "gemcitabine1000mg": "gemcitabine",
+  "ifosfamide1gm": "ifosfamide",
+  "ifosfamide1mg": "ifosfamide",
+  "ifosfamide2gm": "ifosfamide",
+  "mesna400mg": "mesna",
+  "cyclophosphamide1mg": "cyclophosphamide",
+  "doxorubicin50mg": "doxorubicin",
+  "methotrexate50mg2ml": "methotrexate",
+  "vinblastine1mg1ml": "vinblastine",
+  "vincristinsulphate2mg2ml": "vincristine",
+  "cyclophosphamide": "cyclophosphamide",
+  "endoxan": "cyclophosphamide",
+  "doxorubicin50mg25ml": "doxorubicin",
+  "vincristine1mg1ml": "vincristine",
+  "cyclophosphamide1gm": "cyclophosphamide",
+  "alfacalcidol2mcgml": "alfacalcidol",
+  "carboplatin450mg45ml": "carboplatin",
+  "cisplatin10mg": "cisplatin",
+  "docetaxel80mg": "docetaxel",
+  "eutaxer80mg": "docetaxel",
+  "paclitaxel100mg165ml": "paclitaxel",
+  "paclitaxel30mg": "paclitaxel",
+  "carbotinol450mg45ml": "carboplatin",
+  "carbotinol150mg15ml": "carboplatin",
+  "cyclophosphamide50mg": "cyclophosphamide",
+  "docetaxel20mg05ml": "docetaxel",
+  "docetaxel80mg8ml": "docetaxel",
+  "gemzar1gm": "gemcitabine",
+  "tykerb250mg": "lapatinib",
+  "paclitaxel100mg": "paclitaxel",
+  "unitaxel100mg": "paclitaxel",
+  "etoposide50mg": "etoposide",
+  "paclitaxel300mg": "paclitaxel",
+  "paclitaxel150mg25ml": "paclitaxel",
+  "docetaxel20mg2ml": "docetaxel",
+  "gemcitabinehcl1g": "gemcitabine",
+  "vinorelbine20mg": "vinorelbine",
+  "navelbine20mgcap": "vinorelbine",
+  "vinorelbine50mg": "vinorelbine",
+  "vinorelbine10mg1ml": "vinorelbine",
+  "vinorelbine30mg": "vinorelbine",
+  "irinotecan100mg": "irinotecan",
+  "doxorubicin10mg5ml": "doxorubicin",
+  "methotrexate500mg5ml": "methotrexate",
+  "methotrexate50mg": "methotrexate",
+  "methotrexate500mg": "methotrexate",
+  "methotrexate25mg": "methotrexate",
+  "tamoxifen10mg": "tamoxifen",
+  "exemestane25mg": "exemestane",
+  "aromasin25mg": "exemestane",
+  "exemstane": "exemestane",
+  "aromataseenzymeinhibitor": "letrozole",
+  "capecitabineaccord500mgtab": "capecitabine",
+  "mitoxantrone2mgml": "mitoxantrone",
+  "alfacalcidol05mcg": "alfacalcidol",
+  "alfacalcidol025mcg": "alfacalcidol",
+  "anastrozole1mg": "anastrozole",
+  "arimidex1mg": "anastrozole",
+  "letrozole25mg": "letrozole",
+  "tacrolimus003": "tacrolimus",
+  "fulvestrant250mg": "fulvestrant",
+  "palbociclib125mg": "palbociclib",
+  "palbociclib75mg": "palbociclib",
+  "faslodex250mg": "fulvestrant",
+  "ibrance125mg": "palbociclib",
+  "palbociclib100mg": "palbociclib"
+ },
+ "plans": [
+  {
+   "excel_index": 89,
+   "plan_text": "بروتوكول علاج كيميائى خط علاج اول لحالات (Ewing Sarcoma) 3VAC+IE Protocol جرعات مع الابحاث و العلاج التدعيمى",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Vincristine 1mg",
+     "med_key": "vincristine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Dactinomycin",
+     "med_key": "dactinomycin",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Cyclophosphamide 1gm",
+     "med_key": "cyclophosphamide",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 40,
+   "plan_text": "العلاج بالادويه مثبطات انزيم البروتون كينيز BTKI للمرضي ذو الطفره الجينيه DEL 17P (شامل نسبه 7 % للشراء الموحد + 7% للمستشفيات)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Acalibrutinib",
+     "med_key": "acalibrutinib",
+     "qty_per_dose": 60,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 25,
+   "plan_text": "علاج خط ثاني للاورام الليمفاويه طبقا لبروتوكولات (GEMOX) 3 جرعات شامل التحاليل والعلاج الدوائي",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Gemicitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Oxaliplatin 100mg",
+     "med_key": "oxaliplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 26,
+   "plan_text": "العلاج بعقار نيلوتينيب200مجم(عدد 6 جرعات بواقع جرعه واحده شهريا) ويتم التقييم كل 6 شهور",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Nilotinib Or Tasigna",
+     "med_key": "nilotinib_or_tasigna",
+     "qty_per_dose": 56,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 249,
+   "plan_text": "العلاج بعقار ( Lenalidomide 5mg) ما بعد الزرع ويعاد التقييم بعد 180 يوم (قرار اول)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lenalidomide 5mg",
+     "med_key": "lenalidomide",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 261,
+   "plan_text": "العلاج بعقار ( Lenalidomide 5mg) ويعاد التقييم بعد 180 يوم (قرار رابع واخير)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lenalidomide 5mg",
+     "med_key": "lenalidomide",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 6,
+   "plan_text": "بروتوكول علاج كيماوي للورم المنتشر (Platinum +Paclitaxel) 3 جرعات مع التحليل والعلاج التدعيمي",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Paclitaxel 300mg",
+     "med_key": "paclitaxel",
+     "qty_per_dose": 0.5,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 1.5,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 52,
+   "plan_text": "خط علاج كيمائي ماقبل الجراحه طبقا لبروتوكول (Folfox) او (Capox) من 4-6 جرعات (7% للشراء الموحد + 7% للمستشفيات) شامل التحاليل والعلاج الدوائي المصاحب للجرعه",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Capecitabine",
+     "med_key": "capecitabine",
+     "qty_per_dose": 120,
+     "role": "core"
+    },
+    {
+     "excel_name": "Oxaliplatin 100mg",
+     "med_key": "oxaliplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 50,
+   "plan_text": "علاج خط ثاني للاورام الليمفاويه طبقا لبروتوكولات (GDP) 3 جرعات شامل التحاليل والعلاج الدوائي",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Gemcitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Dexamethasone 8mg Ampoule",
+     "med_key": "dexamethasone",
+     "qty_per_dose": 5,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 245,
+   "plan_text": "العلاج بعقار (Azacitidine) تركيز 100 مجم عدد 7 حقن شهريا ويتم التقييم كل 60 يوم",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Azacitidine",
+     "med_key": "azacitidine",
+     "qty_per_dose": 7,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 9,
+   "plan_text": "علاج كيميائى و دوائى و متابعه و ابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Could be any chemotherapy agent consider any chemotherapy agent found dispenced after this decree as it is core medication",
+     "med_key": "ANY_CHEMO",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 41,
+   "plan_text": "علاج كيماوي وتدعيمي ودوائي وابحاث ونقل دم ومشتقاته",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Could be any chemotherapy agent consider any chemotherapy agent found dispenced after this decree as it is core medication",
+     "med_key": "ANY_CHEMO",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 1,
+   "plan_text": "علاج كيماوي خط ثاني لورم منتشر اربع جرعات ، (شامل المتابعه والتحاليل) طبقا للبروتوكولات",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Gemcitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 10,
+   "plan_text": "علاج كيماوى ودوائى ومتابعه وابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Could be any chemotherapy agent consider any chemotherapy agent found dispenced after this decree as it is core medication",
+     "med_key": "ANY_CHEMO",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 11,
+   "plan_text": "علاج كيماوي ودوائي وابحاث ونقل دم ومشتقاته",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Could be any chemotherapy agent consider any chemotherapy agent found dispenced after this decree as it is core medication",
+     "med_key": "ANY_CHEMO",
+     "qty_per_dose": null,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 21,
+   "plan_text": "علاج كيماوي تلطيفي ودوائي وابحاث ونقل دم ومشتقاته",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [],
+   "review": ""
+  },
+  {
+   "excel_index": 234,
+   "plan_text": "العلاج بعقار (Rituximab 700mg)عدد 3 جرعات بواقع جرعه كل 3 اسابيع بالحقن الوريدي (متضمنا للعلاج الكيماوي المصاحب) CHOP OR CVPويتم التقييم بعد 3 جرعات (بعد اضافة 7%للشراء الموحد+7%للمستشفيات) (قرار اول)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Rituximab 500mg",
+     "med_key": "rituximab",
+     "qty_per_dose": null,
+     "role": "core"
+    },
+    {
+     "excel_name": "Rituximab 100mg",
+     "med_key": "rituximab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 235,
+   "plan_text": "العلاج بعقار (Rituximab 700mg)عدد 3 جرعات بواقع جرعه كل 3 اسابيع بالحقن الوريدي (متضمنا للعلاج الكيماوي المصاحب) CHOP OR CVPويتم التقييم بعد 3 جرعات (بعد اضافة 7%للشراء الموحد+7%للمستشفيات) (قرار ثاني)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Rituximab 500mg",
+     "med_key": "rituximab",
+     "qty_per_dose": null,
+     "role": "core"
+    },
+    {
+     "excel_name": "Rituximab 100mg",
+     "med_key": "rituximab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 28,
+   "plan_text": "علاج كيماوي خط ثاني ويستكمل العلاج الي ثلاث جرعات (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Gemcitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 256,
+   "plan_text": "العلاج بعقار (Rituximab 700mg)عدد 2 جرعه بواقع جرعه كل 3 اسابيع بالحقن الوريدي (متضمنا للعلاج الكيماوي المصاحب) ويتم التقييم بعد 3 جرعات (بعد اضافة 7%للشراء الموحد+7%للمستشفيات)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Rituximab 500mg",
+     "med_key": "rituximab",
+     "qty_per_dose": null,
+     "role": "core"
+    },
+    {
+     "excel_name": "Rituximab 100mg",
+     "med_key": "rituximab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 102,
+   "plan_text": "علاج كيماوي Anthracyclines base ومتابعه وابحاث (3 -4 جرعات)",
+   "protocol": "anthracyclines",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Doxirubicin 50mg",
+     "med_key": "doxorubicin",
+     "qty_per_dose": 3,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Cyclophosphamide 1gm",
+     "med_key": "cyclophosphamide",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 232,
+   "plan_text": "علاج هرموني خط ثالث اكسيميستان ودوائي وابحاث",
+   "protocol": "aromasin",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Exemestane",
+     "med_key": "exemestane",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 4,
+   "plan_text": "العلاج بعقار ايماتينيب بيتا(عدد 6 جرعات بواقع جرعه واحدة شهريا) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Imatinib 100mg",
+     "med_key": "imatinib",
+     "qty_per_dose": 30,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 73,
+   "plan_text": "العلاج بعقارات ( Bortezomib 3.5mg +Lenalidomide 25mg+Dexamethone) (بروتوكول VDR) عدد 4حقن شهريا ويتم التقييم كل 90 يوم",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Bortezomib 3.5mg",
+     "med_key": "bortezomib",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Dexamethasone 8mg Ampoule",
+     "med_key": "dexamethasone",
+     "qty_per_dose": 5,
+     "role": "core"
+    },
+    {
+     "excel_name": "Lenalidomide 5mg",
+     "med_key": "lenalidomide",
+     "qty_per_dose": 42,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 172,
+   "plan_text": "علاج هرموني خط ثاني + زولاديكس ودوائي وابحاث",
+   "protocol": "hormonal_zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Letrozole",
+     "med_key": "letrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "anastrozole",
+     "med_key": "anastrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Goserline acetate 10.8mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "companion"
+    }
+   ],
+   "review": "الدواء الفموي يحدد الجرعة؛ زولاديكس مصاحب"
+  },
+  {
+   "excel_index": 195,
+   "plan_text": "علاج هرموني خط ثاني مثبطات الاروماتيز ودوائي وابحاث",
+   "protocol": "hormonal",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Letrozole",
+     "med_key": "letrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "anastrozole",
+     "med_key": "anastrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 14,
+   "plan_text": "العلاج بعقار داساتينيب(عدد6 جرعات بواقع جرعه واحده شهريا)ويتم التقييم كل 6 شهور",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Dasatinib",
+     "med_key": "dasatinib",
+     "qty_per_dose": 60,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 108,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار ثاني / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 219,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار ثالث / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 227,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار رابع / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 251,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار اول / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 110,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار ثاني / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 117,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار سادس / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 118,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار ثالث / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 236,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار خامس / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 112,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار رابع / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 120,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار خامس / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 111,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار سابع / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 116,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار سادس / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 205,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار اول / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 176,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار ثاني/ 7جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 183,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار ثالث/ 7 جرعة) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 179,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار رابع/ 7 جرعة) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 181,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار اول / 6 جرعات) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 184,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار ثاني/ 7جرعات) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 178,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار خامس 7 جرعة) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 180,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار ثالث/ 7 جرعة) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 185,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار خامس/ 7 جرعة) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 182,
+   "plan_text": "تراستوزوماب وريدي خط الأول لعلاج حالات ثانويات / ارتجاع أورام الثدي (قرار رابع/ 7 جرعة) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 165,
+   "plan_text": "علاج هرموني خط ثاني ودوائى وابحاث",
+   "protocol": "hormonal",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Letrozole",
+     "med_key": "letrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "anastrozole",
+     "med_key": "anastrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 166,
+   "plan_text": "علاج هرموني ودوائي وابحاث",
+   "protocol": "hormonal",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Letrozole",
+     "med_key": "letrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "anastrozole",
+     "med_key": "anastrozole",
+     "qty_per_dose": 30,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 59,
+   "plan_text": "العلاج بعقار ايماتينيب بيتا(عدد 6 جرعات بواقع جرعه واحدة شهريا)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Imatinib 100mg",
+     "med_key": "imatinib",
+     "qty_per_dose": 30,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 18,
+   "plan_text": "العلاج بعقار لاباتينب (قرار اول / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 19,
+   "plan_text": "العلاج بعقار لاباتينب (قرار ثاني / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 20,
+   "plan_text": "العلاج بعقار لاباتينب (قرار اول / 6 جرعات) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 43,
+   "plan_text": "العلاج بعقار لاباتينب (قرار ثالث / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 57,
+   "plan_text": "العلاج بعقار لاباتينب (قرار ثاني / 6 جرعات) شامل الفحوصات و المتابعة",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 56,
+   "plan_text": "العلاج بعقار لاباتينب (قرار رابع / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Lapatinib 250mg",
+     "med_key": "lapatinib",
+     "qty_per_dose": 150,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 119,
+   "plan_text": "علاج بمثبطات CDK4/6 خط ثاني (قرار ثامن / 3 جرعات) والمتابعة",
+   "protocol": "cdk46",
+   "counts_doses": false,
+   "reason": "not enabled",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    }
+   ],
+   "review": "مثبطات CDK4/6 فقط (ايبرانس): غير مفعّلة — فعّلها بـ topup_dose_enable_plan"
+  },
+  {
+   "excel_index": 109,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار سابع / 3 جرعات) والمتابعة",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 238,
+   "plan_text": "العلاج بعقار تراستوزوماب تحت الجلد (600mg) (عدد 6 جرعات بواقع vial كل 3 اسابيع) قرار ثانى (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 600mg S.C",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 211,
+   "plan_text": "تراستوزوماب بعد الجراحة تحت الجلد (قرار رابع / 5جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 5,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 209,
+   "plan_text": "تراستوزوماب بعد الجراحة تحت الجلد (قرار ثالث / 4جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 214,
+   "plan_text": "تراستوزوماب بعد الجراحة تحت الجلد (قرار ثاني / 4جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 440mg",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 220,
+   "plan_text": "تراستوزوماب بعد الجراحة تحت الجلد (قرار رابع / 4جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 600mg S.C",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 223,
+   "plan_text": "تراستوزوماب بعد الجراحة تحت الجلد (قرار أول / 4جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 600mg S.C",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 241,
+   "plan_text": "العلاج بعقار تراستوزوماب تحت الجلد (600mg) (عدد 3 جرعات بواقع vial كل 3 اسابيع)شامل المتابعه والتحاليل",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 600mg S.C",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 187,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي كعلاج ما قبل الجراحة (+ استكمال بعد الجراحة ) (قرار ثاني/ 3 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 189,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي كعلاج ما قبل الجراحة (+ استكمال بعد الجراحة ) (قرار ثالث/ 3 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 188,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي علاج بعد الجراحة (قرار سادس/ 3 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 191,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي علاج بعد الجراحة (قرار رابع/ 3 جرعات)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 193,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي علاج بعد الجراحة (قرار خامس/ 3 جرعات)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 221,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي علاج بعد الجراحة (قرار ثالث/ 3 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 137,
+   "plan_text": "زولاديكس تحت الجلد ( 2امبول) ودوائي وابحاث",
+   "protocol": "zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Goserline Acetate 10.8 mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 186,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي كعلاج ما قبل الجراحة (+ استكمال بعد الجراحة ) (قرار اول/ 2 جرعات)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 1200/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 239,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي كعلاج ما بعد الجراحة (قرار اول/ 2 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 1200/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 258,
+   "plan_text": "العلاج بعقار (Capecitabine 500mg) 8 جرعات ما بعد الجراحه لحالات (TNBC) و دوائى و ابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 8,
+   "core": [
+    {
+     "excel_name": "Capecitabine",
+     "med_key": "capecitabine",
+     "qty_per_dose": 120,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 213,
+   "plan_text": "تراستوزوماب تحت الجلد و بيرتوزوماب وريدي كعلاج ما بعد الجراحة (استكمال/ جرعه)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Pertuzumab + Trastuzumab 600/600",
+     "med_key": "pertuzumab_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 231,
+   "plan_text": "العلاج بعقار تراستوزوماب تحت الجلد (600mg)(جرعه واحده بواقع vial كل 3 اسابيع) شامل المتابعه والتحاليل",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Trastuzumab 600mg S.C",
+     "med_key": "trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 207,
+   "plan_text": "العلاج بعقار (Capecitabine 500mg) 4 جرعات و دوائى و ابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Capecitabine",
+     "med_key": "capecitabine",
+     "qty_per_dose": 120,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 2,
+   "plan_text": "خط علاج كيمائي مابعد الجراحه طبقا لبروتوكول (Capecitabine) من 4 جرعات (7% للشراء الموحد + 7% للمستشفيات) (حد اقصي قرارين) شامل التحاليل والعلاج الدوائي المصاحب للجرعه",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Capecitabine",
+     "med_key": "capecitabine",
+     "qty_per_dose": 120,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 190,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار سادس / 2 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 194,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار خامس / 2 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 196,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار رابع / 2 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 198,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار ثاني / 2 جرعات)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 201,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار ثالث / 2 جرعات)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 197,
+   "plan_text": "العلاج بعقار TDM1 وريدي بعد الجراحة لمدة تصل الى (قرار اول / 2 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Ado-trastuzumab 100mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ado-trastuzumab 160mg",
+     "med_key": "ado_trastuzumab",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 253,
+   "plan_text": "العلاج المساعد لوقاية العظام للمرضي الذين يتلقوا علاج هرموني دينوزوماب 60 مجم ( جرعة واحدة ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "supportive",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Zoledronic Acid 4mg",
+     "med_key": "zoledronic_acid",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 132,
+   "plan_text": "علاج هرموني تاموكسفين المصاحب للزولاديكس تحت الجلد ( 6 اشهر) ودوائي وابحاث",
+   "protocol": "tamoxifen_zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Tamoxifen",
+     "med_key": "tamoxifen",
+     "qty_per_dose": 60,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Goserline acetate 10.8mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "companion"
+    }
+   ],
+   "review": "الدواء الفموي يحدد الجرعة؛ زولاديكس مصاحب"
+  },
+  {
+   "excel_index": 131,
+   "plan_text": "علاج بالتاموكسفين المصاحب للزولاديكس تحت الجلد ( 6 اشهر) ودوائي وابحاث",
+   "protocol": "tamoxifen_zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Tamoxifen",
+     "med_key": "tamoxifen",
+     "qty_per_dose": 60,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Goserline acetate 10.8mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "companion"
+    }
+   ],
+   "review": "الدواء الفموي يحدد الجرعة؛ زولاديكس مصاحب"
+  },
+  {
+   "excel_index": 171,
+   "plan_text": "علاج هرموني خط اول تاموكسيفين ودوائي وابحاث",
+   "protocol": "tamoxifen",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Tamoxifen",
+     "med_key": "tamoxifen",
+     "qty_per_dose": 60,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 140,
+   "plan_text": "زولاديكس تحت الجلد لمده 3 شهور (شامل المتابعه والتحاليل) حقنه واحده",
+   "protocol": "zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Goserline Acetate 10.8 mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 138,
+   "plan_text": "زولاديكس تحت الجلد لمده 6 شهور (شامل المتابعه والتحاليل)",
+   "protocol": "zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Goserline Acetate 10.8 mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 139,
+   "plan_text": "زولاديكس تحت الجلد لمده 6 شهور ودوائي وابحاث",
+   "protocol": "zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Goserline Acetate 10.8 mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 226,
+   "plan_text": "العلاج المساعد لوقاية العظام للمرضي الذين يتلقوا علاج هرموني حمض الزيلودرونيك ( جرعة واحدة ) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "supportive",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Zoledronic Acid 4mg",
+     "med_key": "zoledronic_acid",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 263,
+   "plan_text": "العلاج الشهري التلطيفي لمعالجة العظام لمرضي سرطان الثدي المنتشر بالعظام حمض الزيلودرونيك (6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "supportive",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Zoledronic Acid 4mg",
+     "med_key": "zoledronic_acid",
+     "qty_per_dose": 1,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 160,
+   "plan_text": "بيمبروليزوماب وريدي قبل الجراحة (قرار اول /2جرعة)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Pembrolizumab",
+     "med_key": "pembrolizumab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 159,
+   "plan_text": "بيمبروليزوماب وريدي قبل الجراحة (قرار ثاني /2جرعة)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Pembrolizumab",
+     "med_key": "pembrolizumab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 161,
+   "plan_text": "بيمبروليزوماب وريدي قبل الجراحة (قرار ثالث /2جرعة)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Pembrolizumab",
+     "med_key": "pembrolizumab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 162,
+   "plan_text": "بيمبروليزوماب وريدي قبل الجراحة (قرار رابع /2جرعة)(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Pembrolizumab",
+     "med_key": "pembrolizumab",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 103,
+   "plan_text": "علاج كيماوي Anthracyclines base ومتابعه وابحاث (شامله ست جرعات)",
+   "protocol": "anthracyclines",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Doxirubicin 50mg",
+     "med_key": "doxorubicin",
+     "qty_per_dose": 3,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Cyclophosphamide 1gm",
+     "med_key": "cyclophosphamide",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 82,
+   "plan_text": "بروتوكول علاج كيميائى خط علاج اول (Doxorubicin + Ifosfamide) 3 جرعات مع الابحاث و العلاج التدعيمى",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Doxirubicin 50mg",
+     "med_key": "doxorubicin",
+     "qty_per_dose": 3,
+     "role": "core"
+    },
+    {
+     "excel_name": "Ifosfamide 2g",
+     "med_key": "ifosfamide",
+     "qty_per_dose": 6,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 30,
+   "plan_text": "علاج كيماوي خط ثاني لورم منتشر اربع جرعات ، شامل الفحوصات و المتابعة طبقا للبروتوكولات",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Gemcitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 202,
+   "plan_text": "مثبط CDK4/6 و فلفسترانت كخط ثاني للعلاج لمرضى مستجيبي العلاج الهرموني (قرار اول / 4 جرعات) والمتابعة ويجدد وفقا للاستجابه",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Palbociclib 125mg",
+     "med_key": "palbociclib",
+     "qty_per_dose": 21,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "CDK4/6 + فلفسترانت: الدواءان أساسيان وأي منهما يحدد تاريخ الجرعة"
+  },
+  {
+   "excel_index": 3,
+   "plan_text": "خط علاج كيمائي للورم المنتشر طبقا لبروتوكول (Capox) من 4 جرعات (7% للشراء الموحد + 7% للمستشفيات) (حد اقصي قرارين)شامل التحاليل والعلاج الدوائي المصاحب للجرعه",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Capecitabine",
+     "med_key": "capecitabine",
+     "qty_per_dose": 120,
+     "role": "core"
+    },
+    {
+     "excel_name": "Oxaliplatin 100mg",
+     "med_key": "oxaliplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 141,
+   "plan_text": "زولاديكس تحت الجلد لمده 3 شهور (شامل المتابعه والتحاليل) حقنه واحده استكمال نفقات",
+   "protocol": "zoladex",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 1,
+   "core": [
+    {
+     "excel_name": "Goserline Acetate 10.8 mg",
+     "med_key": "goserelin",
+     "qty_per_dose": 1,
+     "role": "anchor"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 126,
+   "plan_text": "علاج كيماوي تاكسان (دوسيتاكل) 4 جرعات (شامل المتابعه والتحاليل)",
+   "protocol": "taxanes",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 4,
+   "core": [
+    {
+     "excel_name": "Paclitaxel 300mg",
+     "med_key": "paclitaxel",
+     "qty_per_dose": null,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "docetaxel",
+     "med_key": "docetaxel",
+     "qty_per_dose": null,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": null,
+     "role": "companion"
+    }
+   ],
+   "review": "باكليتاكسيل أو دوسيتاكسيل (± كاربوبلاتين) حسب المريض؛ الجرعة = تاريخ صرف التاكسان"
+  },
+  {
+   "excel_index": 81,
+   "plan_text": "علاج خط اول لحالات Hodgkin Lymphoma بروتوكول علاج كيماوي ABVD عدد 6 جرعات 3 شهور شامل التحليل والعلاج الدوائي",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Doxirubicin 50mg",
+     "med_key": "doxorubicin",
+     "qty_per_dose": 3,
+     "role": "core"
+    },
+    {
+     "excel_name": "Bleomycin 15mg",
+     "med_key": "bleomycin",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Vinblastine 10mg",
+     "med_key": "vinblastine",
+     "qty_per_dose": 1,
+     "role": "core"
+    },
+    {
+     "excel_name": "Dacarbazine 200mg",
+     "med_key": "dacarbazine",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 32,
+   "plan_text": "علاج كيماوي خط ثاني (جرعه واحده ويستكمل العلاج الي ثلاث جرعات ثم يتم عمل ابحاث الاستجابه وبناءا عليها يستكمل ثلاث جرعات اخري)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Gemcitabine 1gm",
+     "med_key": "gemcitabine",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 23,
+   "plan_text": "خط علاج كيمائي للورم المنتشر طبقا لبروتوكول (Folfox) من 6 جرعات (7% للشراء الموحد + 7% للمستشفيات) (حد اقصي قرارين)شامل التحاليل والعلاج الدوائي المصاحب للجرعه",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Fluorouracil 500mg",
+     "med_key": "fluorouracil",
+     "qty_per_dose": 10,
+     "role": "core"
+    },
+    {
+     "excel_name": "Oxaliplatin 100mg",
+     "med_key": "oxaliplatin",
+     "qty_per_dose": 3,
+     "role": "core"
+    },
+    {
+     "excel_name": "Calcium-Leucovorin 100mg",
+     "med_key": "calcium_leucovorin",
+     "qty_per_dose": 13,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 217,
+   "plan_text": "العلاج بعقار ايفروليماس ( قرار أول / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Everloimus",
+     "med_key": "everolimus",
+     "qty_per_dose": 60,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 250,
+   "plan_text": "العلاج بعقار ايفروليماس ( قرار ثاني / 6 جرعات) (شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Everloimus",
+     "med_key": "everolimus",
+     "qty_per_dose": 60,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 173,
+   "plan_text": "علاج كيماوي (هيدرا) ودوائي وابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Hydroxyurea",
+     "med_key": "hydroxyurea",
+     "qty_per_dose": 100,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 128,
+   "plan_text": "علاج كيماوي تاكسان (دوسيتاكل) 6 جرعات (شامل المتابعه والتحاليل)",
+   "protocol": "taxanes",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Paclitaxel 300mg",
+     "med_key": "paclitaxel",
+     "qty_per_dose": null,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "docetaxel",
+     "med_key": "docetaxel",
+     "qty_per_dose": null,
+     "role": "anchor"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": null,
+     "role": "companion"
+    }
+   ],
+   "review": "باكليتاكسيل أو دوسيتاكسيل (± كاربوبلاتين) حسب المريض؛ الجرعة = تاريخ صرف التاكسان"
+  },
+  {
+   "excel_index": 247,
+   "plan_text": "العلاج بعقار Pemetrexed مصاحب له العلاج الكيماوي (platinum based) (3 جرعات) خط علاج اول (شامل المتابعه والتحاليل) ويجدد بحد اقصي قرارين (قرار اول)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pemetrexade 500mg",
+     "med_key": "pemetrexed",
+     "qty_per_dose": 3,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 1.5,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 254,
+   "plan_text": "العلاج بعقار Pemetrexed مصاحب له العلاج الكيماوي (platinum based) (3 جرعات) خط علاج اول (شامل المتابعه والتحاليل) ويجدد بحد اقصي قرارين (قرار ثانى)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Pemetrexade 500mg",
+     "med_key": "pemetrexed",
+     "qty_per_dose": 3,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 1.5,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 51,
+   "plan_text": "علاج خط ثاني للاورام الليمفاويه طبقا لبروتوكولات (ICE OR MINE) 3 جرعات شامل التحاليل والعلاج الدوائي",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Ifosfamide 2gm",
+     "med_key": "ifosfamide",
+     "qty_per_dose": 6,
+     "role": "core"
+    },
+    {
+     "excel_name": "Carboplatin 150mg",
+     "med_key": "carboplatin",
+     "qty_per_dose": 4,
+     "role": "core"
+    },
+    {
+     "excel_name": "Etoposide 100mg",
+     "med_key": "etoposide",
+     "qty_per_dose": 6,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 174,
+   "plan_text": "علاج كيماوي (هيدرا)  ودوائي وابحاث",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 2,
+   "core": [
+    {
+     "excel_name": "Hydroxyurea",
+     "med_key": "hydroxyurea",
+     "qty_per_dose": 100,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 31,
+   "plan_text": "علاج كيماوي FEC ومتابعه وابحاث (3 -4 جرعات)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Fluorouracil 500mg",
+     "med_key": "fluorouracil",
+     "qty_per_dose": 10,
+     "role": "core"
+    },
+    {
+     "excel_name": "Epirubicin 100mg",
+     "med_key": "epirubicin",
+     "qty_per_dose": 2,
+     "role": "core"
+    },
+    {
+     "excel_name": "Cyclophosphamide",
+     "med_key": "cyclophosphamide",
+     "qty_per_dose": 2,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": 12,
+   "plan_text": "علاج كيماوي خط ثاني لورم منتشر3 جرعات عقار (Vinorelbine oral)،(شامل المتابعه والتحاليل)",
+   "protocol": null,
+   "counts_doses": false,
+   "reason": "other",
+   "doses_per_decree": 3,
+   "core": [
+    {
+     "excel_name": "Vinorelbine 30mg",
+     "med_key": "vinorelbine",
+     "qty_per_dose": 6,
+     "role": "core"
+    },
+    {
+     "excel_name": "Vinorelbine 20mg",
+     "med_key": "vinorelbine",
+     "qty_per_dose": 4,
+     "role": "core"
+    }
+   ],
+   "review": ""
+  },
+  {
+   "excel_index": null,
+   "plan_text": "فلفسترانت كخط اول للعلاج (قرار اول/ 7 جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "فلفسترانت فقط؛ الجرعات من نص الخطة"
+  },
+  {
+   "excel_index": null,
+   "plan_text": "فلفسترانت كخط اول للعلاج (قرار ثالث/ 6 جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 6,
+   "core": [
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "فلفسترانت فقط؛ الجرعات من نص الخطة"
+  },
+  {
+   "excel_index": null,
+   "plan_text": "فلفسترانت كخط ثاني للعلاج لمرضي مستجيبي العلاج الهرموني (قرار اول/ 7 جرعات ) (شامل المتابعه والتحاليل)",
+   "protocol": "fulvestrant",
+   "counts_doses": true,
+   "reason": "",
+   "doses_per_decree": 7,
+   "core": [
+    {
+     "excel_name": "Fulvestrant",
+     "med_key": "fulvestrant",
+     "qty_per_dose": 2,
+     "role": "anchor"
+    }
+   ],
+   "review": "فلفسترانت فقط؛ الجرعات من نص الخطة"
+  }
+ ],
+ "not_core": [
+  "alfacalcidol",
+  "calcium_carbonate"
+ ]
+}

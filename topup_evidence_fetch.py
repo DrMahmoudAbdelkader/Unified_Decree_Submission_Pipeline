@@ -172,11 +172,9 @@ def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
     return out
 
 
-def previous_decrees(c: dict, smc=None) -> list[str]:
-    """Manual numbers win. Otherwise the union of
-         (a) decrees this app stored for the patient's earlier cases on the same protocol, and
-         (b) decrees SMC lists for the patient on the same plan/protocol (the patient lookup),
-    oldest first; then ONLY the newest one is kept (unless all_previous_decrees is set)."""
+def merged_previous(c: dict, smc=None) -> list[str]:
+    """ALL previous decrees of the patient on the same plan/protocol, oldest first (manual numbers win).
+    Used by the dose count, which needs the whole chain; the evidence PDFs use previous_decrees() below."""
     if c.get("manual_decree_numbers"):
         return list(dict.fromkeys(str(x) for x in c["manual_decree_numbers"]))
     _ensure_lookup(c, smc)
@@ -184,12 +182,18 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
     from_smc = _lookup_decrees(c)
     dates = {n: d for d, n in from_smc}
     merged = list(dict.fromkeys(from_db + [n for _, n in from_smc]))
-    # oldest first by issue date (unknown dates count as oldest); stable for ties
-    decrees = sorted(merged, key=lambda n: dates.get(n, ""))
-    if not decrees:
-        return []
-    log.info(f"  candidate {c['id']}: previous decrees {len(from_db)} from the app + {len(from_smc)} from SMC "
-             f"-> {len(decrees)} distinct")
+    decrees = sorted(merged, key=lambda n: dates.get(n, ""))        # unknown dates count as oldest; stable for ties
+    if decrees:
+        log.info(f"  candidate {c['id']}: previous decrees {len(from_db)} from the app + {len(from_smc)} from SMC "
+                 f"-> {len(decrees)} distinct")
+    return decrees
+
+
+def previous_decrees(c: dict, smc=None) -> list[str]:
+    """Manual numbers win. Otherwise merged_previous(), then ONLY the newest one is kept (unless all_previous_decrees)."""
+    decrees = merged_previous(c, smc)
+    if c.get("manual_decree_numbers") or not decrees:
+        return decrees
     # GENERAL RULE: only the invoices of the single most recent previous decree of the same plan.
     # Extraordinary override: candidate.all_previous_decrees = true -> every previous decree
     # (still capped by protocols.max_previous_decrees when that is > 1).
@@ -450,6 +454,9 @@ _FONT_PROBE_JS = (
 )
 
 
+_ROWS_CACHE: dict = {}      # receipt_id -> item rows as loaded (filled by _render_once, used by the dose count)
+
+
 class SessionExpired(Exception):
     pass
 
@@ -538,6 +545,7 @@ def _render_once(smc: SMCSession, receipt: str, extra: int, mode: str = "proxy")
 
             try:
                 rows = page.evaluate(_ROWS_JS)
+                _ROWS_CACHE[receipt] = rows
                 log.info(f"invoice {receipt}: item rows as loaded ({len(rows)} rows, full text) = {rows}")
                 _rd = os.environ.get("TOPUP_ROWS_DIR")          # optional: one JSON file per invoice for parser tests
                 if _rd:
@@ -598,6 +606,35 @@ def _render_once(smc: SMCSession, receipt: str, extra: int, mode: str = "proxy")
                     ctx.close()
             except Exception:
                 pass
+
+
+def rows_for_receipt(smc: SMCSession, receipt: str) -> list:
+    """Item rows (text 'a | b | c ...') of an invoice's Details page, no PDF. Reuses rows read earlier in this run."""
+    if receipt in _ROWS_CACHE:
+        return _ROWS_CACHE[receipt]
+    br = _browser()
+    ctx = br.new_context(viewport={"width": 700, "height": 800})
+    try:
+        ctx.route("**/*", _proxy_handler(smc))
+        page = ctx.new_page()
+        page.goto(DETAILS_URL.format(rid=receipt), wait_until="load", timeout=60_000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        html = page.content()
+        if all(m in html for m in _LOGIN_MARKERS) or "OTP-Auth" in html:
+            raise SessionExpired(f"browser landed on the SMC login page for receipt {receipt}")
+        if receipt not in ar2en(re.sub(r"\s+", " ", BeautifulSoup(html, "html.parser").get_text(" "))):
+            raise SessionExpired(f"receipt {receipt} not found on the page (not the invoice)")
+        rows = page.evaluate(_ROWS_JS)
+        _ROWS_CACHE[receipt] = rows
+        return rows
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 
 def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
@@ -801,6 +838,12 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
                      f"{end[0].get('evidence_message') or ''} - open the entry on the page to view the stored PDFs")
     except Exception:
         pass
+    # dose count over the WHOLE chain of previous decrees (never raises; TOPUP_DOSE_CALC=0 switches it off)
+    try:
+        import topup_dose_calc as _dc
+        _dc.run(c, smc, sys.modules[__name__])
+    except Exception as e:
+        log.warning(f"  candidate {cid}: dose count skipped ({type(e).__name__}: {str(e)[:120]})")
 
 
 def write_run_summary(results):
