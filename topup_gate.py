@@ -84,14 +84,14 @@ def _documents(candidate_id: int) -> List[dict]:
 
 def _unit_word(protocol_key: Optional[str]) -> str:
     if not protocol_key:
-        return "دورة"
+        return "جرعة"
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_protocols", headers=_hdr(), timeout=30,
                          params={"select": "unit_word_ar", "protocol_key": f"eq.{protocol_key}", "limit": 1})
         rows = r.json() if r.ok else []
-        return (rows[0].get("unit_word_ar") if rows else None) or "دورة"
+        return (rows[0].get("unit_word_ar") if rows else None) or "جرعة"
     except Exception:
-        return "دورة"
+        return "جرعة"
 
 
 # --------------------------------------------------------------------------- messages
