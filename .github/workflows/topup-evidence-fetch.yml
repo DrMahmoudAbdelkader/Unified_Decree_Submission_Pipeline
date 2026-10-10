@@ -188,8 +188,15 @@ jobs:
           SIGNATURE_BASE_URL: ${{ vars.SIGNATURE_BASE_URL }}
           MAX_CANDIDATES: ${{ github.event.inputs.max_candidates || '50' }}
           TOPUP_DEBUG_DIR: /tmp/topup_debug
+          TOPUP_ROWS_DIR: /tmp/topup_logs/rows      # one JSON per invoice with every row's full text
           INVOICE_WIDEN_PX: "55"
-        run: python topup_evidence_fetch.py
+          PYTHONUNBUFFERED: "1"
+        # tee: the output still shows in the Actions log AND is saved in full to a file.
+        # pipefail: if the script fails the step still fails (tee must not hide the exit code).
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/topup_logs
+          python topup_evidence_fetch.py 2>&1 | tee /tmp/topup_logs/evidence_fetch_${{ matrix.shard.name }}.log
 
       # artifact names must be unique per runner in one run (upload-artifact@v4)
       - name: Upload raw invoice renders (layout check)
@@ -200,3 +207,13 @@ jobs:
           path: /tmp/topup_debug
           if-no-files-found: ignore
           retention-days: 3
+
+      # FULL log of the invoice step (+ the JSON row dumps) - one artifact per runner.
+      - name: Upload full evidence-fetch log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-fetch-log-${{ matrix.shard.name }}
+          path: /tmp/topup_logs
+          if-no-files-found: ignore
+          retention-days: 7
