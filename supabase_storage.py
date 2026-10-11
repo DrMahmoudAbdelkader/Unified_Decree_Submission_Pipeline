@@ -51,14 +51,26 @@ def _headers():
 
 
 def download(bucket: str, object_path: str, local_path: str) -> bool:
+    """Downloads one object, UNLESS it is already on disk (restored by the
+    workflow's actions/cache step) - every Supabase download counts as egress,
+    and a fresh runner used to re-download ~2.6 MB of identical files on every
+    start. Set ASSETS_FORCE_DOWNLOAD=1 to bypass the skip. The file is written
+    to a temp name and renamed, so an interrupted run can never leave a
+    half-written file that would then be cached and reused."""
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0 \
+            and os.environ.get("ASSETS_FORCE_DOWNLOAD", "").lower() not in ("1", "true", "yes"):
+        log.info(f"Using cached asset (no download): {bucket}/{object_path}")
+        return True
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{object_path}"
     resp = requests.get(url, headers=_headers(), timeout=_TIMEOUT)
     if resp.status_code != 200:
         log.error(f"Storage download failed ({resp.status_code}) for {bucket}/{object_path}: {resp.text[:200]}")
         return False
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-    with open(local_path, "wb") as f:
+    tmp_path = local_path + ".part"
+    with open(tmp_path, "wb") as f:
         f.write(resp.content)
+    os.replace(tmp_path, local_path)
     return True
 
 
