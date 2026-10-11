@@ -73,24 +73,27 @@ def _money(x: float) -> str:
     return f"{x:,.2f}".replace(",", "")
 
 
-def _date_key(s: str):
-    """Sort key for dates written as yyyy-mm-dd, dd/mm/yyyy or dd-mm-yyyy; unknown -> very old."""
-    s = (s or "").strip()
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"):
+def _date_key(s: str, us_first: bool = False):
+    """Sort key for dates written as yyyy-mm-dd, dd/mm/yyyy, dd-mm-yyyy or SMC's 'm/d/yyyy h:mm:ss PM'
+    (any time part is ignored). us_first: for slash dates try month/day first (SMC listing dates). Unknown -> very old."""
+    parts = (s or "").strip().split()
+    s = parts[0] if parts else ""
+    fmts = ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y"] if us_first else ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"]
+    for fmt in fmts:
         try:
-            return datetime.strptime(s[:10], fmt).date()
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
     return date.min
 
 
-def _iso(s) -> str:
-    """Any date we know how to read -> yyyy-mm-dd (the format used in the SMC template). Unreadable -> as is."""
+def _iso(s, us_first: bool = False) -> str:
+    """Any date we know how to read -> plain day date dd-mm-yyyy (no time of day). Unreadable -> as is."""
     s = (str(s) if s is not None else "").strip()
     if not s:
         return ""
-    d = _date_key(s)
-    return d.isoformat() if d != date.min else s
+    d = _date_key(s, us_first)
+    return d.strftime("%d-%m-%Y") if d != date.min else s
 
 
 def _pending_orders(decree_number: str) -> List[dict]:
@@ -133,7 +136,7 @@ def collect(candidate_id: int) -> Optional[dict]:
     lines = []
     for i in inv:
         li = ((i.get("verification") or {}).get("listing") or {})
-        lines.append({"date": str(li.get("reg_date") or "").strip(), "receipt": i["receipt_id"],
+        lines.append({"date": _iso(li.get("reg_date"), us_first=True), "receipt": i["receipt_id"],
                       "value": float(li["amount"]) if li.get("amount") not in (None, "") else None})
     lines.sort(key=lambda x: _date_key(x["date"]))
 
@@ -144,7 +147,7 @@ def collect(candidate_id: int) -> Optional[dict]:
     try:                         # first dose date .. last dose date of THIS decree's dispensings (invoiced + unbilled)
         import topup_dose_calc as dc
         span = dc.dose_span(candidate_id, decrees) if dc.enabled() else None
-        period = (span[0].isoformat(), span[1].isoformat()) if span else None
+        period = (span[0].strftime("%d-%m-%Y"), span[1].strftime("%d-%m-%Y")) if span else None
     except Exception as e:
         log.warning(f"dose span unavailable ({e}) - period taken from the table rows")
     return {"patient_name": name, "national_id": str(p.get("national_id") or ""),
