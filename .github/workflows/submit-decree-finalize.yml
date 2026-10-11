@@ -145,6 +145,20 @@ jobs:
             echo "ghostscript and fonts-hosny-amiri already present - skipping apt."
           fi
 
+      # Supabase Storage downloads count as egress. Signatures, the report template and the
+      # fonts almost never change, so keep them in GitHub's private Actions cache and let
+      # supabase_storage.download() skip files that are already on disk. A runner then
+      # downloads them only on a cache miss (first run, or after 7 days unused).
+      # CHANGED A FILE in the decree-assets bucket? Set the repository VARIABLE
+      # ASSETS_CACHE_VERSION to a new value (v2, v3 ...) - one place, all workflows.
+      - name: Cache signing assets and fonts
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/decree_assets
+            ~/.local/share/fonts
+          key: decree-assets-${{ vars.ASSETS_CACHE_VERSION || 'v1' }}
+
       - name: Stagger login (runner ${{ matrix.shard.n }})
         run: sleep $(( (${{ matrix.shard.n }} - 1) * 3 ))
 
