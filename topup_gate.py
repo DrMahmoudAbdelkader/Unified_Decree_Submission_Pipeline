@@ -9,7 +9,8 @@ calls — decree_common.run_finalize_stages() and decree_submission_prepare.py n
 
     assert_ready(case_id)                 raise (-> FAILED + operator requirement) when not ready
     with_invoices(case_id, patient_pdf)   path of the PDF to merge after the MDT + report
-    cycles_statement(case_id)             English, dated dose sentence for the medical report (TOPUP only)
+    cycles_statement(case_id)             English, dated dose sentence for the medical report (TOPUP only; None when nothing is
+                                          left to receive -> invoices only, like a supportive decree)
     split_ready(cases)                    (ready_cases, blocked) for prepare's bulk run
 
 What each kind needs before its retry request may be sent (answer of the DB function
@@ -62,19 +63,35 @@ def _hdr():
     return {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
 
 
+def _rpc(name: str, body: dict):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/{name}", json=body, headers=_hdr(), timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
+    return r.json()
+
+
 def _gate(case_id: int) -> dict:
-    """{'is_topup': False} for a normal request. Fails open (with a warning) if the RPC is missing."""
+    """{'is_topup': False} for a normal request. Fails open (with a warning) if the RPC is missing.
+
+    A READY_TO_SUBMIT request that nobody linked to a letter (it was created in the normal entry module, not from the top-up
+    page) but belongs to the same patient + plan of an open letter is linked here (topup_autolink_case, migration 14), so it is
+    submitted AFTER the top-up logic: counts, signed invoices, manual bill and report sentence. TOPUP_AUTOLINK_READY=0 disables."""
     try:
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/topup_evidence_gate", json={"p_case_id": int(case_id)},
-                          headers=_hdr(), timeout=30)
-        if not r.ok:
-            log.warning(f"topup gate skipped for case {case_id}: HTTP {r.status_code} {r.text[:120]}")
-            return {"is_topup": False}
-        g = r.json()
-        return g if isinstance(g, dict) else {"is_topup": False}
+        g = _rpc("topup_evidence_gate", {"p_case_id": int(case_id)})
+        g = g if isinstance(g, dict) else {"is_topup": False}
     except Exception as exc:
         log.warning(f"topup gate skipped for case {case_id}: {exc}")
         return {"is_topup": False}
+    if not g.get("is_topup") and (os.environ.get("TOPUP_AUTOLINK_READY") or "1").strip() not in ("0", "false", "off", "no"):
+        try:
+            if _rpc("topup_autolink_case", {"p_case_id": int(case_id)}):
+                log.info(f"  case {case_id}: linked automatically to an open administrative letter of the same patient + plan")
+                g2 = _rpc("topup_evidence_gate", {"p_case_id": int(case_id)})
+                if isinstance(g2, dict):
+                    g = g2
+        except Exception as exc:                                   # migration 14 not applied: behave as before
+            log.debug(f"topup autolink skipped for case {case_id}: {exc}")
+    return g
 
 
 def _documents(candidate_id: int) -> List[dict]:
@@ -162,6 +179,10 @@ def cycles_statement(case_id: int) -> Optional[str]:
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
     rec, rem = int(g["cycles_received"]), int(g["cycles_remaining"])
+    if rem <= 0:
+        # nothing is left to receive (all authorised doses given, or more): like a supportive decree the request carries the
+        # previous decrees' invoices only - NO received / yet-to-be-received sentence in the medical report.
+        return None
     word = _UNIT_EN.get(_unit_word(g.get("protocol_key")), "dose")
     dates = []
     try:

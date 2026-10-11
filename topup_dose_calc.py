@@ -57,6 +57,21 @@ def load_map(force: bool = False):
                               counts_doses=bool(p.get("counts_doses")),
                               doses_per_decree=float(p["doses_per_decree"]) if p.get("doses_per_decree") is not None else 0,
                               core=by_plan.get(p["plan_text"], [])) for p in plans])
+        try:
+            pr = sb.select("topup_dose_patterns", select="protocol_key,pattern_name,label_ar,doses,gap_min,gap_max,is_default,max_multiple,undecided", filters={"is_active": "eq.true"}, limit=200)
+        except Exception:
+            pr = []
+        if pr:
+            rules = {}
+            for r in pr:
+                g = rules.setdefault(r["protocol_key"].lower(), dict(patterns=[], max_multiple=int(r.get("max_multiple") or 2), default=None, undecided=r.get("undecided") or "default"))
+                g["patterns"].append(dict(name=r["pattern_name"], label_ar=r.get("label_ar"), doses=(float(r["doses"]) if r.get("doses") is not None else None),
+                                          gap_min=int(r["gap_min"]), gap_max=int(r["gap_max"])))
+                if r.get("is_default"):
+                    g["default"] = r["pattern_name"]
+            for g in rules.values():
+                g["default"] = g["default"] or g["patterns"][0]["name"]
+            mp["patterns"] = rules
         log.info(f"dose map loaded from the database: {len(mp['plans'])} plan(s), {len(mp['keys'])} medication key(s)")
     except Exception as e:
         log.warning(f"dose map tables not readable ({type(e).__name__}: {str(e)[:120]}) - using {os.path.basename(MAP_JSON)}")
@@ -153,7 +168,13 @@ def _store_and_apply(c: dict, res: dict) -> dict:
                blocking=res["blocking"], info=res["info"], blocking_sig=sig, chain=T.to_jsonable(res["per_decree"]),
                calc_at=datetime.now(timezone.utc).isoformat(),
                reviewed_at=(prev.get("reviewed_at") if prev and prev.get("blocking_sig") == sig else None))
-    sb.upsert(CALC, [row], on_conflict="candidate_id")
+    extra = dict(invoices_only=bool(res.get("invoices_only")), invoiced_value=res.get("invoiced_value"),
+                 invoiced_doses=res.get("invoiced_doses"), avg_dose_value=res.get("avg_dose_value"), pattern=res.get("pattern"))
+    try:
+        sb.upsert(CALC, [{**row, **extra}], on_conflict="candidate_id")
+    except Exception as e:                       # migration 14 (new columns) not applied yet: store the classic columns only
+        log.warning(f"  candidate {cid}: new dose-calc columns not stored ({type(e).__name__}: {str(e)[:100]}) - run migration 14")
+        sb.upsert(CALC, [row], on_conflict="candidate_id")
     applied = False
     if res["supposed_known"] and not manual and (cur_r, cur_m) != (new_r, new_m):
         try:
@@ -179,10 +200,12 @@ def run(c: dict, smc, h) -> Optional[dict]:
             rows, n = _rows_for_decree(d, smc, h)
             chain.append(dict(decree_number=d, decree_date=(look.get(d) or {}).get("decree_date"), plan_text=plan_text,
                               rows=rows, pending=_pending(d), invoices=n))
-        res = T.compute_chain(chain, idx, mt)
+        res = T.compute_chain(chain, idx, mt, mp.get("patterns"))
         out = _store_and_apply(c, res)
         log.info(f"  [dose-calc] candidate {c['id']}: received {res['received']:g} of {res['supposed']:g} authorised, "
                  f"remaining {res['remaining']:g} over {len(chain)} decree(s)"
+                 f"{' [INVOICES ONLY - nothing left to receive]' if res.get('invoices_only') else ''}"
+                 f"{' pattern=' + str(res['pattern']) if res.get('pattern') else ''}"
                  f"{' (no counting plan - nothing written)' if out.get('skipped') else ' (counts written)' if out['applied'] else ' (manual counts kept)' if out['manual'] else ''}")
         for d in res["per_decree"]:
             log.info(f"      decree {d['decree_number']}: authorised {d['authorised']} | doses {d['doses']} | "
@@ -213,7 +236,7 @@ def refresh_unbilled(cid: int) -> bool:
             chain.append(dict(decree_number=d["decree_number"], decree_date=d.get("decree_date"), plan_text=d.get("plan_text"),
                               rows=rows, pending=_pending(d["decree_number"]), invoices=n))
         before = _current_counts(cid)
-        _store_and_apply(c[0], T.compute_chain(chain, idx, mt))
+        _store_and_apply(c[0], T.compute_chain(chain, idx, mt, mp.get("patterns")))
         return _current_counts(cid) != before
     except Exception as e:
         log.warning(f"[dose-calc] refresh skipped for candidate {cid}: {type(e).__name__}: {str(e)[:140]}")
@@ -264,6 +287,15 @@ def hold_message(cid: int, cur_received, cur_remaining) -> Optional[str]:
         return None                                           # a person changed the numbers = reviewed
     return ("عدد الجرعات المحسوب تلقائياً يحتاج مراجعة: " + " ؛ ".join(dc["blocking"]) +
             " — افتح الإدخال في صفحة «متابعة الخطابات الإداريه» وعدّل الأرقام أو اضغط «راجعت العدد».")
+
+
+def invoices_only(cid: int) -> bool:
+    """True when the stored automatic count says nothing is left to receive (received >= authorised)."""
+    try:
+        r = sb.select(CALC, select="invoices_only", filters={"candidate_id": f"eq.{cid}"}, limit=1)
+        return bool(r and r[0].get("invoices_only"))
+    except Exception:
+        return False
 
 
 def supposed_for(cid: int, cur_received, cur_remaining) -> Optional[float]:
