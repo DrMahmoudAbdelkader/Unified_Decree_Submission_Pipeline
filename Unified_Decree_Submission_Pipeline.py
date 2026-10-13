@@ -1502,13 +1502,23 @@ class SMCSession:
     def login(self) -> bool:
         log.info("Logging in to SMC …")
         try:
-            page = self.s.get(f"{BASE_URL}/smc/Home/Index", timeout=30)
+            # SMC changed its sign-in: the login form now lives at /smc/ and
+            # posts back to /smc/ (it used to be /smc/Home/Index, which no
+            # longer works for signing in). Field names are unchanged:
+            # __RequestVerificationToken, username, password.
+            login_url = f"{BASE_URL}/smc/"
+            page = self.s.get(login_url, timeout=30)
             soup = BeautifulSoup(page.text, "html.parser")
             tok = soup.find("input", {"name": "__RequestVerificationToken"})
             data = {"username": USERNAME, "password": PASSWORD}
             if tok:
                 data["__RequestVerificationToken"] = tok["value"]
-            resp = self.s.post(f"{BASE_URL}/smc/Home/Index", data=data, timeout=30, allow_redirects=True)
+            # The browser sends Origin/Referer on this POST; mirror it in case
+            # the server validates them.
+            resp = self.s.post(
+                login_url, data=data, timeout=30, allow_redirects=True,
+                headers={"Origin": BASE_URL, "Referer": login_url},
+            )
             if ("logout" in resp.text.lower() or "dashboard" in resp.text.lower()
                     or "مرحبا" in resp.text or "تسجيل الخروج" in resp.text):
                 self.logged_in = True
@@ -1521,8 +1531,17 @@ class SMCSession:
             return False
 
     def _session_expired(self, r: requests.Response) -> bool:
+        # Logged-out visitors now land on the /smc/ login page (previously
+        # /smc/Home/Index). NOTE: the logged-in home page at /smc/ also still
+        # contains the login <form>, so a username/password check would give
+        # false positives there. The reliable difference is the header marker
+        # "mcit-logged-out", which only the logged-out page carries.
         return r.status_code == 302 or (
-            r.status_code == 200 and "Home/Index" in r.url and "username" in r.text.lower()
+            r.status_code == 200
+            and (
+                "mcit-logged-out" in r.text
+                or ("Home/Index" in r.url and "username" in r.text.lower())
+            )
         )
 
     def _get(self, url: str, ajax: bool = False, referer: Optional[str] = None, **kw) -> Optional[requests.Response]:
