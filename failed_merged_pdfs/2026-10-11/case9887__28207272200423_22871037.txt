@@ -1,0 +1,8 @@
+case_id: 9887
+national_id: 28207272200423
+mdt (pre_request_id): 22871037
+failed_at_utc: 2026-10-11T06:37:17+00:00
+error: MDT #22873570 (recreated because: UHI reprint returned 404) also returned HTTP 404 on its print page after 3 attempt(s) at recreating it — giving up rather than recreating indefinitely. Check this case manually on SMC.
+
+The PDF is already signed, merged and compressed. To submit by hand: open
+Requests/Create?action=HopitalCreateNewRequest&prid=22871037 on the SMC site and attach it.
