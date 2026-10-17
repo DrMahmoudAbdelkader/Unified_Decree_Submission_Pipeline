@@ -284,7 +284,7 @@ jobs:
       # 30-minute batch and keeps the portal from seeing N simultaneous
       # authentications from one IP range.
       - name: Stagger login (slot ${{ matrix.batch.slot }})
-        run: sleep $(( (${{ matrix.batch.slot }} - 1) * 5 ))
+        run: sleep $(( (${{ matrix.batch.slot }} - 1) * 2 ))
 
       - name: Run prepare (MDT creation + document lookup) — ${{ matrix.batch.name }}
         env:
