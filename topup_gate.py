@@ -63,7 +63,7 @@ KIND_LABEL = {"TOPUP": "تجديد في نهاية المدة", "PREV_INCLUSIVE"
 # message prefixes written by the pipeline into decree_topup_candidates.evidence_message
 AUTO_RESOLVED_PREFIX = "تم الحل تلقائياً"          # == topup_resolution.AUTO_PREFIX
 NO_PREVIOUS_PREFIX = "لا يوجد قرار سابق"            # == the text topup_evidence_fetch.process() writes when nothing matched
-_CONTINUOUS_DEFAULT = ("hormonal", "zoladex", "hormonal_zoladex")
+_CONTINUOUS_DEFAULT = ("hormonal", "zoladex", "hormonal_zoladex", "tamoxifen", "aromasin", "tamoxifen_zoladex")
 
 
 # kinds that run the same workflow: cycle counts + signed invoices + report sentence
@@ -144,6 +144,14 @@ def _adjust(g: dict) -> dict:
         return g
     if (g.get("kind") or "TOPUP") not in TOPUP_LIKE:
         return g
+    # An entry whose later same-plan decree already covers a dose is closed here too, at submit time, not only when the
+    # lookup / evidence run happened to see it (TOPUP_GATE_RESOLVE=0 disables). Never raises.
+    if _env_on("TOPUP_GATE_RESOLVE"):
+        try:
+            import topup_resolution as _tr
+            _tr.auto_resolve_by_id(int(g["candidate_id"]))
+        except Exception as exc:
+            log.debug(f"gate-time auto-resolve skipped: {exc}")
     cand = _candidate(g["candidate_id"])
     if not cand:
         return g
@@ -207,7 +215,7 @@ def not_ready_message(g: dict) -> str:
         return head + (f"تقرير القرار السابق غير جاهز (الحالة: {g.get('evidence_status')}). "
                        f"افتح صفحة «متابعة الخطابات الإداريه» وتأكد من جلب التقرير أو اعتماده.")
     missing = []
-    if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
+    if not g.get("continuous") and (g.get("cycles_received") is None or g.get("cycles_remaining") is None):
         missing.append("عدد الدورات (المستلمة / المتبقية)")
     if g.get("evidence_status") != "READY" or not g.get("invoices_ok") or g.get("invoices_bad"):
         missing.append(f"الفواتير الموقّعة (الحالة: {g.get('evidence_status')}، سليمة: {g.get('invoices_ok')}، "

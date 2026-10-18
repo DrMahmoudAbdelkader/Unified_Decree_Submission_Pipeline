@@ -97,7 +97,7 @@ check("combined request: matches C + H + Z", sorted(x["decree_number"] for x in 
 check("  newest H (hormonal) + next Zoladex-containing C -> both", ov.cover(cand("hormonal_zoladex"), ["Z", "C", "H"]) == ["C", "H"])
 check("  newest is combined -> only it", ov.cover(cand("hormonal_zoladex"), ["Z", "H", "C"]) == ["C"])
 check("non-family protocol keeps newest only", ov.cover(cand("taxanes"), ["a", "b", "c"]) == ["c"])
-check("compat sets", ov.compatible_protocols("zoladex") == {"zoladex", "hormonal_zoladex"} and ov.compatible_protocols("taxanes") == {"taxanes"})
+check("compat sets", ov.compatible_protocols("zoladex") == {"zoladex", "hormonal_zoladex", "tamoxifen_zoladex"} and ov.compatible_protocols("taxanes") == {"taxanes"})
 
 # 8) overlap decree as the 'later resolver'
 setup(cand("zoladex"), [row(1, "C", "2026-10-11", COMB, 9000, 9000, "2027-04-09")])
@@ -145,6 +145,39 @@ check("cycles_statement: taxane keeps its sentence", (G.cycles_statement(1) or "
 G._gate = lambda case_id: dict(is_topup=True, kind="TOPUP", candidate_id=1, protocol_key="zoladex", no_previous=True, ready=True)
 check("with_invoices: no_previous -> original path untouched", G.with_invoices(1, "/tmp/x.pdf") == "/tmp/x.pdf")
 check("hold: continuous -> none", G._dose_hold(1, dict(is_topup=True, kind="TOPUP", candidate_id=1, continuous=True)) is None)
+
+# ---------- v2 additions: keyword fallback, tamoxifen family, gate-time resolve, continuous message ----------
+check("keyword: combined text spelled differently -> hormonal_zoladex", ov.protocol_of_description("علاج هرموني + زولاديكس (خط ثالث)") == "hormonal_zoladex")
+check("keyword: zoladex only (extra words)", ov.protocol_of_description("زولاديكس تحت الجلد لمدة 12 شهر شامل المتابعة") == "zoladex")
+check("keyword: fulvestrant 'العلاج الهرموني' text is NOT hormonal", ov.protocol_of_description("فلفسترانت كخط ثاني لمستجيبي العلاج الهرموني (قرار اول)") is None)
+check("keyword: taxane text -> None", ov.protocol_of_description(TAX) is None)
+check("tamoxifen_zoladex bridges to zoladex and hormonal", ov.compatible_protocols("zoladex") >= {"zoladex", "hormonal_zoladex", "tamoxifen_zoladex"}
+      and "tamoxifen" in ov.compatible_protocols("hormonal"))
+check("tamoxifen/aromasin are continuous", ov.is_continuous("tamoxifen") and ov.is_continuous("aromasin") and not ov.is_continuous("taxanes"))
+TAMZ = "علاج هرموني تاموكسفين المصاحب للزولاديكس تحت الجلد ( 6 اشهر) ودوائي وابحاث"
+rows2 = [row(1, "T", "2026-08-01", TAMZ, 9000, 0), row(1, "Z", "2026-02-01", ZOL6, 11325, 0)]
+setup(cand("zoladex"), rows2, view={"Z"})
+check("zoladex request: later tamoxifen+zoladex decree is the cover", ov.cover(cand("zoladex"), [x["decree_number"] for x in ov.matching_rows(cand("zoladex"))]) == ["T"])
+# unknown spelling (not in the map) still overlaps
+ODD = "علاج هرموني + زولاديكس خط ثالث ودوائي"
+setup(cand("zoladex"), [row(1, "Z", "2026-02-01", ZOL6, 11325, 0), row(1, "O", "2026-08-01", ODD, 9000, 0)], view={"Z"})
+check("description not in the map still matched as OVERLAP", [x["decree_number"] for x in ov.matching_rows(cand("zoladex"))] == ["Z", "O"])
+# request date: created_at fallback when optional columns do not exist
+setup(cand("zoladex"), [row(1, "202641505070", "2026-10-11", ZOL6, 11325, 5662.14, "2027-04-09")], req="2026-09-27T10:00:00")
+check("request_date falls back to created_at", str(rs.request_date(cand("zoladex"))) == "2026-09-27")
+# continuous: not-ready message never asks for counts
+msg = G.not_ready_message(dict(kind="TOPUP", continuous=True, cycles_received=None, cycles_remaining=None, evidence_status="PENDING", invoices_ok=0, invoices_bad=0))
+check("continuous not-ready message does not ask for cycle counts", "عدد الدورات" not in msg)
+msg = G.not_ready_message(dict(kind="TOPUP", continuous=False, cycles_received=None, cycles_remaining=None, evidence_status="READY", invoices_ok=2, invoices_bad=0))
+check("non-continuous still asks for cycle counts", "عدد الدورات" in msg)
+# gate-time resolve: a READY zoladex entry is closed at submit time when a later decree covers a dose
+setup(cand("zoladex"), [row(1, "202641505070", "2026-10-11", ZOL6, 11325, 5662.14, "2027-04-09")], req="2026-09-27T10:00:00")
+T["decree_topup_candidates"][0].update(evidence_status="READY", evidence_message="", protocol_key="zoladex")
+gate_real = G._candidate
+G._candidate = lambda cid: select("decree_topup_candidates", filters={"id": "eq.%s" % cid})[0]
+g = G._adjust(dict(base, evidence_status="READY", invoices_ok=2))
+check("gate-time auto-resolve closes the entry and blocks the send", g.get("auto_resolved") and not g["ready"])
+G._candidate = gate_real
 
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)

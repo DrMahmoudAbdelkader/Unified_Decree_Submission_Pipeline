@@ -61,12 +61,29 @@ def _tolerance() -> float:
         return 0.01
 
 
+# Columns of decree_request_cases that may hold the date the request really reached the website. The first one that exists
+# and is filled wins; otherwise created_at (the day the entry was made in the app, never LATER than the website date).
+# Override with TOPUP_REQUEST_DATE_COLUMNS=col1,col2
+def _request_date_columns() -> list:
+    raw = os.environ.get("TOPUP_REQUEST_DATE_COLUMNS")
+    return [x.strip() for x in raw.split(",") if x.strip()] if raw else ["submitted_at", "website_request_date", "request_date"]
+
+
 def request_date(c: dict) -> Optional[date]:
     """Date of the request that received the letter (the entry's source case)."""
     if not c.get("source_case_id"):
         return None
+    flt = {"id": f"eq.{c['source_case_id']}"}
+    for col in _request_date_columns():
+        try:
+            r = sb.select("decree_request_cases", select=col, filters=flt, limit=1)
+            d = ov._d((r[0].get(col) or "")[:10]) if r else None
+            if d:
+                return d
+        except Exception:
+            continue                                   # column does not exist in this database
     try:
-        r = sb.select("decree_request_cases", select="created_at", filters={"id": f"eq.{c['source_case_id']}"}, limit=1)
+        r = sb.select("decree_request_cases", select="created_at", filters=flt, limit=1)
         return ov._d((r[0].get("created_at") or "")[:10]) if r else None
     except Exception as e:
         log.warning(f"request date of case {c.get('source_case_id')} unreadable: {e}")

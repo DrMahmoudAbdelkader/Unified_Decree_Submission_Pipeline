@@ -51,6 +51,10 @@ COMPONENTS: Dict[str, Set[str]] = {
     "hormonal": {"hormonal"},
     "zoladex": {"zoladex"},
     "hormonal_zoladex": {"hormonal", "zoladex"},
+    # the other hormonal plans of topup_core_meds_map.json. Delete these three lines to keep them as stand-alone protocols.
+    "tamoxifen": {"hormonal"},
+    "aromasin": {"hormonal"},
+    "tamoxifen_zoladex": {"hormonal", "zoladex"},
 }
 
 
@@ -78,7 +82,7 @@ def continuous_protocols() -> Set[str]:
     medical report and no cycle counts are required. Override with TOPUP_CONTINUOUS_PROTOCOLS=a,b,c"""
     raw = os.environ.get("TOPUP_CONTINUOUS_PROTOCOLS")
     if raw is None:
-        raw = "hormonal,zoladex,hormonal_zoladex"
+        raw = "hormonal,zoladex,hormonal_zoladex,tamoxifen,aromasin,tamoxifen_zoladex"
     return {_norm(x) for x in raw.split(",") if x.strip()}
 
 
@@ -105,8 +109,36 @@ def _plan_protocols() -> Dict[str, str]:
     return _PLAN_PROTO
 
 
+def _keyword_protocol(desc) -> Optional[str]:
+    """Fallback for a decree description that is NOT spelled exactly like a row of topup_regimen_map (the site's text
+    drifts: extra words, different spelling). Only the hormonal / Zoladex family is recognised; fulvestrant / CDK4/6 /
+    chemotherapy texts mention 'العلاج الهرموني' too and are deliberately left alone. TOPUP_OVERLAP_KEYWORDS=0 disables."""
+    if (os.environ.get("TOPUP_OVERLAP_KEYWORDS") or "1").strip().lower() in ("0", "false", "off", "no"):
+        return None
+    k = T.plan_key(desc)
+    if not k or any(w in k for w in ("فلفسترانت", "فولفسترانت", "cdk", "كيماوي", "كيميائي", "كيميايي", "تاكسان", "انثراسيكلين")):
+        return None
+    z = "زولاديكس" in k or "zoladex" in k or "جوسيرلين" in k
+    tam = "تاموكس" in k
+    exe = "اكسيميستان" in k or "اروماسين" in k
+    h = "هرموني" in k
+    if z and (h or tam):
+        return "tamoxifen_zoladex" if tam else "hormonal_zoladex"
+    if z:
+        return "zoladex"
+    if tam:
+        return "tamoxifen"
+    if exe:
+        return "aromasin"
+    if h:
+        return "hormonal"
+    return None
+
+
 def protocol_of_description(desc) -> Optional[str]:
-    return _plan_protocols().get(T.plan_key(desc)) if desc else None
+    if not desc:
+        return None
+    return _plan_protocols().get(T.plan_key(desc)) or _keyword_protocol(desc)
 
 
 def _app_protocol(decree: str) -> Optional[str]:
