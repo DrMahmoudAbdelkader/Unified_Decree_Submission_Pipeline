@@ -123,6 +123,16 @@ def pick_decree(c: dict) -> tuple[str | None, str]:
     if status in ("PENDING", "RUNNING"):
         return None, "WAIT_LOOKUP"
     same_plan = [r for r in look if r.get("match_kind") == "PLAN"]
+    if c.get("protocol_key"):                 # also decrees of an overlapping protocol (hormonal <-> hormonal+Zoladex <-> Zoladex)
+        try:
+            import topup_overlap as ov
+            from datetime import date as _date
+            allm = ov.matching_rows(c, only_plan=True)
+            if allm:
+                same_plan = [{"decree_number": r["decree_number"], "decree_date": r.get("decree_date")}
+                             for r in sorted(allm, key=lambda r: (r["_date"] or _date.min, r["decree_number"]), reverse=True)]
+        except Exception as e:
+            log.warning(f"overlap matching skipped for candidate {cid}: {e}")
     if same_plan:
         return str(same_plan[0]["decree_number"]), "أحدث قرار لنفس الخطة"
     if status == "ERROR":
@@ -280,7 +290,7 @@ def main():
     if not u:
         log.error("No SMC credentials set."); sys.exit(1)
 
-    prm = {"select": "id,patient_id,manual_decree_numbers,lookup_status",
+    prm = {"select": "id,patient_id,manual_decree_numbers,lookup_status,protocol_key",
            "kind": "eq.PREV_REPORT", "evidence_status": "eq.REPORT_PENDING",
            "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)", "order": "id.asc", "limit": MAX_REPORTS}
     if ONLY_ID_FILTER:

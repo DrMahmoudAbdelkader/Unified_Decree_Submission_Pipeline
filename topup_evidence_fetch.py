@@ -38,6 +38,7 @@ from bs4 import BeautifulSoup
 import Unified_Decree_Submission_Pipeline as _p
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
+import topup_overlap as ov
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("topup_evidence_fetch")
@@ -115,8 +116,9 @@ def _db_decrees(c: dict) -> list[str]:
     plan_ids = {x["treatment_plan_id"] for x in cases if x.get("treatment_plan_id")}
     if not plan_ids:
         return []
+    protos = sorted(ov.compatible_protocols(c["protocol_key"]) | {str(c["protocol_key"])})
     plans = sb.select("decree_treatment_plans", select="id",
-                      filters={"topup_protocol": f"eq.{c['protocol_key']}",
+                      filters={"topup_protocol": "in.(" + ",".join(protos) + ")",      # own protocol + overlapping ones
                                "id": "in.(" + ",".join(map(str, plan_ids)) + ")"}, limit=1000)
     ok_plans = {p["id"] for p in plans}
     case_ids = [x["id"] for x in cases if x["treatment_plan_id"] in ok_plans and x["id"] != c["source_case_id"]]
@@ -144,19 +146,55 @@ def _ensure_lookup(c: dict, smc) -> None:
         log.warning(f"  candidate {c['id']}: inline patient lookup failed: {type(e).__name__}: {e}")
 
 
-def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
-    """[(issue_date 'YYYY-MM-DD' or '', decree_number)] of the patient's decrees on SMC that belong to
-    the same PLAN / PROTOCOL (match computed in the DB view), issued on or before the declined
-    request. Oldest first."""
+def _refresh_lookup_if_stale(c: dict, smc) -> None:
+    """The auto-resolution compares the VALUE LEFT of a later decree, so that number must be fresh. A lookup older than
+    TOPUP_LOOKUP_MAX_AGE_H hours (default 20; 0 = never refresh) is redone inline."""
+    if smc is None:
+        return
+    if c.get("lookup_status") != "DONE":
+        _ensure_lookup(c, smc)
+        return
     try:
-        rows = sb.select("decree_topup_lookup_view", select="decree_number,decree_date,match_kind",
-                         filters={"candidate_id": f"eq.{c['id']}", "match_kind": "not.is.null"},
-                         order="decree_date.asc.nullsfirst", limit=200)
+        max_h = float(os.environ.get("TOPUP_LOOKUP_MAX_AGE_H") or "20")
+    except ValueError:
+        max_h = 20.0
+    if max_h <= 0:
+        return
+    try:
+        r = sb.select("decree_topup_decree_lookup", select="fetched_at", filters={"candidate_id": f"eq.{c['id']}"},
+                      order="fetched_at.desc", limit=1)
+        ts = (r[0].get("fetched_at") if r else None)
+        age_h = ((datetime.now(timezone.utc) - datetime.fromisoformat(str(ts).replace("Z", "+00:00"))).total_seconds() / 3600
+                 if ts else None)
+    except Exception:
+        return
+    if age_h is None or age_h < max_h:
+        return
+    try:
+        import topup_decree_lookup as lk
+        n = lk.lookup_one(smc, {"id": c["id"], "patient_id": c.get("patient_id")})
+        sb.update(CAND, c["id"], {"lookup_status": "DONE", "lookup_message": f"{n} قرار",
+                                  "lookup_finished_at": datetime.now(timezone.utc).isoformat()})
+        log.info(f"  candidate {c['id']}: patient lookup was {age_h:.0f} h old - refreshed ({n} decree(s))")
     except Exception as e:
-        log.warning(f"  lookup view not readable (migration 06?): {e}")
+        log.warning(f"  candidate {c['id']}: lookup refresh failed, using the stored one: {type(e).__name__}: {e}")
+
+
+def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
+    """[(issue_date 'YYYY-MM-DD' or '', decree_number)] of the patient's decrees on SMC that belong to the same PLAN /
+    PROTOCOL (the DB view's match) PLUS decrees of an OVERLAPPING protocol (hormonal <-> hormonal+Zoladex <-> Zoladex, see
+    topup_overlap.py). Oldest first.
+    Decrees issued AFTER the request that got the letter are kept (TOPUP_INCLUDE_LATER_DECREES=0 drops them like before):
+    when such a decree exists and still covers a dose the entry is auto-resolved before we get here (topup_resolution.py);
+    when it is used up, it is the newest decree and its bills are the ones to attach."""
+    try:
+        rows = ov.matching_rows(c)
+    except Exception as e:
+        log.warning(f"  lookup rows not readable (migration 06?): {e}")
         return []
     cutoff = ""
-    if c.get("source_case_id"):
+    if (os.environ.get("TOPUP_INCLUDE_LATER_DECREES") or "1").strip().lower() in ("0", "false", "off", "no") \
+            and c.get("source_case_id"):
         try:
             src = sb.select("decree_request_cases", select="created_at",
                             filters={"id": f"eq.{c['source_case_id']}"}, limit=1)
@@ -207,7 +245,9 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
             except Exception as e:
                 log.warning(f"max_previous_decrees lookup skipped: {e}")
         return decrees[-int(lim):] if lim and int(lim) > 1 else decrees
-    return decrees[-1:]
+    # Hormonal / Zoladex / combined: the newest decree(s) that together contain what the request asks for (see topup_overlap.cover);
+    # every other protocol: the single newest decree. Older decrees of the same plan are never attached.
+    return ov.cover(c, decrees)
 
 
 # --------------------------------------------------------------------------- SMC calls
@@ -769,6 +809,11 @@ def purge_candidate(cid, s3, bucket):
 # --------------------------------------------------------------------------- one candidate
 def process(c: dict, smc: SMCSession, s3, bucket: str):
     cid = c["id"]
+    # 1) fresh patient decrees, 2) already resolved by a later same-plan decree with enough value left? -> close, nothing to request
+    _refresh_lookup_if_stale(c, smc)
+    import topup_resolution
+    if topup_resolution.auto_resolve(c):
+        return
     sb.update(CAND, cid, {"evidence_status": "FETCHING"})
     nid = national_id_of(c.get("patient_id"))
     decrees = previous_decrees(c, smc)
@@ -851,8 +896,8 @@ def write_run_summary(results):
     on the page, not a crash) - so say it loudly here: warning annotations + the run's summary tab."""
     if not results:
         return
-    good = [r for r in results if r[1] == "READY"]
-    bad = [r for r in results if r[1] != "READY"]
+    good = [r for r in results if r[1] == "READY" or str(r[2]).startswith("تم الحل تلقائياً")]
+    bad = [r for r in results if r not in good]
     log.info(f"SUMMARY: {len(good)} READY, {len(bad)} need attention out of {len(results)}")
     for cid, st, msg in bad:
         print(f"::warning title=Top-up entry {cid} - {st}::{msg or 'see the entry on the page'}")
@@ -881,7 +926,7 @@ def main():
     except Exception as e:
         log.warning(f"stale release skipped: {e}")
     flt = {"evidence_status": "eq.PENDING", "protocol_key": "not.is.null",
-           "status": "not.in.(SUBMITTED,DISMISSED)"}
+           "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)"}
     only = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
     if only:                       # the page asked for these entries only
         flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
@@ -926,7 +971,7 @@ def requeue_no_previous(only) -> int:
     """Entries marked NO_PREVIOUS_DECREE BEFORE the patient lookup existed (or before it ran) stay stuck even though the
     lookup now lists matching decrees. Put them back in the queue as soon as the lookup is DONE and shows a match."""
     flt = {"evidence_status": "eq.NO_PREVIOUS_DECREE", "lookup_status": "eq.DONE", "protocol_key": "not.is.null",
-           "status": "not.in.(SUBMITTED,DISMISSED)"}
+           "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)"}
     if only:
         flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
     n = 0

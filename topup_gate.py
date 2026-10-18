@@ -21,6 +21,16 @@ topup_evidence_gate(case_id), migration 07):
     ID_CARD       «تم التصحيح» pressed on the page                  -> nothing appended (the
                   corrected card is already inside the patient's own documents)
 
+ADJUSTMENTS applied on top of the DB gate (see _adjust()):
+    * NO PREVIOUS DECREE  - the patient has no earlier decree of the same plan (and the patient lookup finished): the
+                            letter cannot be answered with bills, so the request is sent NORMALLY (no invoices appended,
+                            no dose sentence) instead of being blocked.
+    * AUTO-RESOLVED       - topup_resolution.py closed the entry (a later same-plan decree already has enough value
+                            left): the request is NOT sent; the message tells the operator why.
+    * CONTINUOUS PLANS    - hormonal / Zoladex / hormonal+Zoladex (no upper dose limit): no cycle counts required, no dose
+                            review hold, and NO "received / yet to be received" sentence in the medical report - only the
+                            previous decree's bills are attached.
+
 A request that is not linked to any candidate is not a top-up: every function is then a no-op
 and the pipeline behaves exactly as before. If the DB function itself cannot be called (migration
 not applied) the gate FAILS OPEN with a warning, so normal requests are never blocked by it.
@@ -50,6 +60,12 @@ KIND_LABEL = {"TOPUP": "تجديد في نهاية المدة", "PREV_INCLUSIVE"
               "ID_CARD": "بطاقة الرقم القومي"}
 
 
+# message prefixes written by the pipeline into decree_topup_candidates.evidence_message
+AUTO_RESOLVED_PREFIX = "تم الحل تلقائياً"          # == topup_resolution.AUTO_PREFIX
+NO_PREVIOUS_PREFIX = "لا يوجد قرار سابق"            # == the text topup_evidence_fetch.process() writes when nothing matched
+_CONTINUOUS_DEFAULT = ("hormonal", "zoladex", "hormonal_zoladex")
+
+
 # kinds that run the same workflow: cycle counts + signed invoices + report sentence
 TOPUP_LIKE = ("TOPUP", "PREV_INCLUSIVE")
 
@@ -70,7 +86,7 @@ def _rpc(name: str, body: dict):
     return r.json()
 
 
-def _gate(case_id: int) -> dict:
+def _gate_raw(case_id: int) -> dict:
     """{'is_topup': False} for a normal request. Fails open (with a warning) if the RPC is missing.
 
     A READY_TO_SUBMIT request that nobody linked to a letter (it was created in the normal entry module, not from the top-up
@@ -92,6 +108,71 @@ def _gate(case_id: int) -> dict:
         except Exception as exc:                                   # migration 14 not applied: behave as before
             log.debug(f"topup autolink skipped for case {case_id}: {exc}")
     return g
+
+
+def _env_on(name: str, default: bool = True) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return default if not v else v not in ("0", "false", "off", "no")
+
+
+def _is_continuous(protocol: Optional[str]) -> bool:
+    try:
+        import topup_overlap as ov
+        return ov.is_continuous(protocol)
+    except Exception:
+        raw = os.environ.get("TOPUP_CONTINUOUS_PROTOCOLS")
+        names = [x.strip().lower() for x in raw.split(",") if x.strip()] if raw is not None else list(_CONTINUOUS_DEFAULT)
+        return (protocol or "").strip().lower() in names
+
+
+def _candidate(candidate_id) -> dict:
+    """The few candidate columns the adjustments need; {} on any problem (= no adjustment, old behaviour)."""
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_candidates", headers=_hdr(), timeout=30, params={
+            "select": "status,evidence_status,evidence_message,lookup_status,manual_decree_numbers,manual_receipt_ids,protocol_key",
+            "id": f"eq.{int(candidate_id)}", "limit": 1})
+        rows = r.json() if r.ok else []
+        return rows[0] if rows else {}
+    except Exception as exc:
+        log.warning(f"topup candidate {candidate_id} not readable ({exc}) - gate adjustments skipped")
+        return {}
+
+
+def _adjust(g: dict) -> dict:
+    """See the module doc (ADJUSTMENTS). Only touches TOPUP / PREV_INCLUSIVE entries."""
+    if not g.get("is_topup") or not g.get("candidate_id"):
+        return g
+    if (g.get("kind") or "TOPUP") not in TOPUP_LIKE:
+        return g
+    cand = _candidate(g["candidate_id"])
+    if not cand:
+        return g
+    msg = (cand.get("evidence_message") or "").strip()
+    protocol = g.get("protocol_key") or cand.get("protocol_key")
+    g["continuous"] = _is_continuous(protocol)
+
+    if cand.get("status") == "RESOLVED" and msg.startswith(AUTO_RESOLVED_PREFIX):
+        g["auto_resolved"] = True
+        g["auto_resolved_message"] = msg
+        g["ready"] = False
+        return g
+
+    if (not g.get("ready") and _env_on("TOPUP_NO_PREVIOUS_PASS")
+            and cand.get("evidence_status") == "NO_PREVIOUS_DECREE" and msg.startswith(NO_PREVIOUS_PREFIX)
+            and cand.get("lookup_status") == "DONE"
+            and not cand.get("manual_decree_numbers") and not cand.get("manual_receipt_ids")):
+        g["no_previous"] = True
+        g["ready"] = True
+        return g
+
+    if (g["continuous"] and not g.get("ready") and g.get("evidence_status") == "READY"
+            and g.get("invoices_ok") and not g.get("invoices_bad")):
+        g["ready"] = True                      # continuous plan: bills are enough, no cycle counts needed
+    return g
+
+
+def _gate(case_id: int) -> dict:
+    return _adjust(_gate_raw(case_id))
 
 
 def _documents(candidate_id: int) -> List[dict]:
@@ -116,6 +197,8 @@ def _unit_word(protocol_key: Optional[str]) -> str:
 
 # --------------------------------------------------------------------------- messages
 def not_ready_message(g: dict) -> str:
+    if g.get("auto_resolved"):
+        return g.get("auto_resolved_message") or "تم الحل تلقائياً — لا حاجة لطلب جديد."
     kind = g.get("kind") or "TOPUP"
     head = f"طلب «{KIND_LABEL.get(kind, kind)}» لا يمكن إرساله بعد: "
     if kind == "ID_CARD":
@@ -139,6 +222,8 @@ def _dose_hold(case_id: int, g: dict) -> Optional[str]:
     try:
         if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE or not g.get("candidate_id"):
             return None
+        if g.get("continuous") or g.get("no_previous"):
+            return None                                     # no dose counts matter for these: nothing to review
         import topup_dose_calc as dc
         if not dc.enabled():
             return None
@@ -176,6 +261,8 @@ def cycles_statement(case_id: int) -> Optional[str]:
     g = _gate(case_id)
     if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE:
         return None
+    if g.get("continuous") or g.get("no_previous"):
+        return None                  # hormonal / Zoladex: continuous regimen - never state received / yet-to-be-received doses
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
     rec, rem = int(g["cycles_received"]), int(g["cycles_remaining"])
@@ -204,6 +291,9 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
     normal request or an ID_CARD letter the original path is returned untouched."""
     g = _gate(case_id)
     if not g.get("is_topup") or g.get("kind") not in ("TOPUP", "PREV_INCLUSIVE", "PREV_REPORT"):
+        return patient_pdf_path
+    if g.get("no_previous"):
+        log.info(f"  [top-up] case {case_id}: no previous decree of the same plan - request sent normally (no invoices appended).")
         return patient_pdf_path
     docs = _documents(int(g["candidate_id"]))
     if not docs:

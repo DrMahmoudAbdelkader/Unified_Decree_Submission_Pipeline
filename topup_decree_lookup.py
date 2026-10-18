@@ -263,6 +263,11 @@ def main():
                 _set(c["id"], lookup_status="DONE", lookup_message=f"{n} قرار",
                      lookup_finished_at=datetime.now(timezone.utc).isoformat())
                 log.info(f"candidate {c['id']}: {n} decree(s)")
+                try:                                    # a later same-plan decree with enough value left closes the entry now
+                    import topup_resolution
+                    topup_resolution.auto_resolve_by_id(c["id"])
+                except Exception as e:
+                    log.warning(f"candidate {c['id']}: auto-resolve skipped ({type(e).__name__}: {str(e)[:120]})")
             except Exception as e:
                 log.exception(f"candidate {c['id']} lookup failed")
                 _set(c["id"], lookup_status="ERROR", lookup_message=f"{type(e).__name__}: {str(e)[:200]}",
