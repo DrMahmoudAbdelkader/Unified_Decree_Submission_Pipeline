@@ -116,12 +116,18 @@ def _keyword_protocol(desc) -> Optional[str]:
     if (os.environ.get("TOPUP_OVERLAP_KEYWORDS") or "1").strip().lower() in ("0", "false", "off", "no"):
         return None
     k = T.plan_key(desc)
-    if not k or any(w in k for w in ("فلفسترانت", "فولفسترانت", "cdk", "كيماوي", "كيميائي", "كيميايي", "تاكسان", "انثراسيكلين")):
+    # other drug families, and SUPPORTIVE plans (bone protection with zoledronic acid etc.) that only MENTION hormonal
+    # therapy to describe the patients ("... للمرضي الذين يتلقوا علاج هرموني ...") - never part of the family
+    if not k or any(w in k for w in (
+            "فلفسترانت", "فولفسترانت", "cdk", "كيماوي", "كيميائي", "كيميايي", "تاكسان", "انثراسيكلين",
+            "عظام", "زيلودرونيك", "زوليدرونيك", "zoledron", "دينوسوماب", "denosumab", "بايفوسفونيت", "مساعد", "تدعيمي", "حمض")):
         return None
     z = "زولاديكس" in k or "zoladex" in k or "جوسيرلين" in k
     tam = "تاموكس" in k
     exe = "اكسيميستان" in k or "اروماسين" in k
-    h = "هرموني" in k
+    # 'hormonal' only counts when it is the TREATMENT NAMED AT THE START of the plan ("علاج هرموني ...", "هرموني ..."),
+    # not a word somewhere in the sentence
+    h = k.startswith("علاج هرموني") or k.startswith("هرموني")
     if z and (h or tam):
         return "tamoxifen_zoladex" if tam else "hormonal_zoladex"
     if z:

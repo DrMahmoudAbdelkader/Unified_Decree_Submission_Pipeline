@@ -179,5 +179,12 @@ g = G._adjust(dict(base, evidence_status="READY", invoices_ok=2))
 check("gate-time auto-resolve closes the entry and blocks the send", g.get("auto_resolved") and not g["ready"])
 G._candidate = gate_real
 
+BONE = "العلاج المساعد لوقاية العظام للمرضي الذين يتلقوا علاج هرموني حمض الزيلودرونيك ( جرعة واحدة ) (شامل المتابعه والتحاليل)"
+check("bone-protection zoledronic decree is NOT in the hormonal/zoladex family", ov.protocol_of_description(BONE) is None)
+setup(cand("zoladex"), [row(1, "Z", "2026-02-01", ZOL6, 11325, 0), row(1, "B", "2026-09-01", BONE, 500, 500)], view={"Z"})
+check("bone decree never matched as OVERLAP for zoladex", [x["decree_number"] for x in ov.matching_rows(cand("zoladex"))] == ["Z"])
+setup(cand("hormonal"), [row(1, "H", "2026-02-01", HORM, 6000, 0), row(1, "B", "2026-09-01", BONE, 500, 500)], view={"H"})
+check("bone decree never matched as OVERLAP for hormonal", [x["decree_number"] for x in ov.matching_rows(cand("hormonal"))] == ["H"])
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 sys.exit(0 if all(ok) else 1)
