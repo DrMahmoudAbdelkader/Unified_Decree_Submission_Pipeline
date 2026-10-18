@@ -59,8 +59,9 @@ NOT_APPROVED_RE = re.compile(r"غير\s*معتمد|مرفوض|ملغ|رفض")
 SIGNED_MIN_IMAGES = int(os.environ.get("SIGNED_MIN_IMAGES") or "4")
 SIGNED_MIN_BLUE_PX = int(os.environ.get("SIGNED_MIN_BLUE_PX") or "2500")   # blue px the signing must ADD (100 dpi)
 LAYOUT_MIN_SPAN_FRAC = float(os.environ.get("LAYOUT_MIN_SPAN_FRAC") or "0.35")  # label columns must span this much of the page width
-SIGNATURE_BASE_URL = (os.environ.get("SIGNATURE_BASE_URL") or
-                      "https://qayhkvtgkflxvlhstiuz.supabase.co/storage/v1/object/public/signature_files").rstrip("/")
+# Optional override of the public bucket that holds 1b/2b/3b/4b/stamp.png. NO hard-coded project address any more (the old one
+# pointed at the previous Supabase project): the default is this run's own SUPABASE_URL, see _assets().
+SIGNATURE_BASE_URL = (os.environ.get("SIGNATURE_BASE_URL") or "").rstrip("/")
 SIGNATURE_FILES = {"sig1": "1b.png", "sig2": "2b.png", "sig3": "3b.png", "sig4": "4b.png", "stamp": "stamp.png"}
 DELAY = 0.4
 CAND, INV = "decree_topup_candidates", "decree_topup_invoices"
@@ -350,22 +351,57 @@ _ASSETS = {}
 
 
 def _assets() -> dict:
-    """Download the 5 signing images from the public signature_files bucket (once per run)."""
-    if not _ASSETS:
-        from PIL import Image
-        d = os.path.join(tempfile.gettempdir(), "topup_signature_assets")
-        os.makedirs(d, exist_ok=True)
+    """The 5 signing images (sig1-4 + stamp), once per run. Tried in this order:
+      1) the private decree-assets bucket through supabase_storage (service key) - exactly what the prepare / finalize
+         pipeline signs with, cached in /tmp/decree_assets by the workflow;
+      2) the public signature_files bucket of THIS project (SUPABASE_URL), then SIGNATURE_BASE_URL if that variable is set.
+    On failure the error starts with SIGNING_ASSETS and lists what each source answered (status + file), so the log and
+    verification.error say what is really wrong instead of a guess."""
+    if _ASSETS:
+        return _ASSETS
+    from PIL import Image
+    problems = []
+
+    def _verified(paths: dict) -> bool:
+        if len(paths) != len(SIGNATURE_FILES):
+            problems.append(f"missing {sorted(set(SIGNATURE_FILES) - set(paths))}")
+            return False
+        for k, pth in paths.items():
+            Image.open(pth).verify()                       # must really be an image, not an error page
+        return True
+
+    try:
+        import supabase_storage as st
+        a = st.fetch_signing_and_template_assets("/tmp/decree_assets") or {}
+        got = {k: a[k] for k in SIGNATURE_FILES if a.get(k) and os.path.exists(a[k])}
+        if _verified(got):
+            _ASSETS.update(got)
+            log.info("signing images: loaded from the decree-assets bucket")
+            return _ASSETS
+    except Exception as e:
+        problems.append(f"decree-assets: {type(e).__name__}: {str(e)[:120]}")
+
+    bases = [b for b in (SIGNATURE_BASE_URL, f"{SUPABASE_URL}/storage/v1/object/public/signature_files" if SUPABASE_URL else "") if b]
+    d = os.path.join(tempfile.gettempdir(), "topup_signature_assets")
+    os.makedirs(d, exist_ok=True)
+    for base in dict.fromkeys(bases):
         got = {}
-        for key, fn in SIGNATURE_FILES.items():
-            r = requests.get(f"{SIGNATURE_BASE_URL}/{fn}", timeout=60)
-            r.raise_for_status()
-            path = os.path.join(d, fn)
-            with open(path, "wb") as f:
-                f.write(r.content)
-            Image.open(path).verify()                      # must really be an image, not an error page
-            got[key] = path
-        _ASSETS.update(got)
-    return _ASSETS
+        try:
+            for key, fn in SIGNATURE_FILES.items():
+                r = requests.get(f"{base}/{fn}", timeout=60)
+                if not r.ok:
+                    raise RuntimeError(f"HTTP {r.status_code} for {fn}")
+                path = os.path.join(d, fn)
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                got[key] = path
+            if _verified(got):
+                _ASSETS.update(got)
+                log.info(f"signing images: loaded from {base.split('/storage/')[0]}")
+                return _ASSETS
+        except Exception as e:
+            problems.append(f"{base.split('/storage/')[0]}: {type(e).__name__}: {str(e)[:100]}")
+    raise RuntimeError("SIGNING_ASSETS: " + " | ".join(problems))
 
 
 def sign_with_script(data: bytes):
@@ -706,14 +742,14 @@ def render_details_pdf(smc: SMCSession, receipt: str) -> bytes:
 def friendly_error(err: str) -> str:
     """Short Arabic hint for an invoice that could not be built (the raw error stays in verification.error)."""
     e = (err or "").lower()
+    if "signing_assets" in e:
+        return "تعذّر تحميل صور التوقيع/الختم: " + (err or "").split("SIGNING_ASSETS:", 1)[-1].strip()[:160]
     if "login page" in e or "not found on the rendered page" in e:
         return "انتهت جلسة SMC أثناء طباعة الفاتورة — أعد المحاولة"
     if "timeout" in e:
         return "انتهت مهلة تحميل صفحة الفاتورة — أعد المحاولة"
     if "label" in e or "detect" in e or "column" in e:
         return "تعذّر تحديد خانات التوقيع في صفحة الفاتورة — راجع شكل الفاتورة"
-    if "signature" in e or "png" in e or "image" in e:
-        return "تعذّر تحميل صور التوقيع/الختم — راجع مخزن signature_files"
     return "تعذّر إنشاء/توقيع الفاتورة: " + (err or "")[:90]
 
 
