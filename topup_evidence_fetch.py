@@ -26,7 +26,8 @@ current invoice has. For EVERY invoice, whatever its status:
   3. verify: the rendered PDF really is this receipt, ink was added, the 4 label columns look sane
 Result row: signed_source='rendered_signed'; status OK when every check passes, otherwise REVIEW
 (file kept, message says which check failed); FAILED only if rendering/signing itself raised.
-Nothing is ever uploaded back to SMC.
+Nothing is uploaded to SMC EXCEPT one thing: topup_unbilled.py creates the bill (HospDecreeReceipts/Create, titled
+"<name> - <national id>") for items that were entered on a previous decree but never billed (switch: TOPUP_BILL_UNBILLED).
 """
 from __future__ import annotations
 import hashlib, io, logging, os, re, sys, tempfile, time
@@ -39,6 +40,7 @@ import Unified_Decree_Submission_Pipeline as _p
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
 import topup_overlap as ov
+import topup_unbilled as ub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("topup_evidence_fetch")
@@ -252,10 +254,17 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
 
 
 # --------------------------------------------------------------------------- SMC calls
-def list_receipts(smc: SMCSession, decree: str) -> list[dict]:
+def list_receipts(smc: SMCSession, decree: str, bill_unbilled: bool = True) -> list[dict]:
     """POST decreeId=<decree> exactly like the Create page's own XHR. Returns one dict per invoice:
     receipt_id, decree_id, claim_id, status_code ('M1'...), status_text, approved, amount,
-    reg_date, has_attachment."""
+    reg_date, has_attachment, title.
+
+    CHECKPOINT (bill_unbilled=True, the default): BEFORE listing, topup_unbilled.ensure_billed() looks for dispensing items
+    that were entered on the decree but never put into a bill, and creates that bill (titled "<name> - <national id>") so
+    the listing below contains ALL of the decree's bills. Every caller (evidence fetch, dose count) goes through here.
+    The outcome is kept in ub.LAST[decree]; process() refuses to call the evidence READY when it was BLOCKED / FAILED."""
+    if bill_unbilled:
+        ub.ensure_billed(smc, decree, BASE_URL, list_receipts)
     hdr = {"X-Requested-With": "XMLHttpRequest",
            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
            "Referer": CREATE_URL.format(decree=decree), "Origin": BASE_URL}
@@ -290,7 +299,7 @@ def parse_receipt_table(html: str) -> list[dict]:
         if len(txt) > 6:
             m = re.search(r"[\d,]+(?:\.\d+)?", txt[6])
             amount = float(m.group(0).replace(",", "")) if m else None
-        out.append({"receipt_id": rid, "decree_id": hid("DECREEID"), "claim_id": hid("CLAIMID"),
+        out.append({"receipt_id": rid, "title": txt[1] if len(txt) > 1 else "", "decree_id": hid("DECREEID"), "claim_id": hid("CLAIMID"),
                     "status_code": hid("STATUSID"), "status_text": status_text,
                     "approved": bool(APPROVED_RE.search(status_text)) and not NOT_APPROVED_RE.search(status_text),
                     "amount": amount, "reg_date": txt[2] if len(txt) > 2 else "",
@@ -862,7 +871,7 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
     work, problems = [], []          # work: (decree, listing_info)
     for d in decrees:
         try:
-            rows = list_receipts(smc, d)
+            rows = list_receipts(smc, d)          # also bills any entered-but-unbilled items first (topup_unbilled)
         except Exception as e:
             problems.append(f"{d}: {type(e).__name__}: {str(e)[:80]}"); continue
         time.sleep(DELAY)
@@ -873,6 +882,15 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
         if not rows:
             problems.append(f"{d}: لا توجد فواتير")
         work.extend((d, x) for x in rows)
+    # A decree that still holds items outside any bill (and SMC would not let us bill them) must NOT be treated as complete:
+    # attaching only its older bill would silently drop dispensings.
+    incomplete = ub.blocking(decrees)
+    if incomplete:
+        msg = " ; ".join(f"{x['decree']}: {x['message']}" for x in incomplete)
+        log.warning(f"  candidate {cid}: unbilled items could not be billed - {msg}")
+        sb.update(CAND, cid, {"evidence_status": "FAILED",
+                              "evidence_message": ("بنود مصروفة غير مفوترة على القرار — " + msg)[:480]})
+        return
     # manually typed receipt ids: decree is read off the invoice page itself
     for rid in manual_receipts:
         if any(x["receipt_id"] == rid for _, x in work):
