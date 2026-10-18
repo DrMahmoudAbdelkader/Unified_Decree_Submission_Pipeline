@@ -30,6 +30,11 @@ TWO KINDS OF APPROVED REVIEW (pipeline_state.review_mode, set by prepare):
     "delta"  only NEW archive pages were labeled (delta/<id>.pdf). They are
              appended to the permanent labeled file here, before signing —
              see _prepare_approved_doc().
+    "delta" + pipeline_state.delta_discarded: the operator looked at the new archive
+             pages and kept NONE of them (document-review edge function action
+             confirm_no_new_pages). Nothing is appended; the existing labeled file is
+             submitted as is and the discarded archive IDs are written to the merge
+             log so they are not offered for review again.
 
 RUN LOCALLY:
     export SUPABASE_URL=...  SUPABASE_SERVICE_ROLE_KEY=...
@@ -125,6 +130,31 @@ def _prepare_approved_doc(national_id: str, attempt_id: int, pipeline_state: dic
 
     delta_ids = list(pipeline_state.get("delta_ids") or [])
     already_logged = set(r2_client.get_merged_archive_ids(national_id))
+
+    if pipeline_state.get("delta_discarded"):
+        # The operator deleted every new archive page as irrelevant. Nothing is
+        # appended. The IDs still go into the merge log, otherwise the very next
+        # request for this patient would extract the same papers and ask for a
+        # review again. Safe to re-run: already-logged IDs are skipped.
+        new_ids = [i for i in delta_ids if i not in already_logged]
+        if new_ids:
+            window = pipeline_state.get("delta_window") or {}
+            merged_ids = list(r2_client.get_merged_archive_ids(national_id)) + new_ids
+            saved = False
+            for _ in range(3):
+                if r2_client.save_merged_archive_ids(national_id, merged_ids,
+                                                      window_start=window.get("from"),
+                                                      window_end=window.get("to")):
+                    saved = True
+                    break
+            if not saved:
+                log.warning(f"  [delta] {national_id}: discarded papers could NOT be recorded in the merge "
+                            f"log — they may be offered for review again on the next request.")
+        r2_client.delete_labeled_delta(national_id)   # never let a stale delta be appended later
+        log.info(f"  [delta] {national_id}: operator discarded {len(delta_ids)} new archive paper(s) as "
+                 f"irrelevant — submitting the existing labeled file unchanged.")
+        return base_path
+
     if pipeline_state.get("delta_merged") or (delta_ids and all(i in already_logged for i in delta_ids)):
         log.info(f"  [delta] {national_id}: the new pages are already merged into the permanent file — "
                  f"not appending them again.")
