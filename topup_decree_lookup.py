@@ -66,6 +66,15 @@ def _num(s):
 
 
 # --------------------------------------------------------------------------- parsers (tested on the HAR)
+def is_usable_status(text: str) -> bool:
+    """The site's «قرار منتهي ؟» column has THREE values, not two: مفتوح, مغلق and «معلّق». A «معلّق» decree is one that is still
+    being dispensed from (real cases: 2,930 left of 3,000 with approved invoices on it), so only a decree the site calls
+    «مغلق» is unusable. The old rule ("مفتوح" in text) marked every «معلّق» decree is_open=false, and the DB triage then
+    never counted its balance as 'enough value'. Expired / stopped decrees are still excluded separately by `flag` + expiry."""
+    t = re.sub(r"\s+", " ", ar2en(text or "")).strip()
+    return bool(t) and "مغلق" not in t and "مقفل" not in t
+
+
 def parse_decrees_list(html: str) -> list[dict]:
     """DecreesSearch result table -> one dict per decree."""
     soup = BeautifulSoup(html, "html.parser")
@@ -86,7 +95,7 @@ def parse_decrees_list(html: str) -> list[dict]:
         out.append({"decree_number": a["href"].rstrip("/").split("/")[-1], "national_id": t[2],
                     "decree_date": d, "decree_type": t[4], "decree_value": _num(t[5]),
                     "value_left_website": _num(t[7]), "open_text": t[8],
-                    "is_open": "مفتوح" in t[8] and "مغلق" not in t[8], "flag": flag})
+                    "is_open": is_usable_status(t[8]), "flag": flag})
     return out
 
 

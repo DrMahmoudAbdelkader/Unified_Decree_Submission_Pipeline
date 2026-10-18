@@ -91,7 +91,17 @@ def request_date(c: dict) -> Optional[date]:
 
 
 def dose_value(c: dict, row: dict) -> Optional[float]:
-    """Value of ONE dose for this decree (see the module doc), or None when it cannot be known."""
+    """Value of ONE dose for this decree (see the module doc), or None when it cannot be known.
+    A protocol's FIXED limit (decree_topup_protocols.value_cutoff, e.g. 600 for the supportive plan) comes first - it is the
+    same number the DB triage view uses (COALESCE(value_cutoff, avg_dose_value)), so both agree."""
+    try:
+        pk = c.get("protocol_key")
+        if pk:
+            pr = sb.select("decree_topup_protocols", select="value_cutoff", filters={"protocol_key": f"eq.{pk}"}, limit=1)
+            if pr and pr[0].get("value_cutoff"):
+                return float(pr[0]["value_cutoff"])
+    except Exception:
+        pass                                              # table/column missing: continue with the average
     try:
         r = sb.select("decree_topup_dose_calc", select="avg_dose_value", filters={"candidate_id": f"eq.{c['id']}"}, limit=1)
         if r and r[0].get("avg_dose_value"):
@@ -121,6 +131,12 @@ def evaluate(c: dict) -> dict:
             res["reason"] = "kind not eligible"; return res
         if c.get("manual_decree_numbers") or c.get("manual_receipt_ids"):
             res["reason"] = "operator typed decrees/receipts by hand - left alone"; return res
+        try:
+            sk = sb.select("decree_topup_protocols", select="skip_value_check", filters={"protocol_key": f"eq.{c.get('protocol_key')}"}, limit=1) if c.get("protocol_key") else []
+            if sk and sk[0].get("skip_value_check"):
+                res["reason"] = "protocol skips the value check"; return res
+        except Exception:
+            pass
         req = request_date(c)
         if not req:
             res["reason"] = "request date unknown"; return res
