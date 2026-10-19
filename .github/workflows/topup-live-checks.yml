@@ -1,0 +1,74 @@
+# .github/workflows/topup-live-checks.yml
+# ============================================================================
+# Nightly LIVE CHECKS for EVERY open administrative-letter entry (topup_live_checks.py):
+#
+#   1) manual requests: a request for the same patient that somebody filed BY HAND on the SMC website (outside the app)
+#      and that has not reached «قرار نهائي» / «خطاب ادارى» yet. While one exists the entry is moved to
+#      «سبق التعامل معها» and topup_gate.py refuses to send a new request for it.
+#   2) ID_CARD entries: looks in the DMS archive for a paper dated on/after the letter. Found -> the paper is extracted for
+#      the user and the entry goes to «تم التصحيح — جاهز للطلب»; not found -> it stays in «بانتظار بطاقة سارية جديدة».
+#
+# Runs after Top-up Evidence Fetch (which already checked its own entries <20 h ago - those are skipped), and on a fallback
+# schedule in case that chain did not run. Each entry is re-checked at most every TOPUP_*_MAX_AGE_H (20 h) unless
+# candidate_ids is given (then it is always re-checked).
+#
+# Secrets used: SUPABASE_*, SMC_USERNAME_3/_2/SMC_USERNAME (+ passwords), R2_*. The DMS login uses the defaults inside
+# patient_pdf_dms_archive_fallback.py (HMIS_USERNAME / HMIS_PASSWORD); add them as secrets only if the script needs them.
+# ============================================================================
+name: Top-up Live Checks
+
+concurrency:
+  group: topup-live-checks
+  cancel-in-progress: false
+
+on:
+  workflow_run:
+    workflows: ["Top-up Evidence Fetch"]
+    types: [completed]
+  schedule:
+    - cron: "30 4 * * *"            # fallback, 04:30 UTC (06:30 Cairo in winter, 07:30 in summer time)
+  workflow_dispatch:
+    inputs:
+      candidate_ids:
+        description: "Optional: only these decree_topup_candidates ids (comma separated). Empty = every open entry that is due."
+        required: false
+        default: ""
+
+jobs:
+  live:
+    # after the evidence run whatever its result - the checks do not depend on it
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+      SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+      SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+      SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+      SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+      SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
+      LIVE_CHECK_BUDGET_MIN: "80"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      # no Playwright / Ghostscript: this job only reads SMC + the DMS archive and merges PDFs
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF beautifulsoup4
+      - name: Run live checks
+        run: python topup_live_checks.py

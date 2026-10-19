@@ -7,6 +7,10 @@
 #          groups of `chunk_size` (default 10), keeping one patient's entries
 #          together. With candidate_ids set (the page's buttons) it splits
 #          exactly those ids instead.
+#   (new) every runner ALSO runs topup_live_checks.py for its own entries, right after the lookups:
+#            - manual requests filed on the SMC website outside the app (blocks sending, see topup_gate.py)
+#            - new ID-card paper in the DMS archive (ID_CARD entries)
+#          The nightly topup-live-checks.yml covers every open entry (incl. ID_CARD ones that never enter this plan).
 #   fetch  matrix job: one runner PER GROUP, all started together, never more
 #          than 15 at once (max-parallel). Each runner runs the SAME three
 #          scripts as before, in the same order, with CANDIDATE_IDS = its own
@@ -168,6 +172,15 @@ jobs:
           MAX_LOOKUPS: "300"
           LOOKUP_TIME_BUDGET_MIN: "30"
         run: python topup_decree_lookup.py
+
+      # 1b) LIVE CHECKS for this runner's entries: requests filed by hand on the SMC website + new ID card in the DMS archive.
+      #     Never fails the run (continue-on-error): a failed check leaves manual_check_message on the entry.
+      - name: Live checks (manual SMC requests + ID card in DMS archive)
+        continue-on-error: true
+        env:
+          LIVE_CHECK_BUDGET_MIN: "25"
+          PYTHONUNBUFFERED: "1"
+        run: python topup_live_checks.py
 
       # Playwright's browser download is cached: 15 runners must not each fetch ~130 MB every run.
       - name: Cache Playwright browsers
