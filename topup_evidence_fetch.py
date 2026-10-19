@@ -380,57 +380,40 @@ _ASSETS = {}
 
 
 def _assets() -> dict:
-    """The 5 signing images (sig1-4 + stamp), once per run. Tried in this order:
-      1) the private decree-assets bucket through supabase_storage (service key) - exactly what the prepare / finalize
-         pipeline signs with, cached in /tmp/decree_assets by the workflow;
-      2) the public signature_files bucket of THIS project (SUPABASE_URL), then SIGNATURE_BASE_URL if that variable is set.
-    On failure the error starts with SIGNING_ASSETS and lists what each source answered (status + file), so the log and
-    verification.error say what is really wrong instead of a guess."""
+    """The 5 signing images, ONLY from the private decree-assets bucket, folder `signatures`, files 1b.png 2b.png 3b.png 4b.png
+    stamp.png (internal roles sig1..sig4 = 1b..4b; the old sig1.png... names and the public signature_files bucket are NOT used).
+    Downloaded with the service key on every run into a folder the workflow does NOT cache, so a replaced image is picked
+    up at once. Folder override: DECREE_ASSETS_SIGNATURES_PATH (default "signatures"); bucket: DECREE_ASSETS_BUCKET.
+    Any missing / invalid file -> RuntimeError starting with SIGNING_ASSETS (no silent fallback to another set)."""
     if _ASSETS:
         return _ASSETS
+    import hashlib
+    from urllib.parse import quote
     from PIL import Image
-    problems = []
-
-    def _verified(paths: dict) -> bool:
-        if len(paths) != len(SIGNATURE_FILES):
-            problems.append(f"missing {sorted(set(SIGNATURE_FILES) - set(paths))}")
-            return False
-        for k, pth in paths.items():
-            Image.open(pth).verify()                       # must really be an image, not an error page
-        return True
-
-    try:
-        import supabase_storage as st
-        a = st.fetch_signing_and_template_assets("/tmp/decree_assets") or {}
-        got = {k: a[k] for k in SIGNATURE_FILES if a.get(k) and os.path.exists(a[k])}
-        if _verified(got):
-            _ASSETS.update(got)
-            log.info("signing images: loaded from the decree-assets bucket")
-            return _ASSETS
-    except Exception as e:
-        problems.append(f"decree-assets: {type(e).__name__}: {str(e)[:120]}")
-
-    bases = [b for b in (SIGNATURE_BASE_URL, f"{SUPABASE_URL}/storage/v1/object/public/signature_files" if SUPABASE_URL else "") if b]
-    d = os.path.join(tempfile.gettempdir(), "topup_signature_assets")
+    bucket = (os.environ.get("DECREE_ASSETS_BUCKET") or "decree-assets").strip("/")
+    folder = (os.environ.get("DECREE_ASSETS_SIGNATURES_PATH") or "signatures").strip("/")
+    d = os.path.join(tempfile.gettempdir(), "topup_signing_images")
     os.makedirs(d, exist_ok=True)
-    for base in dict.fromkeys(bases):
-        got = {}
+    got, problems = {}, []
+    for key, fn in SIGNATURE_FILES.items():
+        obj = f"{folder}/{fn}" if folder else fn
+        url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{quote(obj)}"
         try:
-            for key, fn in SIGNATURE_FILES.items():
-                r = requests.get(f"{base}/{fn}", timeout=60)
-                if not r.ok:
-                    raise RuntimeError(f"HTTP {r.status_code} for {fn}")
-                path = os.path.join(d, fn)
-                with open(path, "wb") as f:
-                    f.write(r.content)
-                got[key] = path
-            if _verified(got):
-                _ASSETS.update(got)
-                log.info(f"signing images: loaded from {base.split('/storage/')[0]}")
-                return _ASSETS
+            r = requests.get(url, headers={"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}, timeout=60)
+            if not r.ok:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            path = os.path.join(d, fn)
+            with open(path, "wb") as f:
+                f.write(r.content)
+            Image.open(path).verify()                      # must really be an image, not an error page
+            got[key] = path
+            log.info(f"signing image {key}: {bucket}/{obj} ({len(r.content)} bytes, sha256 {hashlib.sha256(r.content).hexdigest()[:12]})")
         except Exception as e:
-            problems.append(f"{base.split('/storage/')[0]}: {type(e).__name__}: {str(e)[:100]}")
-    raise RuntimeError("SIGNING_ASSETS: " + " | ".join(problems))
+            problems.append(f"{bucket}/{obj}: {type(e).__name__}: {str(e)[:100]}")
+    if problems:
+        raise RuntimeError("SIGNING_ASSETS: " + " | ".join(problems))
+    _ASSETS.update(got)
+    return _ASSETS
 
 
 def sign_with_script(data: bytes):
