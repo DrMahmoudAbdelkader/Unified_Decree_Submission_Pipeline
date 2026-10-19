@@ -109,21 +109,37 @@ def national_id_of(patient_id) -> str:
 
 
 # --------------------------------------------------------------------------- which decrees
+def is_inclusive(c: dict) -> bool:
+    """«القرار السابق شامل»: the previous decree of the SAME PLAN already covers the request. No protocol, no dose counts, no
+    overlap family: the only job is to find the newest decree of the same plan and attach its bills.
+    TOPUP_INCLUSIVE_PLAIN=0 restores the old behaviour (same workflow as TOPUP)."""
+    return (c.get("kind") == "PREV_INCLUSIVE"
+            and (os.environ.get("TOPUP_INCLUSIVE_PLAIN") or "1").strip().lower() not in ("0", "false", "off", "no"))
+
+
 def _db_decrees(c: dict) -> list[str]:
     """Decrees stored by THIS app: attempts of the patient's earlier cases whose plan carries the
-    same top-up protocol (excluding the declined request itself). Oldest first."""
-    if not (c.get("patient_id") and c.get("protocol_key")):
+    same top-up protocol (excluding the declined request itself). Oldest first.
+    PREV_INCLUSIVE: earlier cases of the very same treatment plan as the declined request (no protocol needed)."""
+    inclusive = is_inclusive(c)
+    if not c.get("patient_id") or not (inclusive or c.get("protocol_key")):
         return []
     cases = sb.select("decree_request_cases", select="id,treatment_plan_id",
                       filters={"patient_id": f"eq.{c['patient_id']}"}, limit=1000)
     plan_ids = {x["treatment_plan_id"] for x in cases if x.get("treatment_plan_id")}
     if not plan_ids:
         return []
-    protos = sorted(ov.compatible_protocols(c["protocol_key"]) | {str(c["protocol_key"])})
-    plans = sb.select("decree_treatment_plans", select="id",
-                      filters={"topup_protocol": "in.(" + ",".join(protos) + ")",      # own protocol + overlapping ones
-                               "id": "in.(" + ",".join(map(str, plan_ids)) + ")"}, limit=1000)
-    ok_plans = {p["id"] for p in plans}
+    if inclusive:
+        own = next((x.get("treatment_plan_id") for x in cases if x["id"] == c.get("source_case_id")), None)
+        if not own:
+            return []
+        ok_plans = {own}
+    else:
+        protos = sorted(ov.compatible_protocols(c["protocol_key"]) | {str(c["protocol_key"])})
+        plans = sb.select("decree_treatment_plans", select="id",
+                          filters={"topup_protocol": "in.(" + ",".join(protos) + ")",      # own protocol + overlapping ones
+                                   "id": "in.(" + ",".join(map(str, plan_ids)) + ")"}, limit=1000)
+        ok_plans = {p["id"] for p in plans}
     case_ids = [x["id"] for x in cases if x["treatment_plan_id"] in ok_plans and x["id"] != c["source_case_id"]]
     if not case_ids:
         return []
@@ -191,7 +207,9 @@ def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
     when such a decree exists and still covers a dose the entry is auto-resolved before we get here (topup_resolution.py);
     when it is used up, it is the newest decree and its bills are the ones to attach."""
     try:
-        rows = ov.matching_rows(c)
+        rows = ov.matching_rows(c, only_plan=True) if is_inclusive(c) else ov.matching_rows(c)
+        if is_inclusive(c):                # same PLAN only (the DB view's 'PLAN' match): never the hormonal/Zoladex overlap family
+            rows = [r for r in rows if r.get("_kind") == "PLAN"]
     except Exception as e:
         log.warning(f"  lookup rows not readable (migration 06?): {e}")
         return []
@@ -235,6 +253,8 @@ def previous_decrees(c: dict, smc=None) -> list[str]:
     decrees = merged_previous(c, smc)
     if c.get("manual_decree_numbers") or not decrees:
         return decrees
+    if is_inclusive(c):                    # «القرار السابق شامل»: the newest decree of the same plan, nothing else
+        return decrees if c.get("all_previous_decrees") else decrees[-1:]
     # GENERAL RULE: only the invoices of the single most recent previous decree of the same plan.
     # Extraordinary override: candidate.all_previous_decrees = true -> every previous decree
     # (still capped by protocols.max_previous_decrees when that is > 1).
@@ -926,6 +946,19 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
                  f"[{row.get('signed_source')}, {row.get('page_count')} page(s), {row.get('bytes')} bytes]"
                  + (f" - {row['message']}" if row.get("message") else ""))
     _rpc("topup_recompute_evidence", {"p_id": cid})
+    if is_inclusive(c):
+        # The DB function asks for a protocol / cycle counts. «القرار السابق شامل» needs neither: all bills read fine = READY.
+        try:
+            now = sb.select(CAND, select="status,evidence_status", filters={"id": f"eq.{cid}"}, limit=1)
+            now = now[0] if now else {}
+            all_ok = bool(built) and all((row.get("status") == "OK" and row.get("r2_key")) for _, _, row in built)
+            if all_ok and now.get("evidence_status") != "READY":
+                sb.update(CAND, cid, {"evidence_status": "READY", "evidence_message": None})
+                log.info(f"  candidate {cid}: PREV_INCLUSIVE - bills are enough, evidence_status forced READY (was {now.get('evidence_status')})")
+            if all_ok and now.get("status") == "NEEDS_COUNTS":
+                sb.update(CAND, cid, {"status": "READY"})
+        except Exception as e:
+            log.warning(f"  candidate {cid}: PREV_INCLUSIVE readiness override skipped ({type(e).__name__}: {str(e)[:120]})")
     try:
         end = sb.select(CAND, select="evidence_status,evidence_message", filters={"id": f"eq.{cid}"}, limit=1)
         hint = problem_hint(built)
@@ -938,6 +971,8 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
     except Exception:
         pass
     # dose count over the WHOLE chain of previous decrees (never raises; TOPUP_DOSE_CALC=0 switches it off)
+    if is_inclusive(c):
+        return                              # «القرار السابق شامل»: no dose counts at all
     try:
         import topup_dose_calc as _dc
         _dc.run(c, smc, sys.modules[__name__])
@@ -979,7 +1014,8 @@ def main():
         _rpc("topup_release_stale_fetching", {"p_minutes": 45})
     except Exception as e:
         log.warning(f"stale release skipped: {e}")
-    flt = {"evidence_status": "eq.PENDING", "protocol_key": "not.is.null",
+    requeue_inclusive_needs_protocol(None)
+    flt = {"evidence_status": "eq.PENDING", "or": "(protocol_key.not.is.null,kind.eq.PREV_INCLUSIVE)",
            "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)"}
     only = [int(x) for x in re.findall(r"\d+", os.environ.get("CANDIDATE_IDS") or "")]
     if only:                       # the page asked for these entries only
@@ -1021,16 +1057,38 @@ def main():
     write_run_summary(results)
 
 
-def requeue_no_previous(only) -> int:
-    """Entries marked NO_PREVIOUS_DECREE BEFORE the patient lookup existed (or before it ran) stay stuck even though the
-    lookup now lists matching decrees. Put them back in the queue as soon as the lookup is DONE and shows a match."""
-    flt = {"evidence_status": "eq.NO_PREVIOUS_DECREE", "lookup_status": "eq.DONE", "protocol_key": "not.is.null",
+def requeue_inclusive_needs_protocol(only) -> int:
+    """«القرار السابق شامل» entries the DB parked as NEEDS_PROTOCOL (plan without a top-up protocol, e.g. supportive plans)
+    are put back in the queue: this kind never needs a protocol."""
+    if (os.environ.get("TOPUP_INCLUSIVE_PLAIN") or "1").strip().lower() in ("0", "false", "off", "no"):
+        return 0
+    flt = {"kind": "eq.PREV_INCLUSIVE", "evidence_status": "eq.NEEDS_PROTOCOL",
            "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)"}
     if only:
         flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
     n = 0
     try:
-        for c in sb.select(CAND, select="id,source_case_id,kind", filters=flt, limit=500) or []:
+        for c in sb.select(CAND, select="id", filters=flt, limit=500) or []:
+            sb.update(CAND, c["id"], {"evidence_status": "PENDING", "evidence_message": None})
+            n += 1
+    except Exception as e:
+        log.warning(f"requeue of PREV_INCLUSIVE NEEDS_PROTOCOL entries skipped: {e}")
+    if n:
+        log.info(f"{n} PREV_INCLUSIVE entr(ies) were waiting for a protocol - queued for the bills run")
+    return n
+
+
+def requeue_no_previous(only) -> int:
+    """Entries marked NO_PREVIOUS_DECREE BEFORE the patient lookup existed (or before it ran) stay stuck even though the
+    lookup now lists matching decrees. Put them back in the queue as soon as the lookup is DONE and shows a match."""
+    flt = {"evidence_status": "eq.NO_PREVIOUS_DECREE", "lookup_status": "eq.DONE",
+           "or": "(protocol_key.not.is.null,kind.eq.PREV_INCLUSIVE)",
+           "status": "not.in.(SUBMITTED,DISMISSED,RESOLVED)"}
+    if only:
+        flt["id"] = "in.(" + ",".join(map(str, only)) + ")"
+    n = 0
+    try:
+        for c in sb.select(CAND, select="id,source_case_id,kind,patient_id,protocol_key", filters=flt, limit=500) or []:
             if c.get("kind") == "PREV_REPORT":
                 continue
             if _lookup_decrees(c):

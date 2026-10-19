@@ -165,6 +165,9 @@ def _adjust(g: dict) -> dict:
     msg = (cand.get("evidence_message") or "").strip()
     protocol = g.get("protocol_key") or cand.get("protocol_key")
     g["continuous"] = _is_continuous(protocol)
+    # «القرار السابق شامل»: invoices of the newest same-plan decree are the ONLY requirement - no protocol, no cycle counts,
+    # no dose review, no sentence in the medical report, no manual bill page (TOPUP_INCLUSIVE_PLAIN=0 = old behaviour).
+    g["plain"] = g.get("kind") == "PREV_INCLUSIVE" and _env_on("TOPUP_INCLUSIVE_PLAIN")
 
     if cand.get("status") == "RESOLVED" and msg.startswith(AUTO_RESOLVED_PREFIX):
         g["auto_resolved"] = True
@@ -180,6 +183,10 @@ def _adjust(g: dict) -> dict:
         g["ready"] = True
         return g
 
+    if (g["plain"] and not g.get("ready") and g.get("evidence_status") == "READY"
+            and g.get("invoices_ok") and not g.get("invoices_bad")):
+        g["ready"] = True                      # previous-decree-covers-it: bills are enough
+        return g
     if (g["continuous"] and not g.get("ready") and g.get("evidence_status") == "READY"
             and g.get("invoices_ok") and not g.get("invoices_bad")):
         g["ready"] = True                      # continuous plan: bills are enough, no cycle counts needed
@@ -292,7 +299,7 @@ def not_ready_message(g: dict) -> str:
         return head + (f"تقرير القرار السابق غير جاهز (الحالة: {g.get('evidence_status')}). "
                        f"افتح صفحة «متابعة الخطابات الإداريه» وتأكد من جلب التقرير أو اعتماده.")
     missing = []
-    if not g.get("continuous") and (g.get("cycles_received") is None or g.get("cycles_remaining") is None):
+    if not g.get("continuous") and not g.get("plain") and (g.get("cycles_received") is None or g.get("cycles_remaining") is None):
         missing.append("عدد الدورات (المستلمة / المتبقية)")
     if g.get("evidence_status") != "READY" or not g.get("invoices_ok") or g.get("invoices_bad"):
         missing.append(f"الفواتير الموقّعة (الحالة: {g.get('evidence_status')}، سليمة: {g.get('invoices_ok')}، "
@@ -307,7 +314,7 @@ def _dose_hold(case_id: int, g: dict) -> Optional[str]:
     try:
         if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE or not g.get("candidate_id"):
             return None
-        if g.get("continuous") or g.get("no_previous"):
+        if g.get("continuous") or g.get("no_previous") or g.get("plain"):
             return None                                     # no dose counts matter for these: nothing to review
         import topup_dose_calc as dc
         if not dc.enabled():
@@ -346,8 +353,8 @@ def cycles_statement(case_id: int) -> Optional[str]:
     g = _gate(case_id)
     if not g.get("is_topup") or g.get("kind") not in TOPUP_LIKE:
         return None
-    if g.get("continuous") or g.get("no_previous"):
-        return None                  # hormonal / Zoladex: continuous regimen - never state received / yet-to-be-received doses
+    if g.get("continuous") or g.get("no_previous") or g.get("plain"):
+        return None                  # hormonal / Zoladex / previous-decree-covers-it: never state received / yet-to-be-received doses
     if g.get("cycles_received") is None or g.get("cycles_remaining") is None:
         return None
     rec, rem = int(g["cycles_received"]), int(g["cycles_remaining"])
@@ -408,7 +415,7 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
     # manual "كشف حساب" page — only when the previous decree still has dispensings waiting to be billed
     # in Enhanced Monitor. Placed right after the invoices. A failure here must never block the request.
     bill_pages = 0
-    if g.get("kind") in TOPUP_LIKE:
+    if g.get("kind") in TOPUP_LIKE and not (g.get("plain") and not _env_on("TOPUP_INCLUSIVE_MANUAL_BILL", False)):
         try:
             import topup_manual_bill
             bill = topup_manual_bill.bill_pdf_for_candidate(int(g["candidate_id"]))

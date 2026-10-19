@@ -26,7 +26,7 @@ import topup_dose_count as T
 
 log = logging.getLogger("topup_dose_calc")
 CAND, CALC, ROWS, LOOK = "decree_topup_candidates", "decree_topup_dose_calc", "decree_topup_item_rows", "decree_topup_decree_lookup"
-TOPUP_LIKE = (None, "", "TOPUP", "PREV_INCLUSIVE")
+TOPUP_LIKE = (None, "", "TOPUP")      # PREV_INCLUSIVE ("previous decree covers it") has no dose count: bills only
 MAP_JSON = os.environ.get("TOPUP_MAP_JSON") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "topup_core_meds_map.json")
 _MAP = None
 
