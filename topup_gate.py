@@ -31,6 +31,13 @@ ADJUSTMENTS applied on top of the DB gate (see _adjust()):
                             review hold, and NO "received / yet to be received" sentence in the medical report - only the
                             previous decree's bills are attached.
 
+    * MANUAL REQUEST      - (ALL kinds) topup_live_checks.py found a request for the same patient that somebody filed by hand on the
+                            SMC website (status تم التسجيل / لجنة طبية / محول لطبيب آخر / توصية ...) and that this app did not file.
+                            Sending another request would duplicate it, so the entry is NOT ready until that request reaches a final
+                            status (قرار نهائي / خطاب إداري) or the operator presses «تجاهل» on it. TOPUP_MANUAL_BLOCK=0 disables.
+                            TOPUP_MANUAL_REQUIRE_FRESH_H=<hours> (default 0 = off) additionally refuses entries whose manual-request
+                            check never ran / is older than that.
+
 A request that is not linked to any candidate is not a top-up: every function is then a no-op
 and the pipeline behaves exactly as before. If the DB function itself cannot be called (migration
 not applied) the gate FAILS OPEN with a warning, so normal requests are never blocked by it.
@@ -179,8 +186,62 @@ def _adjust(g: dict) -> dict:
     return g
 
 
+def _manual_requests(candidate_id) -> List[dict]:
+    """Pending requests filed by hand on the SMC website for this entry's patient (decree_topup_manual_requests).
+    Raises on a DB problem - the caller decides to fail open."""
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_manual_requests", headers=_hdr(), timeout=30, params={
+        "select": "request_number,request_date,status_raw,plan_text", "candidate_id": f"eq.{int(candidate_id)}",
+        "order": "request_date.desc.nullslast"})
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
+    return r.json() or []
+
+
+def _manual_check_age_ok(candidate_id) -> Optional[str]:
+    """Only when TOPUP_MANUAL_REQUIRE_FRESH_H > 0: None = the manual-request check is fresh enough, else the reason."""
+    try:
+        hours = float(os.environ.get("TOPUP_MANUAL_REQUIRE_FRESH_H") or "0")
+    except ValueError:
+        hours = 0.0
+    if hours <= 0:
+        return None
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_candidates", headers=_hdr(), timeout=30, params={
+            "select": "manual_check_at", "id": f"eq.{int(candidate_id)}", "limit": 1})
+        rows = r.json() if r.ok else []
+        ts = rows[0].get("manual_check_at") if rows else None
+        if not ts:
+            return "فحص الطلبات اليدوية على موقع SMC لم يُنفَّذ لهذا الخطاب بعد"
+        from datetime import datetime, timezone
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(ts).replace("Z", "+00:00"))).total_seconds() / 3600
+        return None if age <= hours else f"فحص الطلبات اليدوية على موقع SMC قديم (آخر فحص منذ {age:.0f} ساعة)"
+    except Exception as exc:
+        log.warning(f"manual-check age not readable ({exc}) - not enforced")
+        return None
+
+
+def _manual_block(g: dict) -> dict:
+    """Applies to EVERY kind (TOPUP / PREV_INCLUSIVE / PREV_REPORT / ID_CARD). Never raises; a DB problem = no block."""
+    if not g.get("is_topup") or not g.get("candidate_id") or not _env_on("TOPUP_MANUAL_BLOCK"):
+        return g
+    try:
+        rows = _manual_requests(g["candidate_id"])
+    except Exception as exc:                                  # migration 15 not applied: behave as before
+        log.warning(f"manual-request check skipped for candidate {g.get('candidate_id')}: {exc}")
+        return g
+    if rows:
+        g["manual_pending"] = rows
+        g["ready"] = False
+        return g
+    stale = _manual_check_age_ok(g["candidate_id"])
+    if stale:
+        g["manual_stale"] = stale
+        g["ready"] = False
+    return g
+
+
 def _gate(case_id: int) -> dict:
-    return _adjust(_gate_raw(case_id))
+    return _manual_block(_adjust(_gate_raw(case_id)))
 
 
 def _documents(candidate_id: int) -> List[dict]:
@@ -204,7 +265,23 @@ def _unit_word(protocol_key: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- messages
+def manual_message(g: dict) -> str:
+    rows = g.get("manual_pending") or []
+    parts = []
+    for r in rows[:5]:
+        d = str(r.get("request_date") or "")[:10]
+        parts.append(f"#{r.get('request_number')}" + (f" بتاريخ {d}" if d else "") + (f" — الحالة: {r.get('status_raw')}" if r.get("status_raw") else "")
+                     + (f" — الخطة: {(r.get('plan_text') or '')[:120]}" if r.get("plan_text") else ""))
+    more = f" (+{len(rows) - 5} أخرى)" if len(rows) > 5 else ""
+    return ("لا يمكن إرسال طلب جديد: يوجد للمريض طلب مُقدَّم يدوياً على موقع SMC خارج النظام ولم يصل بعد إلى «قرار نهائي» أو «خطاب إداري»: "
+            + " | ".join(parts) + more + ". انتظر نتيجته (يُفحص تلقائياً كل 24 ساعة) أو اضغط «تجاهل» على الطلب من صفحة «متابعة الخطابات الإداريه» إن كان لا يخص هذه الخطة.")
+
+
 def not_ready_message(g: dict) -> str:
+    if g.get("manual_pending"):
+        return manual_message(g)
+    if g.get("manual_stale"):
+        return f"لا يمكن إرسال الطلب: {g['manual_stale']}. اضغط «فحص الطلبات اليدوية» على الخطاب من صفحة «متابعة الخطابات الإداريه» ثم أعد المحاولة."
     if g.get("auto_resolved"):
         return g.get("auto_resolved_message") or "تم الحل تلقائياً — لا حاجة لطلب جديد."
     kind = g.get("kind") or "TOPUP"
