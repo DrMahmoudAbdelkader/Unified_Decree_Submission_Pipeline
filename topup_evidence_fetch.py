@@ -884,8 +884,12 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
     decrees = previous_decrees(c, smc)
     manual_receipts = [str(x) for x in (c.get("manual_receipt_ids") or [])]
     if not decrees and not manual_receipts:
-        sb.update(CAND, cid, {"evidence_status": "NO_PREVIOUS_DECREE",
-                              "evidence_message": "لا يوجد قرار سابق بنفس الخطة/البروتوكول لا في سجلات النظام ولا في قرارات المريض على SMC — أدخل أرقام القرارات يدوياً"})
+        if is_inclusive(c):       # keep the «لا يوجد قرار سابق» prefix: the gate and the page recognise it
+            msg = ("لا يوجد قرار سابق لنفس الخطة — الخطاب يشير إلى قرار لخطة أخرى: راجع قرارات المريض الأخرى في الأسفل "
+                   "ثم قرّر: إغلاق (تم الحل) أو إعادة الطلب كطلب عادي")
+        else:
+            msg = "لا يوجد قرار سابق بنفس الخطة/البروتوكول لا في سجلات النظام ولا في قرارات المريض على SMC — أدخل أرقام القرارات يدوياً"
+        sb.update(CAND, cid, {"evidence_status": "NO_PREVIOUS_DECREE", "evidence_message": msg})
         return
 
     work, problems = [], []          # work: (decree, listing_info)
