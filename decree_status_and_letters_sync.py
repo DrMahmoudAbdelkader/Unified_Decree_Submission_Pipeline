@@ -655,7 +655,7 @@ def load_open_attempts() -> List[dict]:
     while True:
         page = sb.select(
             ATTEMPTS_TABLE,
-            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final,last_status_checked_at",
+            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final,last_status_checked_at,smc_status_raw",
             filters={
                 "website_request_id": "not.is.null",
                 "or": "(status_is_final.is.false,status_is_final.is.null)",
@@ -1057,8 +1057,12 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
             update_fields["response_text"] = letter_text
             counters["letters_fetched"] = 1
 
+    status_changed = (attempt.get("smc_status_raw") != status_raw)
     _mark_checked(attempt["id"], update_fields)
-    sb.insert(EVENTS_TABLE, {
+    # Event only when something actually changed (status or captured letter text). A "checked, nothing new"
+    # check is still recorded by last_status_checked_at, so staleness ordering is unaffected.
+    if status_changed or update_fields.get("response_text"):
+      sb.insert(EVENTS_TABLE, {
         "case_id": attempt["case_id"],
         "attempt_id": attempt["id"],
         "event_type": "status_sync_checked",
@@ -1070,7 +1074,7 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
             "source": "bulk_window" if counters["used_bulk"] else "single_lookup",
             "response_text_captured": bool(update_fields.get("response_text")),
         },
-    })
+      })
     counters["updated"] = 1
 
     if bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:

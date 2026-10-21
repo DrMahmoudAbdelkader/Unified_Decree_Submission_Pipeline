@@ -69,12 +69,31 @@ def _request_date_columns() -> list:
     return [x.strip() for x in raw.split(",") if x.strip()] if raw else ["submitted_at", "website_request_date", "request_date"]
 
 
+_REQ_DATE_COLS = None
+
+
+def _resolved_request_date_columns() -> list:
+    """Probe the candidate columns ONCE per run (not once per candidate) and keep only the ones that exist.
+    Before: every request_date() call fired up to 3 GETs that returned HTTP 400 for columns missing in this database."""
+    global _REQ_DATE_COLS
+    if _REQ_DATE_COLS is None:
+        ok = []
+        for col in _request_date_columns():
+            try:
+                sb.select("decree_request_cases", select=col, limit=1)
+                ok.append(col)
+            except Exception:
+                pass                                   # column does not exist in this database
+        _REQ_DATE_COLS = ok
+    return _REQ_DATE_COLS
+
+
 def request_date(c: dict) -> Optional[date]:
     """Date of the request that received the letter (the entry's source case)."""
     if not c.get("source_case_id"):
         return None
     flt = {"id": f"eq.{c['source_case_id']}"}
-    for col in _request_date_columns():
+    for col in _resolved_request_date_columns():
         try:
             r = sb.select("decree_request_cases", select=col, filters=flt, limit=1)
             d = ov._d((r[0].get(col) or "")[:10]) if r else None
