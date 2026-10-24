@@ -179,19 +179,6 @@ jobs:
           RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_finalize.py
 
-      # /tmp/decree_merged/** = every merged PDF built this run; /tmp/decree_failed_merged/**
-      # = copies of the FAILED cases' PDFs + a .txt saying why. Artifact name must be unique per runner.
-      - name: Upload run artifacts (logs, debug dumps, if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: decree-finalize-run-${{ github.run_id }}-${{ matrix.shard.name }}
-          path: |
-            /tmp/decree_merged/**
-            /tmp/decree_failed_merged/**
-          if-no-files-found: ignore
-          retention-days: 14
-
   notify:
     needs: [plan, finalize]
     if: ${{ always() }}

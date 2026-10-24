@@ -364,6 +364,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 5
 
+  # ==========================================================================
+  # JOB 3 — NOTIFY. Runs after every batch has finished (or the plan found
+  # nothing / failed / the run was cancelled) and posts ONE message for the
+  # whole session to the module's notification center. If this was the last
+  # active session it also posts the "all sessions finished" message.
+  # ==========================================================================
   notify:
     needs: [plan, prepare]
     if: ${{ always() }}
