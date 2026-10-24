@@ -169,8 +169,6 @@ jobs:
     # nothing is READY_TO_SUBMIT.
     if: ${{ needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
-    # No `contents: write` here any more: the failed-PDF branch is pushed ONCE by the
-    # `publish-failed` job below, not by every batch.
     # Per BATCH, not per queue. ~10 cases each; was 60 for everything.
     timeout-minutes: 30
     strategy:
@@ -314,21 +312,6 @@ jobs:
           RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_prepare.py
 
-      # Merged PDFs of cases that FAILED after their merge (decree_common._keep_failed_merged_pdf
-      # writes them to /tmp/decree_failed_merged). They used to be pushed to the `failed-pdfs` branch
-      # FROM EVERY BATCH: up to 15 runners force-pushing the same branch lost the race over and over
-      # (11 retries, 12+ min per batch). Now each batch only uploads them as a tiny 1-day transport
-      # artifact (seconds) and ONE job after all batches (`publish-failed`) pushes the branch once.
-      - name: Hand over failed cases' merged PDFs (transport artifact)
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: decree-failed-pdfs-${{ github.run_id }}-${{ matrix.batch.name }}
-          path: /tmp/decree_failed_merged
-          if-no-files-found: ignore
-          retention-days: 1
-
       # CHANGED: was `if: always()`. /tmp/decree_merged holds the MERGED
       # PATIENT SUBMISSION PDFs — real patient documents. Uploading them on
       # every successful run costs upload time on every runner and parks
@@ -381,61 +364,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 5
 
-  # ==========================================================================
-  # JOB 3 — NOTIFY. Runs after every batch has finished (or the plan found
-  # nothing / failed / the run was cancelled) and posts ONE message for the
-  # whole session to the module's notification center. If this was the last
-  # active session it also posts the "all sessions finished" message.
-  # ==========================================================================
-  # publish-failed: ONE job after every batch finished. Collects the transport artifacts of all
-  # batches and pushes the failed-pdfs branch once (no race, ~1 min). `notify` does NOT wait for
-  # it, so the completion message is not delayed. Nothing to publish = no git work at all
-  # (old date folders are still pruned by cleanup-failed-pdfs.yml and by the next real publish).
-  # ==========================================================================
-  publish-failed:
-    needs: [plan, prepare]
-    if: ${{ always() && needs.prepare.result != 'skipped' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    # two prepare runs finishing together queue here instead of racing on the branch
-    concurrency:
-      group: publish-failed-pdfs
-      cancel-in-progress: false
-    steps:
-      - name: Collect failed PDFs of all batches
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: decree-failed-pdfs-${{ github.run_id }}-*
-          path: /tmp/failed_in
-          merge-multiple: true
-
-      - name: Anything to publish?
-        id: any
-        run: |
-          n=$(find /tmp/failed_in -type f 2>/dev/null | wc -l)
-          echo "files=$n" >> "$GITHUB_OUTPUT"
-          echo "$n failed-case file(s) collected"
-
-      - name: Check out the publisher script only
-        if: steps.any.outputs.files != '0'
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: publish_failed_pdfs.py
-          sparse-checkout-cone-mode: false
-
-      - name: Publish failed cases' merged PDFs (branch failed-pdfs)
-        if: steps.any.outputs.files != '0'
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          SOURCE_DIR: /tmp/failed_in
-        run: python publish_failed_pdfs.py
-
-  # ==========================================================================
   notify:
     needs: [plan, prepare]
     if: ${{ always() }}
