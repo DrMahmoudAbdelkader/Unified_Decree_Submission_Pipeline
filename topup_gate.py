@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from datetime import date, timedelta
 from typing import List, Optional, Tuple
 
 import requests
@@ -98,14 +99,21 @@ def _gate_raw(case_id: int) -> dict:
 
     A READY_TO_SUBMIT request that nobody linked to a letter (it was created in the normal entry module, not from the top-up
     page) but belongs to the same patient + plan of an open letter is linked here (topup_autolink_case, migration 14), so it is
-    submitted AFTER the top-up logic: counts, signed invoices, manual bill and report sentence. TOPUP_AUTOLINK_READY=0 disables."""
+    submitted AFTER the top-up logic: counts, signed invoices, manual bill and report sentence. OFF by default now:
+    TOPUP_AUTOLINK_READY=1 re-enables it."""
     try:
         g = _rpc("topup_evidence_gate", {"p_case_id": int(case_id)})
         g = g if isinstance(g, dict) else {"is_topup": False}
     except Exception as exc:
         log.warning(f"topup gate skipped for case {case_id}: {exc}")
         return {"is_topup": False}
-    if not g.get("is_topup") and (os.environ.get("TOPUP_AUTOLINK_READY") or "1").strip() not in ("0", "false", "off", "no"):
+    # «ارفاق القرار السابق» (PREV_REPORT) no longer has its own workflow: it runs exactly like «القرار السابق شامل».
+    if g.get("kind") == "PREV_REPORT":
+        g["kind"] = "PREV_INCLUSIVE"
+    # AUTO-LINK IS OFF BY DEFAULT: a NEW entry made in the ordinary decree-request module must never be pulled into an old
+    # administrative letter (and then blocked because that letter's counts / invoices were incomplete). Only a request created
+    # FROM the top-up page is gated. TOPUP_AUTOLINK_READY=1 brings the old behaviour back.
+    if not g.get("is_topup") and (os.environ.get("TOPUP_AUTOLINK_READY") or "0").strip().lower() in ("1", "true", "on", "yes"):
         try:
             if _rpc("topup_autolink_case", {"p_case_id": int(case_id)}):
                 log.info(f"  case {case_id}: linked automatically to an open administrative letter of the same patient + plan")
@@ -166,7 +174,8 @@ def _adjust(g: dict) -> dict:
     protocol = g.get("protocol_key") or cand.get("protocol_key")
     g["continuous"] = _is_continuous(protocol)
     # «القرار السابق شامل»: invoices of the newest same-plan decree are the ONLY requirement - no protocol, no cycle counts,
-    # no dose review, no sentence in the medical report, no manual bill page (TOPUP_INCLUSIVE_PLAIN=0 = old behaviour).
+    # no dose review, no sentence in the medical report. The manual «كشف حساب» page IS added when the previous decree has
+    # dispensings still waiting to be billed in Enhanced Monitor (TOPUP_INCLUSIVE_MANUAL_BILL=0 turns that off).
     g["plain"] = g.get("kind") == "PREV_INCLUSIVE" and _env_on("TOPUP_INCLUSIVE_PLAIN")
 
     if cand.get("status") == "RESOLVED" and msg.startswith(AUTO_RESOLVED_PREFIX):
@@ -193,11 +202,22 @@ def _adjust(g: dict) -> dict:
     return g
 
 
+def warn_days() -> int:
+    """Look-back window of the duplicate / previous-letter checks: only things from the last N days count (default 30).
+    Override with TOPUP_WARN_DAYS."""
+    try:
+        return max(1, int(float(os.environ.get("TOPUP_WARN_DAYS") or "30")))
+    except ValueError:
+        return 30
+
+
 def _manual_requests(candidate_id) -> List[dict]:
-    """Pending requests filed by hand on the SMC website for this entry's patient (decree_topup_manual_requests).
-    Raises on a DB problem - the caller decides to fail open."""
+    """Pending requests filed by hand on the SMC website for this entry's patient (decree_topup_manual_requests) that are
+    NOT older than warn_days() (30 days). An older hand-filed request never blocks. Raises on a DB problem - caller fails open."""
+    cutoff = (date.today() - timedelta(days=warn_days())).isoformat()
     r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_manual_requests", headers=_hdr(), timeout=30, params={
         "select": "request_number,request_date,status_raw,plan_text", "candidate_id": f"eq.{int(candidate_id)}",
+        "or": f"(request_date.gte.{cutoff},request_date.is.null)",
         "order": "request_date.desc.nullslast"})
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
@@ -254,7 +274,8 @@ def _gate(case_id: int) -> dict:
 def _documents(candidate_id: int) -> List[dict]:
     r = requests.get(f"{SUPABASE_URL}/rest/v1/decree_topup_invoices", headers=_hdr(), timeout=60, params={
         "select": "id,decree_number,receipt_id,r2_key,doc_kind", "candidate_id": f"eq.{candidate_id}",
-        "status": "eq.OK", "r2_key": "not.is.null", "order": "decree_number.asc,id.asc"})
+        "status": "eq.OK", "r2_key": "not.is.null", "or": "(doc_kind.is.null,doc_kind.neq.PREV_REPORT)",
+        "order": "decree_number.asc,id.asc"})          # old printed-report rows of the merged PREV_REPORT kind are never attached
     r.raise_for_status()
     return r.json() or []
 
@@ -415,7 +436,7 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
     # manual "كشف حساب" page — only when the previous decree still has dispensings waiting to be billed
     # in Enhanced Monitor. Placed right after the invoices. A failure here must never block the request.
     bill_pages = 0
-    if g.get("kind") in TOPUP_LIKE and not (g.get("plain") and not _env_on("TOPUP_INCLUSIVE_MANUAL_BILL", False)):
+    if g.get("kind") in TOPUP_LIKE and not (g.get("plain") and not _env_on("TOPUP_INCLUSIVE_MANUAL_BILL", True)):
         try:
             import topup_manual_bill
             bill = topup_manual_bill.bill_pdf_for_candidate(int(g["candidate_id"]))

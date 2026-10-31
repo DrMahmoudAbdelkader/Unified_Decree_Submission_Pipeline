@@ -113,7 +113,7 @@ def is_inclusive(c: dict) -> bool:
     """«القرار السابق شامل»: the previous decree of the SAME PLAN already covers the request. No protocol, no dose counts, no
     overlap family: the only job is to find the newest decree of the same plan and attach its bills.
     TOPUP_INCLUSIVE_PLAIN=0 restores the old behaviour (same workflow as TOPUP)."""
-    return (c.get("kind") == "PREV_INCLUSIVE"
+    return (c.get("kind") in ("PREV_INCLUSIVE", "PREV_REPORT")
             and (os.environ.get("TOPUP_INCLUSIVE_PLAIN") or "1").strip().lower() not in ("0", "false", "off", "no"))
 
 
