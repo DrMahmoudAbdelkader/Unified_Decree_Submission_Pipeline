@@ -293,8 +293,6 @@ jobs:
           # just decides which credential is sitting in those two variables.
           SMC_USERNAME: ${{ secrets[format('SMC_USERNAME_{0}', matrix.batch.slot)] || secrets.SMC_USERNAME }}
           SMC_PASSWORD: ${{ secrets[format('SMC_PASSWORD_{0}', matrix.batch.slot)] || secrets.SMC_PASSWORD }}
-          HMIS_USERNAME: ${{ secrets.HMIS_USERNAME }}
-          HMIS_PASSWORD: ${{ secrets.HMIS_PASSWORD }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -304,10 +302,6 @@ jobs:
           # nine others doing the same.
           CASE_IDS: ${{ matrix.batch.case_ids }}
           DEBUG_RENDER_MDT_AND_STOP: ${{ github.event.inputs.debug_render_mdt_and_stop }}
-          # The ONE archive window (days) for every DMS/CMIS archive lookup in
-          # prepare. Default 7. To change it without editing code, add a
-          # repository VARIABLE (not secret) named ARCHIVE_WINDOW_DAYS.
-          ARCHIVE_WINDOW_DAYS: ${{ vars.ARCHIVE_WINDOW_DAYS || '7' }}
           # Lets each batch add its counters to the run (see run_notify.py).
           RUN_REF: ${{ github.event.inputs.run_ref }}
         run: python decree_submission_prepare.py

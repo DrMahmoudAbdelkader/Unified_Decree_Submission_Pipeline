@@ -1,0 +1,57 @@
+# .github/workflows/patient-file-fetch.yml
+# Started by the patient-file edge function (action request_fetch, input national_ids) or by hand.
+#   mode=fetch    (default) download the patient's PDF from the SMC website into R2 pending/<nid>.pdf (nothing uses it until reviewed)
+#   mode=register one-time: register every <nid>.pdf already in R2 in patient_documents
+name: Patient File Fetch
+
+concurrency:
+  group: patient-file-fetch
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      national_ids:
+        description: "Comma-separated national ids (mode=fetch)"
+        required: false
+        default: ""
+      mode:
+        description: "fetch (default) or register"
+        required: false
+        default: "fetch"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+      SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+      SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+      SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+      SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+      SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      NATIONAL_IDS: ${{ github.event.inputs.national_ids }}
+      MODE: ${{ github.event.inputs.mode || 'fetch' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      # the fetch imports the submission pipeline (SMC session), so it needs the same libraries; no browser is started
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4 requests
+      - run: python patient_file_fetch.py
