@@ -308,8 +308,8 @@ def download_patient_pdf_from_website(pipeline_session, base_url: str, national_
         Full path to the downloaded PDF on success, or None if neither
         facility's requests for this patient had a working PDF (or the
         patient has no requests on the site at all). A None return is
-        not itself an error - it means "try the next fallback" (the DMS
-        archive fallback) or give up on this row.
+        not itself an error - it means there is no file on SMC, so the
+        patient's file must be started from scanned papers («ملف المريض»).
     """
     log.info(f"  [website fallback] Searching SMC site requests for patient {national_id} …")
     all_rows = _search_requests_by_national_id(pipeline_session.s, base_url, national_id)

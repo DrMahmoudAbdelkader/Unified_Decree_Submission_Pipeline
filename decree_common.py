@@ -102,7 +102,7 @@ def configure_smc_credentials(username_env="SMC_USERNAME", password_env="SMC_PAS
     # hardcoded D:\SMS\... Windows path (before this function ever runs).
     # Re-pointing PATIENT_DOCS_UNDER_PROCESSED_DIR above does NOT change it,
     # because it's a separate variable, not a live reference — so every
-    # website/CMIS-fallback download was still landing in that stale
+    # website-fallback download was still landing in that stale
     # Windows-literal folder name on the Linux runner instead of anywhere
     # this script (or R2) could find it. This is the actual cause of the
     # "Downloaded to D:\SMS\..." log lines. Must be repointed explicitly.
@@ -737,18 +737,9 @@ def run_finalize_stages(session: SMCSession, case_id: int, attempt_id: int, nati
         patient_pdf_path = topup_gate.with_invoices(case_id, patient_pdf_path)
         topup_cycles_statement = topup_gate.cycles_statement(case_id)
 
-        # NOTE: no DMS/CMIS archive collection happens here. That happens
-        # during PREPARE (decree_submission_prepare.py's
-        # resolve_patient_document()), using ONE window (ARCHIVE_WINDOW_DAYS,
-        # default 7):
-        #   - freshly extracted file: website file + the window of DMS pages
-        #     (or the whole DMS archive if it only exists there), whole file
-        #     reviewed;
-        #   - R2 cache hit: window minus the patient's merge log
-        #     (r2_client.get_merged_archive_ids) = the NEW papers only. Only
-        #     those are labeled by the operator, and
-        #     decree_submission_finalize.py appends them to the labeled
-        #     permanent file BEFORE calling this function.
+        # NOTE: no document collection happens here. The patient's file (R2 permanent file, or one extracted from the
+        # SMC website and reviewed) is resolved during PREPARE (decree_submission_prepare.py). New papers are added by
+        # staff on the «ملف المريض» screen (scanner -> top of the file in R2).
         # So by the time this runs, patient_pdf_path is already the complete,
         # reviewed document. This function only ever does: sign, build the
         # report, merge, upload — nothing else.

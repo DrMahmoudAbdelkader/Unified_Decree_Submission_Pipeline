@@ -25,32 +25,17 @@ END-TO-END FLOW PER EXCEL ROW
 --------------------------------------------------------------------------
 BATCH PRE-SCAN (runs once, before any MDT creation for any row)
 --------------------------------------------------------------------------
-  a) For every unique patient ID in the queue, search
-     D:\\SMS\\Cleaned_Processed_Patients_Doccuments (PATIENT_DOCS_ROOT,
-     excluding its UNDER_PROCESSED subfolder) for the PDF named after
-     that ID.
-       - FOUND LOCALLY: check the CMIS archive
-         (patient_pdf_dms_archive_fallback.py) for anything scanned in
-         the last RECENT_ARCHIVE_DAYS_BACK days (default 7 — a full week,
-         widened from the original today/yesterday-only window) that
-         isn't already in this file — if found, merge it on and
-         OVERWRITE the local file in place, then use it.
-       - NOT found locally, the order is:
-           i)  Try the SMC website first (patient_pdf_website_fallback.py).
-               If found, ALSO merge in the last RECENT_ARCHIVE_DAYS_BACK
-               days of CMIS archive pages, same as the local-found case —
-               just applied to the freshly-downloaded file.
-           ii) Only if the SMC website has nothing at all, fall back to
-               the patient's ENTIRE CMIS archive
-               (patient_pdf_dms_archive_fallback.py, full-extraction
-               mode) as the final fallback.
-       Anything freshly pulled by (i) or (ii) is saved into
-       PATIENT_DOCS_UNDER_PROCESSED_DIR (a subfolder of PATIENT_DOCS_ROOT)
-       — NOT directly into the cleaned root — so it's easy to find and is
-       never mistaken for an already-cleaned local file.
-       Only if BOTH fallbacks come up empty does that patient end up with
-       no document at all (any row for that ID is later logged FAILED
-       for that reason — this never blocks the rest of the run).
+  a) For every unique patient ID in the queue, look for the patient's
+     PDF named after that ID (PATIENT_DOCS_ROOT / the permanent R2 file).
+       - FOUND: use it as-is. New papers are added to it ONLY through the
+         «ملف المريض» screen (scanner -> top of the file in R2).
+       - NOT found: try the SMC website (patient_pdf_website_fallback.py).
+         A file pulled from SMC is saved into
+         PATIENT_DOCS_UNDER_PROCESSED_DIR - NOT directly into the cleaned
+         root - and must be reviewed before it is ever used.
+       No other source exists. If the website has nothing either, that
+       patient has no document (rows for that ID are logged FAILED for that
+       reason - this never blocks the rest of the run).
   b) If step (a) put anything into PATIENT_DOCS_UNDER_PROCESSED_DIR, your
      labeling server (DOC_LABELER_BATCH_PATH / start3.bat) is launched
      automatically, and the whole run PAUSES for you to clean/label those
@@ -154,20 +139,10 @@ HOW TO RUN
    is NOT required - the medical report is built directly as a PDF by
    medical_report_overlay.py (see that file's header for one-time setup).
 
-2. Keep these three files in the SAME FOLDER as this script - they are
+2. Keep these files in the SAME FOLDER as this script - they are
    imported directly, not standalone tools anymore:
        medical_report_overlay.py             (Stage 3 - report PDF)
-       patient_pdf_dms_archive_fallback.py   (Stage 4 - CMIS archive; runs first)
-       patient_pdf_website_fallback.py       (Stage 4 - SMC website; final fallback)
-   The CMIS archive module needs HMIS_USERNAME / HMIS_PASSWORD set in
-   the environment (same variables Extract_DMS_Patients_Prescriptioned_
-   Services_Data.py uses). It looks patients up by national ID directly
-   - no separate MR mapping file needed.
-
-   BEFORE relying on it in a real run, test it standalone first:
-       python dms_archive_explorer.py
-   against one patient you know has archived documents, and confirm the
-   PDF URLs it finds actually open. See that script's own header.
+       patient_pdf_website_fallback.py       (Stage 4 - SMC website)
 
 3. Edit the CONFIGURATION section below.
 
@@ -178,12 +153,10 @@ HOW TO RUN
    This runs run_self_test() (near the bottom of this file), which
    exercises locate_patient_document_pdf() and
    prompt_review_extracted_pdf() with fake stand-ins for the network
-   calls and for input() — it never touches CMIS, the SMC website, or
+   calls and for input() — it never touches the SMC website or
    your real files. It checks, and prints PASS/FAIL for, every branch:
-   local-found (no pause), website-found with a CMIS same-day merge,
-   website-found with nothing new in CMIS, website-empty but CMIS
-   full-archive succeeds, and nothing found anywhere — plus that typing
-   'c' resumes and 's' skips. Do not trust the real run until every
+   local-found (no pause), website-found, and nothing found anywhere —
+   plus that typing 'c' resumes and 's' skips. Do not trust the real run until every
    line says PASS.
 
 5. Run for real:
@@ -245,20 +218,13 @@ EXCEL_INPUT_PATH = os.path.join(SUBMISSION_ROOT, "TEMPLATE_EXCEL_FILES\IDS_1.xls
 # searched by patient ID appearing anywhere in the filename.
 PATIENT_DOCS_ROOT = r"D:\SMS\Cleaned_Processed_Patients_Doccuments"
 
-# Freshly-extracted-but-not-yet-cleaned patient PDFs (SMC website / CMIS
-# archive fallback) now land HERE instead of directly in PATIENT_DOCS_ROOT,
+# Freshly-extracted-but-not-yet-cleaned patient PDFs (SMC website) now land HERE instead of directly in PATIENT_DOCS_ROOT,
 # so they're easy to find and don't get treated as "already cleaned" by
 # find_patient_id_pdf() before you've had a chance to run them through the
 # labeling server. This is exactly the folder your labeler's start3.bat
 # already points --input at.
 PATIENT_DOCS_UNDER_PROCESSED_DIR = os.path.join(PATIENT_DOCS_ROOT, "UNDER_PROCESSED")
 
-# How many days back (inclusive of today) the CMIS archive is checked for
-# "recently added investigation papers" to merge onto a patient's document
-# PDF - whether that PDF was already local or was just pulled from the SMC
-# website. Widened from the original today/yesterday (2-day) window to a
-# full week, per your latest instruction.
-RECENT_ARCHIVE_DAYS_BACK = 7
 
 # Your local document-labeling/cleaning server (the one wired up via
 # app.py / index.html / start3.bat). start3.bat already points --input at
@@ -493,7 +459,7 @@ _add_generic_tumor_type("pancreatic_cancer", "Pancreatic Cancer", "سرطان ا
 #
 # CAUTION - Arabic diagnosis names below are my best direct translation
 # of each English label, NOT text you supplied or that's been confirmed
-# against the SMC/CMIS system (same caution the file's original
+# against the SMC system (same caution the file's original
 # placeholder-phrase types called out). These are only used to build the
 # generic report sentence ("A patient of <arabic_name> for <plan>") and
 # for GetDiagnosisData alias matching - verify each one before relying on
@@ -1159,36 +1125,10 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------
 from medical_report_overlay import build_medical_report_pdf  # noqa: E402
 
-# --------------------------------------------------------------------
-# Patient-document sourcing/refresh chain lives in two separate modules
-# (see each file's own header for full detail on how each was verified
-# against real captured site responses):
-#
-#   1. patient_pdf_dms_archive_fallback.py - talks to the on-prem
-#      CMIS/MRM portal. Used TWO ways in Stage 4 below, run BEFORE the
-#      website fallback:
-#        a) If a local PDF was already found for this patient, first
-#           REFRESH it in place - check CMIS's archive for anything
-#           scanned in the last RECENT_ARCHIVE_DAYS_BACK days (default
-#           7) and not yet in the local file, merge it on, overwrite
-#           the same local file.
-#        b) If no local PDF exists at all, do a FULL extraction of
-#           every archived PDF for this patient from CMIS and save it
-#           as a new file.
-#   2. patient_pdf_website_fallback.py - re-searches the SMC decree
-#      site itself for a Gustave-facility request with a downloadable
-#      PDF attached. Tried LAST, only if step 1 still leaves this row
-#      with no patient PDF at all (CMIS lookup failed entirely, or the
-#      patient truly has nothing archived there).
-# --------------------------------------------------------------------
-from patient_pdf_dms_archive_fallback import (  # noqa: E402
-    get_all_patient_archive_pdfs_merged,
-    refresh_local_pdf_with_recent_archive_docs,
-)
+# Patient-document sourcing: the permanent file (R2 / local folder), else the SMC website.
 from patient_pdf_website_fallback import download_patient_pdf_from_website  # noqa: E402
 
-# Where fallback-extracted patient document PDFs (SMC website / CMIS
-# archive) get saved when nothing was found locally. This used to point
+# Where fallback-extracted patient document PDFs (SMC website) get saved when nothing was found locally. This used to point
 # directly at PATIENT_DOCS_ROOT. It now points at the UNDER_PROCESSED
 # subfolder instead (per your latest instruction) - so a freshly-pulled,
 # not-yet-cleaned PDF is easy to find and review/label on its own, and is
@@ -1202,7 +1142,7 @@ os.makedirs(FALLBACK_PATIENT_DOCS_DIR, exist_ok=True)
 def normalize_extracted_patient_pdf_name(pdf_path: Optional[str], patient_id: str) -> Optional[str]:
     """Return a freshly extracted PDF as exactly ``<patient_id>.pdf``.
 
-    The DMS fallback may create names such as ``<patient_id>-archive.pdf``.
+    Extraction may create names such as ``<patient_id>-archive.pdf``.
     Keep the PDF in the same extraction directory while removing that source
     suffix so it follows the cleaned SMC naming convention.
     """
@@ -3719,68 +3659,33 @@ def locate_patient_document_pdf(
     *,
     find_local_fn=None,
     website_fn=None,
-    refresh_fn=None,
-    full_archive_fn=None,
     reconnect_fn=None,
 ) -> Tuple[Optional[str], Optional[str], bool]:
     """
-    Resolves the patient document PDF to use for this row, per the
-    (flipped) order you specified:
+    Resolves the patient document PDF to use for this row:
 
-        1. Local folder (PATIENT_DOCS_ROOT).
-             FOUND  -> always refresh with the last
-                       RECENT_ARCHIVE_DAYS_BACK days (default 7) of
-                       CMIS archive pages first (merged + overwritten
-                       in place), then use it. NOT "newly extracted".
-        2. SMC website (patient_pdf_website_fallback.py) — tried FIRST
-           among the two fallbacks now, only reached if step 1 found
-           nothing.
-             FOUND  -> also check the CMIS archive for the same
-                       RECENT_ARCHIVE_DAYS_BACK-day window and merge
-                       that onto the freshly-downloaded file before
-                       it's used. "newly extracted" = True.
-        3. CMIS full archive extraction (patient_pdf_dms_archive_
-           fallback.py) — final fallback, only reached if step 2 found
-           nothing either.
-             FOUND  -> "newly extracted" = True.
-        4. Nothing anywhere -> (None, None, False).
+        1. The permanent file (local folder / R2) - used as-is. New papers
+           reach it only through the «ملف المريض» screen.
+        2. SMC website (patient_pdf_website_fallback.py) - only if step 1
+           found nothing. "newly extracted" = True: the file must be
+           reviewed before it is used.
+        3. Nothing anywhere -> (None, None, False).
 
-    Every dependency is injectable (defaults to the real production
-    functions/module-level objects) purely so run_self_test() can swap
-    in fakes and exercise every branch without a network connection,
-    real credentials, or real files.
+    Every dependency is injectable purely so run_self_test() can swap in
+    fakes without a network connection, credentials, or real files.
 
     Returns (pdf_path_or_None, source_or_None, newly_extracted).
-    source is one of: "local", "website+archive", "cmis_full_archive".
-
-    Saves into FALLBACK_PATIENT_DOCS_DIR (== PATIENT_DOCS_ROOT), which
-    is exactly the folder find_patient_id_pdf() searches — so a
-    freshly-extracted file is found LOCALLY on every subsequent run
-    instead of being re-extracted from SMC/CMIS every time.
+    source is one of: "local", "website".
     """
     find_local_fn = find_local_fn or find_patient_id_pdf
     website_fn = website_fn or download_patient_pdf_from_website
-    refresh_fn = refresh_fn or refresh_local_pdf_with_recent_archive_docs
-    full_archive_fn = full_archive_fn or get_all_patient_archive_pdfs_merged
     reconnect_fn = reconnect_fn or call_with_reconnect
 
-    # ---- Step 1: local folder ----
     id_pdf_path = find_local_fn(patient_id)
     if id_pdf_path:
-        log.info(f"  Found local file {id_pdf_path} - checking CMIS archive for newer pages "
-                 f"(last {RECENT_ARCHIVE_DAYS_BACK} day(s)) …")
-        try:
-            refreshed = refresh_fn(patient_id, id_pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK)
-            if refreshed:
-                log.info("  Local file updated with newly archived page(s).")
-            else:
-                log.info("  Nothing new in the archive - using local file as-is.")
-        except Exception as exc:
-            log.warning(f"  Archive refresh check raised an error (using local file as-is): {exc}")
         return id_pdf_path, "local", False
 
-    # ---- Step 2: SMC website (tried FIRST of the two fallbacks) ----
-    log.info(f"  Not found under {PATIENT_DOCS_ROOT} - trying SMC website first …")
+    log.info(f"  Not found under {PATIENT_DOCS_ROOT} - trying the SMC website …")
     try:
         id_pdf_path = reconnect_fn(
             session, "website PDF fallback", website_fn,
@@ -3789,42 +3694,14 @@ def locate_patient_document_pdf(
     except Exception as exc:
         log.warning(f"  Website fallback raised an error, treating as not-found: {exc}")
         id_pdf_path = None
-
     if id_pdf_path:
-        log.info(f"  Found on SMC website - checking CMIS archive for the last "
-                 f"{RECENT_ARCHIVE_DAYS_BACK} day(s) of docs to merge in …")
-        try:
-            refreshed = refresh_fn(patient_id, id_pdf_path, days_back=RECENT_ARCHIVE_DAYS_BACK)
-            if refreshed:
-                log.info("  Website PDF updated with newly archived CMIS page(s).")
-            else:
-                log.info(f"  Nothing new in the CMIS archive for the last "
-                         f"{RECENT_ARCHIVE_DAYS_BACK} day(s).")
-        except Exception as exc:
-            log.warning(f"  CMIS archive merge-in raised an error (using website PDF as-is): {exc}")
-        return id_pdf_path, "website+archive", True
-
-    # ---- Step 3: CMIS full archive extraction (final fallback) ----
-    log.info("  Not on the SMC website either - trying full CMIS archive extraction "
-             "(final fallback) …")
-    try:
-        id_pdf_path = full_archive_fn(patient_id, FALLBACK_PATIENT_DOCS_DIR)
-    except Exception as exc:
-        log.warning(f"  CMIS archive extraction raised an error, treating as not-found: {exc}")
-        id_pdf_path = None
-
-    if id_pdf_path:
-        id_pdf_path = normalize_extracted_patient_pdf_name(id_pdf_path, patient_id)
-        return id_pdf_path, "cmis_full_archive", True
-
-    # ---- Step 4: nothing anywhere ----
+        return id_pdf_path, "website", True
     return None, None, False
 
 
 _DOC_SOURCE_LABELS = {
     "local": "your local patient-documents folder",
-    "website+archive": "the SMC website (merged with any recent-week CMIS archive pages)",
-    "cmis_full_archive": "the CMIS archive — full extraction (SMC website had nothing)",
+    "website": "the SMC website",
 }
 
 
@@ -3833,8 +3710,7 @@ def prompt_review_extracted_pdf(patient_id: str, pdf_path: str, doc_source: str,
     """
     The "important pause" you asked for: called ONLY when the patient
     document PDF was NOT already sitting locally and had to be pulled
-    by one of the fallbacks (doc_source in {"website+archive",
-    "cmis_full_archive"}). Never called for doc_source == "local".
+    by one of the fallbacks (doc_source == "website"). Never called for doc_source == "local".
 
     Blocks until the user answers, then returns "continue" or "skip".
     input_fn is injectable so run_self_test() can simulate keystrokes
@@ -3876,13 +3752,10 @@ def prompt_review_extracted_pdf(patient_id: str, pdf_path: str, doc_source: str,
 # creation. Instead, per your latest instruction:
 #
 #   1. Every unique patient ID in the whole queue is swept up front.
-#      Anyone already sitting in PATIENT_DOCS_ROOT is left alone (just
-#      refreshed with the last RECENT_ARCHIVE_DAYS_BACK days of CMIS
-#      archive pages, same as before).
-#   2. Anyone missing gets extracted RIGHT AWAY in this same pass -
-#      SMC website first (merged with the same recent-archive window),
-#      then the full CMIS archive as the final fallback - and saved into
-#      PATIENT_DOCS_UNDER_PROCESSED_DIR instead of the cleaned root.
+#      Anyone already sitting in PATIENT_DOCS_ROOT is left alone.
+#   2. Anyone missing gets extracted RIGHT AWAY in this same pass from the
+#      SMC website and saved into PATIENT_DOCS_UNDER_PROCESSED_DIR instead
+#      of the cleaned root.
 #   3. If anything landed in UNDER_PROCESSED, your labeling server is
 #      launched and the run pauses for you to clean/label it, then
 #      re-scans the cleaned root for the labeled result.
@@ -3903,7 +3776,7 @@ def prescan_and_prepare_patient_documents(
     Runs locate_patient_document_pdf() once per unique patient ID up
     front (not interleaved with MDT creation). locate_fn is injectable
     for testing; defaults to the real locate_patient_document_pdf, which
-    already implements local -> SMC website -> CMIS full archive in that
+    already implements local -> SMC website in that
     order and already saves fallback extractions into
     FALLBACK_PATIENT_DOCS_DIR (== PATIENT_DOCS_UNDER_PROCESSED_DIR).
 
@@ -3926,7 +3799,7 @@ def prescan_and_prepare_patient_documents(
             log.info(f"  -> [{source}] {path}")
         else:
             log.warning(f"  -> No patient document PDF found anywhere for {pid} "
-                        "(local / SMC website / CMIS archive all came up empty).")
+                        "(local / SMC website both came up empty).")
     return doc_map
 
 
@@ -3966,7 +3839,7 @@ def launch_doc_labeler_and_rescan(
 
     print("\n" + "=" * 70)
     print(f"{len(newly)} patient document PDF(s) were freshly extracted (SMC website / "
-          "CMIS archive) this run and saved into:")
+          "SMC website) this run and saved into:")
     print(f"  {PATIENT_DOCS_UNDER_PROCESSED_DIR}")
     for pid, info in newly.items():
         print(f"    {pid}  [{info['source']}]  ->  {info['path']}")
@@ -4042,7 +3915,7 @@ def prompt_global_review_decision(doc_map: Dict[str, Dict], input_fn=input) -> s
     print("PAUSED - freshly extracted/labeled patient documents need your decision")
     print("!" * 70)
     print(f"  {len(newly_ids)} patient ID(s) had NO local document at the start of this run")
-    print("  and were freshly pulled (SMC website / CMIS archive) and labeled:")
+    print("  and were freshly pulled (SMC website) and labeled:")
     for pid in newly_ids:
         info = doc_map[pid]
         print(f"    {pid}  [{info['source']}]  ->  {info['path']}")
@@ -4178,7 +4051,7 @@ def process_row(session: SMCSession, patient_id: str, description: str, tumor_ty
             if not id_pdf_path:
                 result["error"] = (
                     f"No patient document PDF found under {PATIENT_DOCS_ROOT}, on the SMC "
-                    f"website, or in the CMIS archive for patient {patient_id}. MDT request "
+                    f"website for patient {patient_id}. MDT request "
                     f"#{pre_request_id} was already created on the site — this row is skipped; "
                     "move on to the next one."
                 )
@@ -4426,9 +4299,8 @@ def main():
 
     # ---- BATCH PRE-SCAN (new, once per run, before any MDT creation) ----
     # 1. Sweep every unique patient ID in the queue: local folder first
-    #    (refreshed with the last RECENT_ARCHIVE_DAYS_BACK days of CMIS
-    #    archive pages), then SMC website, then full CMIS archive - for
-    #    IDs with no local file. Fallback extractions land in
+    #    (the permanent file, else the SMC website) for IDs with no local
+    #    file. Fallback extractions land in
     #    PATIENT_DOCS_UNDER_PROCESSED_DIR, not the cleaned root.
     unique_patient_ids = list(dict.fromkeys(pid for pid, *_ in queue))
     log.info(f"\n{'='*65}\nPre-scan: locating patient document PDFs for all "
@@ -4553,83 +4425,49 @@ def run_self_test():
     def local_found(_pid):
         return "/fake/local/12345.pdf"
 
-    def refresh_says_nothing_new(_pid, _path, **_kwargs):
-        return False
-
     path, source, newly = locate_patient_document_pdf(
         fake_session, "12345",
-        find_local_fn=local_found, refresh_fn=refresh_says_nothing_new,
+        find_local_fn=local_found,
         website_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("website_fn should not be called")),
-        full_archive_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("full_archive_fn should not be called")),
         reconnect_fn=fake_reconnect,
     )
     check("Case 1: local file found -> used directly", path == "/fake/local/12345.pdf")
     check("Case 1: source reported as 'local'", source == "local")
     check("Case 1: NOT flagged newly_extracted (no pause)", newly is False)
 
-    # ---- Case 2: not local, found on website, CMIS has a same-day merge ----
+    # ---- Case 2: not local, found on website -> review required ----
     def local_missing(_pid):
         return None
 
     def website_finds_it(*a, **k):
         return "/fake/website/12345.pdf"
 
-    merge_calls = []
-
-    def refresh_merges_something(pid, path_, **_kwargs):
-        merge_calls.append((pid, path_))
-        return True
-
     path, source, newly = locate_patient_document_pdf(
         fake_session, "12345",
         find_local_fn=local_missing, website_fn=website_finds_it,
-        refresh_fn=refresh_merges_something,
-        full_archive_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("full_archive_fn should not be called")),
         reconnect_fn=fake_reconnect,
     )
-    check("Case 2: SMC website tried BEFORE CMIS full archive", path == "/fake/website/12345.pdf")
-    check("Case 2: source reported as 'website+archive'", source == "website+archive")
-    check("Case 2: IS flagged newly_extracted (pause required)", newly is True)
-    check("Case 2: CMIS recent-archive merge was attempted on the website PDF",
-          merge_calls == [("12345", "/fake/website/12345.pdf")])
+    check("Case 2: SMC website used when nothing local", path == "/fake/website/12345.pdf")
+    check("Case 2: source reported as 'website'", source == "website")
+    check("Case 2: IS flagged newly_extracted (review required)", newly is True)
 
-    # ---- Case 3: not local, found on website, nothing new in CMIS ----
+    # ---- Case 3: website raises -> treated as not found ----
+    def website_raises(*a, **k):
+        raise RuntimeError("boom")
+
     path, source, newly = locate_patient_document_pdf(
         fake_session, "12345",
-        find_local_fn=local_missing, website_fn=website_finds_it,
-        refresh_fn=refresh_says_nothing_new,
-        full_archive_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("full_archive_fn should not be called")),
-        reconnect_fn=fake_reconnect,
+        find_local_fn=local_missing, website_fn=website_raises, reconnect_fn=fake_reconnect,
     )
-    check("Case 3: website file still used when CMIS has nothing new", path == "/fake/website/12345.pdf")
-    check("Case 3: still flagged newly_extracted", newly is True)
+    check("Case 3: website error -> not found, no crash", path is None and source is None and newly is False)
 
-    # ---- Case 4: not local, website empty -> full CMIS archive extraction ----
+    # ---- Case 5: nothing anywhere ----
     def website_finds_nothing(*a, **k):
         return None
 
-    def full_archive_finds_it(_pid, _dir):
-        return "/fake/cmis_archive/12345_archive.pdf"
-
     path, source, newly = locate_patient_document_pdf(
         fake_session, "12345",
         find_local_fn=local_missing, website_fn=website_finds_nothing,
-        refresh_fn=refresh_says_nothing_new, full_archive_fn=full_archive_finds_it,
-        reconnect_fn=fake_reconnect,
-    )
-    check("Case 4: falls through to full CMIS archive when website is empty",
-          path == "/fake/cmis_archive/12345_archive.pdf")
-    check("Case 4: source reported as 'cmis_full_archive'", source == "cmis_full_archive")
-    check("Case 4: IS flagged newly_extracted (pause required)", newly is True)
-
-    # ---- Case 5: nothing anywhere ----
-    def full_archive_finds_nothing(_pid, _dir):
-        return None
-
-    path, source, newly = locate_patient_document_pdf(
-        fake_session, "12345",
-        find_local_fn=local_missing, website_fn=website_finds_nothing,
-        refresh_fn=refresh_says_nothing_new, full_archive_fn=full_archive_finds_nothing,
         reconnect_fn=fake_reconnect,
     )
     check("Case 5: nothing found anywhere -> path is None", path is None)
@@ -4639,7 +4477,7 @@ def run_self_test():
     # ---- Case 6: review pause — typing 'c' continues ----
     fake_inputs_c = iter(["c"])
     decision = prompt_review_extracted_pdf(
-        "12345", "/fake/website/12345.pdf", "website+archive", "PR-999",
+        "12345", "/fake/website/12345.pdf", "website", "PR-999",
         input_fn=lambda _prompt: next(fake_inputs_c),
     )
     check("Case 6: typing 'c' returns 'continue'", decision == "continue")
@@ -4647,7 +4485,7 @@ def run_self_test():
     # ---- Case 7: review pause — typing 's' skips ----
     fake_inputs_s = iter(["s"])
     decision = prompt_review_extracted_pdf(
-        "12345", "/fake/cmis_archive/12345_archive.pdf", "cmis_full_archive", "PR-999",
+        "12345", "/fake/website/12345.pdf", "website", "PR-999",
         input_fn=lambda _prompt: next(fake_inputs_s),
     )
     check("Case 7: typing 's' returns 'skip'", decision == "skip")
@@ -4655,7 +4493,7 @@ def run_self_test():
     # ---- Case 8: review pause — re-prompts on garbage input, then accepts 'skip' ----
     fake_inputs_retry = iter(["blah", "", "skip"])
     decision = prompt_review_extracted_pdf(
-        "12345", "/fake/website/12345.pdf", "website+archive", "PR-999",
+        "12345", "/fake/website/12345.pdf", "website", "PR-999",
         input_fn=lambda _prompt: next(fake_inputs_retry),
     )
     check("Case 8: invalid input is rejected and it re-prompts until valid", decision == "skip")
@@ -4665,7 +4503,7 @@ def run_self_test():
         if pid == "111":
             return "/fake/local/111.pdf", "local", False
         if pid == "222":
-            return "/fake/under_processed/222.pdf", "website+archive", True
+            return "/fake/under_processed/222.pdf", "website", True
         return None, None, False
 
     doc_map = prescan_and_prepare_patient_documents(
@@ -4689,7 +4527,7 @@ def run_self_test():
     check("Case 10: doc_map returned unchanged", result_map is doc_map_local_only)
 
     # ---- Case 11: labeler step launches, waits, and re-scans for freshly extracted docs ----
-    doc_map_fresh = {"222": {"path": "/fake/under_processed/222.pdf", "source": "website+archive", "newly_extracted": True}}
+    doc_map_fresh = {"222": {"path": "/fake/under_processed/222.pdf", "source": "website", "newly_extracted": True}}
     launch_calls2 = []
     waited = []
     result_map2 = launch_doc_labeler_and_rescan(
@@ -4701,7 +4539,7 @@ def run_self_test():
     check("Case 11: labeler launched exactly once", launch_calls2 == [DOC_LABELER_BATCH_PATH])
     check("Case 11: run paused waiting for confirmation", waited == [True])
     check("Case 11: cleaned path picked up after re-scan", result_map2["222"]["path"] == "/fake/cleaned/222.pdf")
-    check("Case 11: source annotated with '+labeled'", result_map2["222"]["source"] == "website+archive+labeled")
+    check("Case 11: source annotated with '+labeled'", result_map2["222"]["source"] == "website+labeled")
 
     # ---- Case 12: global review decision — 'c' includes freshly-extracted rows ----
     decision = prompt_global_review_decision(doc_map_fresh, input_fn=lambda _p: "c")

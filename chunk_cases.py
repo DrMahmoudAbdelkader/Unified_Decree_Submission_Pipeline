@@ -29,7 +29,7 @@ THREE INVARIANTS THIS FILE EXISTS TO PROTECT
    prepare.py's doc_cache and pending_review_by_patient dicts are scoped
    to one process (see resolve_patient_document() and
    link_sibling_to_pending_review()). Split one patient across two
-   SIMULTANEOUS runs and you get: the slow SMC/CMIS document search run
+   SIMULTANEOUS runs and you get: the slow SMC document search run
    twice concurrently, two racing uploads to the same
    r2 pending/<id>.pdf key, and two independent human review cards for
    one physical document — exactly the bug the sibling-linking logic

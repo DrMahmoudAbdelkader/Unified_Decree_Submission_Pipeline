@@ -38,6 +38,17 @@ ADJUSTMENTS applied on top of the DB gate (see _adjust()):
                             TOPUP_MANUAL_REQUIRE_FRESH_H=<hours> (default 0 = off) additionally refuses entries whose manual-request
                             check never ran / is older than that.
 
+EVERYTHING ABOVE IS A WARNING, NOT A WALL (patient-file workflow):
+    A request that is not ready is held back the FIRST time with an open requirement whose text starts with WARN_PREFIX (nothing is
+    sent, no MDT is consumed). In «إرسال طلبات SMC» the user presses «إرسال» again: the page shows that warning, and when the user
+    confirms with OK it writes a row into topup_gate_acks (case_id, scope). From then on the checks below are only LOGGED and the
+    request goes through: no invoices yet -> sent without them, manual SMC request pending -> sent anyway, ID card not corrected ->
+    sent with the patient's file as it is. For an ID-card letter the page already shows the ID-card warning BEFORE the first press and
+    writes the ack itself (scope ID_CARD), so one OK is enough.
+      scope ALL      silences every reason above
+      scope ID_CARD  silences ONLY the ID-card reason (a manual SMC request / auto-resolved entry still warns first)
+    No row = old behaviour (held back with the warning). Table missing -> logged, behaves as "no row" (nothing breaks).
+
 A request that is not linked to any candidate is not a top-up: every function is then a no-op
 and the pipeline behaves exactly as before. If the DB function itself cannot be called (migration
 not applied) the gate FAILS OPEN with a warning, so normal requests are never blocked by it.
@@ -76,6 +87,56 @@ _CONTINUOUS_DEFAULT = ("hormonal", "zoladex", "hormonal_zoladex", "tamoxifen", "
 
 # kinds that run the same workflow: cycle counts + signed invoices + report sentence
 TOPUP_LIKE = ("TOPUP", "PREV_INCLUSIVE")
+
+
+WARN_PREFIX = "تنبيه قبل الإرسال: "    # smc-submissions.js looks for exactly this text at the start of the open requirement
+WARN_HELP = " — إن رأيت أنه لا يمنع الإرسال فاضغط «إرسال» من وحدة «إرسال طلبات SMC» ووافق على رسالة التنبيه، وسيُرسل الطلب."
+
+# the ID-card note (same wording as ID_CARD_WARNING in smc-submissions.js / decree-topup.js)
+ID_CARD_WARNING = ("بطاقة الرقم القومي الجديدة يجب أن تُضاف عبر «ملف المريض». فحص بطاقة الخطابات الإدارية يقرأ سجل الإضافات، "
+                   "والبطاقة التي تُعتمد عبر «إرسال طلبات SMC» فقط لا تُسجَّل فيه فيبقى الخطاب بانتظار البطاقة. "
+                   "إن أرسلت الآن فسيُرسل الطلب بملف المريض كما هو دون ضمان وجود البطاقة الجديدة فيه.")
+
+_ACK_CACHE: dict = {}      # case_id -> scope ("ALL" | "ID_CARD")
+
+
+def _ack_scope(case_id) -> Optional[str]:
+    """'ALL' / 'ID_CARD' when the user pressed OK on the warning for this case (row in topup_gate_acks), else None. Never raises."""
+    cid = int(case_id)
+    if _ACK_CACHE.get(cid) == "ALL":
+        return "ALL"
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/topup_gate_acks", headers=_hdr(), timeout=20,
+                         params={"select": "case_id,scope", "case_id": f"eq.{cid}", "limit": 1})
+        if not r.ok:
+            log.warning(f"topup_gate_acks not readable (HTTP {r.status_code}) - run topup_gate_acks.sql; treated as 'not acknowledged'")
+            return _ACK_CACHE.get(cid)
+        rows = r.json() or []
+        if rows:
+            sc = "ID_CARD" if (rows[0].get("scope") or "ALL").upper() == "ID_CARD" else "ALL"
+            _ACK_CACHE[cid] = sc
+            return sc
+    except Exception as exc:
+        log.warning(f"ack check skipped for case {cid}: {exc}")
+    return _ACK_CACHE.get(cid)
+
+
+def _reason_scope(g: dict) -> str:
+    """ID_CARD when the ONLY thing missing is the ID-card correction; ALL for anything else (manual request, invoices ...)."""
+    if (g.get("kind") == "ID_CARD" and not g.get("manual_pending") and not g.get("manual_stale") and not g.get("auto_resolved")):
+        return "ID_CARD"
+    return "ALL"
+
+
+def _acked(case_id, g: Optional[dict] = None) -> bool:
+    sc = _ack_scope(case_id)
+    if sc == "ALL":
+        return True
+    return bool(sc == "ID_CARD" and g is not None and _reason_scope(g) == "ID_CARD")
+
+
+def _warn(msg: str) -> str:
+    return WARN_PREFIX + msg + WARN_HELP
 
 
 class TopupNotReady(Exception):
@@ -301,21 +362,21 @@ def manual_message(g: dict) -> str:
         parts.append(f"#{r.get('request_number')}" + (f" بتاريخ {d}" if d else "") + (f" — الحالة: {r.get('status_raw')}" if r.get("status_raw") else "")
                      + (f" — الخطة: {(r.get('plan_text') or '')[:120]}" if r.get("plan_text") else ""))
     more = f" (+{len(rows) - 5} أخرى)" if len(rows) > 5 else ""
-    return ("لا يمكن إرسال طلب جديد: يوجد للمريض طلب مُقدَّم يدوياً على موقع SMC خارج النظام ولم يصل بعد إلى «قرار نهائي» أو «خطاب إداري»: "
-            + " | ".join(parts) + more + ". انتظر نتيجته (يُفحص تلقائياً كل 24 ساعة) أو اضغط «تجاهل» على الطلب من صفحة «متابعة الخطابات الإداريه» إن كان لا يخص هذه الخطة.")
+    return ("يوجد للمريض طلب مُقدَّم يدوياً على موقع SMC خارج النظام ولم يصل بعد إلى «قرار نهائي» أو «خطاب إداري»: "
+            + " | ".join(parts) + more + ". الأفضل انتظار نتيجته (يُفحص تلقائياً كل 24 ساعة) أو الضغط على «تجاهل» عليه من صفحة «متابعة الخطابات الإداريه» إن كان لا يخص هذه الخطة؛ وإرسال طلب جديد قد يكرره.")
 
 
 def not_ready_message(g: dict) -> str:
     if g.get("manual_pending"):
         return manual_message(g)
     if g.get("manual_stale"):
-        return f"لا يمكن إرسال الطلب: {g['manual_stale']}. اضغط «فحص الطلبات اليدوية» على الخطاب من صفحة «متابعة الخطابات الإداريه» ثم أعد المحاولة."
+        return f"{g['manual_stale']}. يمكنك الضغط على «فحص الطلبات اليدوية» على الخطاب من صفحة «متابعة الخطابات الإداريه» للتأكد قبل الإرسال."
     if g.get("auto_resolved"):
-        return g.get("auto_resolved_message") or "تم الحل تلقائياً — لا حاجة لطلب جديد."
+        return (g.get("auto_resolved_message") or "تم الحل تلقائياً") + " — لا حاجة لطلب جديد على الأرجح."
     kind = g.get("kind") or "TOPUP"
-    head = f"طلب «{KIND_LABEL.get(kind, kind)}» لا يمكن إرساله بعد: "
+    head = f"طلب «{KIND_LABEL.get(kind, kind)}» غير مكتمل: "
     if kind == "ID_CARD":
-        return head + "لم يُضغط «تم التصحيح» بعد استبدال صورة بطاقة الرقم القومي في مستندات المريض."
+        return ID_CARD_WARNING
     if kind == "PREV_REPORT":
         return head + (f"تقرير القرار السابق غير جاهز (الحالة: {g.get('evidence_status')}). "
                        f"افتح صفحة «متابعة الخطابات الإداريه» وتأكد من جلب التقرير أو اعتماده.")
@@ -353,10 +414,17 @@ def _dose_hold(case_id: int, g: dict) -> Optional[str]:
 def assert_ready(case_id: int) -> None:
     g = _gate(case_id)
     if g.get("is_topup") and not g.get("ready"):
-        raise TopupNotReady(not_ready_message(g))
+        msg = not_ready_message(g)
+        if _acked(case_id, g):
+            log.warning(f"  case {case_id}: warning acknowledged by the user - sending anyway ({msg[:200]})")
+        else:
+            raise TopupNotReady(_warn(msg))
     hold = _dose_hold(case_id, g)
     if hold:
-        raise TopupNotReady(hold)
+        if _acked(case_id):                                   # dose-count holds are never covered by the ID_CARD-only ack
+            log.warning(f"  case {case_id}: dose-count warning acknowledged by the user - sending anyway ({hold[:200]})")
+        else:
+            raise TopupNotReady(_warn(hold))
 
 
 _UNIT_EN = {"جرعه": "dose", "جرعة": "dose", "دورة": "cycle", "دوره": "cycle"}
@@ -410,7 +478,10 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
         return patient_pdf_path
     docs = _documents(int(g["candidate_id"]))
     if not docs:
-        raise TopupNotReady(not_ready_message({**g, "ready": False}))
+        if _acked(case_id):
+            log.warning(f"  [top-up] case {case_id}: no stored invoices/report - sent WITHOUT them because the user acknowledged the warning.")
+            return patient_pdf_path
+        raise TopupNotReady(_warn(not_ready_message({**g, "ready": False})))
 
     try:
         from pypdf import PdfReader, PdfWriter
@@ -459,16 +530,24 @@ def with_invoices(case_id: int, patient_pdf_path: str) -> str:
 
 
 def split_ready(cases: List[dict]) -> Tuple[List[dict], List[dict]]:
-    """For prepare's bulk run: cases that are top-up retries and NOT ready are held back (and an
-    OPEN requirement tells the operator why) instead of consuming an MDT; everything else passes."""
+    """For prepare's bulk run: top-up retries that are NOT ready are held back the first time (and an OPEN requirement starting
+    with WARN_PREFIX tells the operator why) instead of consuming an MDT. A case the user already acknowledged (topup_gate_acks) is
+    NOT held back - the warning was shown and confirmed. Everything else passes."""
     ready, blocked = [], []
     for c in cases:
         g = _gate(c["id"])
-        msg = None
+        msg, acked = None, False
         if g.get("is_topup") and not g.get("ready"):
             msg = not_ready_message(g)
+            acked = _acked(c["id"], g)
         elif g.get("is_topup"):
             msg = _dose_hold(c["id"], g)
+            acked = bool(msg) and _acked(c["id"])
+        if msg and acked:
+            log.warning(f"  case {c['id']}: warning acknowledged by the user - not held back ({msg[:160]})")
+            msg = None
+        elif msg:
+            msg = _warn(msg)
         if msg:
             blocked.append({"case_id": c["id"], "message": msg, "kind": g.get("kind")})
             try:

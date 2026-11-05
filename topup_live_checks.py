@@ -18,20 +18,19 @@ CHECK 1 - MANUAL / OUTSIDE-THE-APP REQUESTS   (every kind: TOPUP, PREV_INCLUSIVE
   page (whatever it says: a manual request does not use the app's standard plans). While one exists the entry is NOT a
   work item (the page moves it to «سبق التعامل معها») and topup_gate refuses to send a new request for it.
 
-CHECK 2 - NEW ID CARD IN THE DMS ARCHIVE   (kind ID_CARD only)
-  Opens the patient in CMIS like the submission workflow does and looks for archive rows dated ON/AFTER the day the letter
-  arrived (and not rejected before). Found  -> the new paper(s) are merged into ONE pdf, stored in R2 and
-  decree_topup_invoices (doc_kind ID_CARD_NEW) for the user to look at, and the entry is marked READY through
-  topup_mark_id_fixed (so it shows in «تم التصحيح - جاهز للطلب»). Not found -> idcard_state = WAITING_NEW (tab «بانتظار بطاقة
-  سارية جديدة»); it is checked again every 24 h. If the user finds the paper is NOT a valid card he presses «البطاقة غير سارية»
-  (topup_idcard_reject, migration 15): those archive rows are remembered as rejected and the entry goes back to waiting.
-  When the request is later filed through the normal workflow, its patient PDF already contains the new archive pages.
+CHECK 2 - NEW ID CARD IN THE PATIENT FILE   (kind ID_CARD only)
+  Staff scan the new card on the «ملف المريض» screen and label it ID_FRONT / ID_BACK / ID_FRONT_BACK; the save is logged in
+  patient_document_additions. An addition dated ON/AFTER the day the letter arrived, carrying an ID label and not rejected
+  before, means the valid card is now INSIDE the patient's file: the entry is marked READY through topup_mark_id_fixed (tab
+  «تم التصحيح - جاهز للطلب»). Not found -> idcard_state = WAITING_NEW (tab «بانتظار بطاقة سارية جديدة») and the patient is put
+  on hold (patient_file_gate) so no request goes out with the old card. If the user finds the saved scan is NOT a valid card
+  he presses «البطاقة غير سارية» (topup_idcard_reject): that addition id is remembered as rejected and the entry goes back to waiting.
 
 WIRING (see the delivery notes): migration 15 creates decree_topup_manual_requests + the columns/RPCs used here; topup_gate.py
 blocks the send while a manual request is stored; decree-topup.js moves such entries to «سبق التعامل معها» and shows the request
 (number, date, status, plan text) on the card; ID_CARD tabs: «بانتظار بطاقة سارية جديدة» / «تم التصحيح — جاهز للطلب».
 
-NOT TESTED against live SMC / CMIS. The plan-text reader for Requests/Details is label-based (see _plan_text) and has to be
+NOT TESTED against live SMC. The plan-text reader for Requests/Details is label-based (see _plan_text) and has to be
 checked once on a real manual request.
 """
 from __future__ import annotations
@@ -265,7 +264,7 @@ def check_manual(c: dict, smc, status_map, cache: dict) -> int:
     return len(rows)
 
 
-# =========================================================================== CHECK 2 - new ID card in DMS
+# =========================================================================== CHECK 2 - new ID card in the patient file
 def _letter_date(c: dict):
     if c.get("source_case_id"):
         try:
@@ -287,66 +286,38 @@ def _r2():
 
 
 def check_idcard(c: dict) -> str:
-    """-> 'FOUND' | 'WAITING_NEW' | 'ERROR'"""
-    import patient_pdf_dms_archive_fallback as dms
+    """-> 'FOUND' | 'WAITING_NEW' | 'ERROR'
+
+    No DMS any more. The ID card arrives through the «ملف المريض» screen: staff scan the new card, label the page
+    ID_FRONT / ID_BACK / ID_FRONT_BACK in the reviewer and save it at the top of the patient's file. That save is logged in
+    patient_document_additions. An addition dated on/after the letter, carrying an ID label and not rejected by the reviewer
+    of this entry, means the valid card is now INSIDE the patient's file (and the normal workflow uses that file).
+    No such addition -> the entry stays «بانتظار بطاقة سارية» and a patient-file HOLD keeps new requests from going out."""
+    import patient_file_gate as gate
     cid = c["id"]
     nid = national_id_of(c.get("patient_id"))
     letter = _letter_date(c)
     if not nid or not letter:
         _set(cid, idcard_check_at=_now().isoformat(), idcard_message="الرقم القومي أو تاريخ الخطاب غير معروف")
         return "ERROR"
-    rejected = set(c.get("idcard_rejected_ids") or [])
-    opened = dms._open_patient_session(nid)
-    if not opened:
-        _set(cid, idcard_check_at=_now().isoformat(), idcard_message="تعذّر فتح أرشيف DMS للمريض (تسجيل الدخول/البحث) — يُعاد بعد 24 ساعة")
-        return "ERROR"
-    session, mr, index_html = opened
-    ids = dms.extract_archive_row_dates(index_html)
+    rejected = {str(x) for x in (c.get("idcard_rejected_ids") or [])}
     floor = letter if IDCARD_SAME_DAY else letter + timedelta(days=1)
-    new = [i for i in ids if (dms._parse_row_date(i) or date.min) >= floor and i not in rejected]
+    rows = _rest("GET", "patient_document_additions",
+                 params={"select": "id,added_at,doc_codes,pages_added", "national_id": f"eq.{nid}",
+                         "added_at": f"gte.{floor.isoformat()}", "order": "added_at.desc"}) or []
+    new = [r for r in rows if str(r["id"]) not in rejected
+           and any(x in gate.ID_CODES for x in (r.get("doc_codes") or []))]
     if not new:
+        gate.open_id_card_hold(nid, source_case_id=c.get("source_case_id"))
         _set(cid, idcard_state="WAITING_NEW", idcard_check_at=_now().isoformat(),
-             idcard_message=f"لا توجد أوراق أرشيف بتاريخ {floor:%d/%m/%Y} أو بعده — فُحص {len(ids)} صف")
+             idcard_message=f"لم تُضف بطاقة جديدة لملف المريض بتاريخ {floor:%d/%m/%Y} أو بعده — امسحها من شاشة «ملف المريض»")
         return "WAITING_NEW"
-    gallery = dms.call_archive_view_all(session, new)
-    urls = dms.parse_gallery_pdf_urls(gallery) if gallery else []
-    blobs = [b for b in (dms._download_pdf_bytes(session, u) for u in urls) if b]
-    if not blobs:
-        _set(cid, idcard_check_at=_now().isoformat(), idcard_message="وُجدت أوراق أرشيف جديدة لكن تعذّر تنزيلها — يُعاد بعد 24 ساعة")
-        return "ERROR"
-    tmp = os.path.join(tempfile.mkdtemp(prefix="idcard_"), f"{nid}_idcard.pdf")
-    if not dms._merge_pdf_bytes_list(blobs, tmp):
-        _set(cid, idcard_check_at=_now().isoformat(), idcard_message="تعذّر دمج أوراق الأرشيف الجديدة")
-        return "ERROR"
-    data = open(tmp, "rb").read()
-    import pymupdf
-    d = pymupdf.open(stream=data, filetype="pdf")
-    pages = len(d)
-    d.close()
-    key = f"topup-idcards/{cid}/{_now():%Y%m%d%H%M%S}.pdf"
-    bucket = os.environ["R2_BUCKET_NAME"]
-    s3 = _r2()
-    old = _rest("GET", INV, params={"select": "id,r2_key", "candidate_id": f"eq.{cid}", "doc_kind": "eq.ID_CARD_NEW"}) or []
-    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/pdf")
-    for o in old:
-        if o.get("r2_key"):
-            try:
-                s3.delete_object(Bucket=bucket, Key=o["r2_key"])
-            except Exception:
-                pass
-        _rest("DELETE", INV, params={"id": f"eq.{o['id']}"})
-    dates = sorted({str(dms._parse_row_date(i)) for i in new})
-    _rest("POST", INV, json=[{
-        "candidate_id": cid, "decree_number": "IDCARD", "receipt_id": f"IDCARD-{cid}", "doc_kind": "ID_CARD_NEW",
-        "signed_source": "dms_archive", "r2_key": key, "bytes": len(data), "page_count": pages,
-        "sha256": hashlib.sha256(data).hexdigest(), "status": "REVIEW",
-        "verification": {"archive_ids": new, "letter_date": str(letter)},
-        "message": f"أوراق أرشيف DMS جديدة بتاريخ {', '.join(dates)} — راجع أنها تحمل البطاقة السارية",
-        "fetched_at": _now().isoformat()}], headers={"Prefer": "return=minimal"})
-    _set(cid, idcard_state="FOUND", idcard_found_ids=new, idcard_found_at=_now().isoformat(),
-         idcard_check_at=_now().isoformat(), idcard_message=f"{len(new)} ورقة أرشيف جديدة ({', '.join(dates)}) — {pages} صفحة")
-    _rpc("topup_mark_id_fixed", {"p_id": cid, "p_note": f"وُجدت أوراق أرشيف جديدة بتاريخ {', '.join(dates)} — راجع الملف المستخرج"})
-    log.info(f"  candidate {cid}: ID-card check FOUND {len(new)} new archive row(s) -> marked ready for review")
+    ids = [str(r["id"]) for r in new]
+    when = ", ".join(sorted({str(r["added_at"])[:10] for r in new}))
+    _set(cid, idcard_state="FOUND", idcard_found_ids=ids, idcard_found_at=_now().isoformat(),
+         idcard_check_at=_now().isoformat(), idcard_message=f"أُضيفت بطاقة جديدة لملف المريض ({when}) — راجع الملف ثم أعد الطلب")
+    _rpc("topup_mark_id_fixed", {"p_id": cid, "p_note": f"أُضيفت بطاقة جديدة لملف المريض بتاريخ {when}"})
+    log.info(f"  candidate {cid}: ID-card check FOUND {len(new)} addition(s) in the patient file -> marked ready")
     return "FOUND"
 
 
