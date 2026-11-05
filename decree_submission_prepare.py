@@ -179,7 +179,8 @@ def stage_and_flag_for_review(case: dict, attempt_id: int, national_id: str, pre
     the reviewed file to R2's permanent key."""
     case_id = case["id"]
 
-    if not r2_client.upload_pending(national_id, extracted_pdf_path):
+    # doc_source == "r2_pending": the file already IS pending/<nid>.pdf - never upload over it (see resolve_patient_document).
+    if doc_source != "r2_pending" and not r2_client.upload_pending(national_id, extracted_pdf_path):
         common.open_requirement(case_id, attempt_id,
                                  "تم استخراج مستند المريض لكن تعذر رفعه للمراجعة على Cloudflare R2 — حاول مرة أخرى.")
         return
@@ -269,6 +270,16 @@ def resolve_patient_document(session: SMCSession, national_id: str, doc_cache: D
     New papers are NOT looked for here: they are added by staff on the «ملف المريض» screen."""
     if national_id in doc_cache:
         return doc_cache[national_id]
+
+    # PENDING REUSE: no permanent file yet, but an SMC extract is already waiting at pending/<nid>.pdf (maybe with scans
+    # the staff added on top of it from «ملف المريض»). Use THAT file - re-extracting from SMC and calling upload_pending()
+    # would overwrite it and silently throw the staff's scans away. It still needs review (newly_extracted=True).
+    if not r2_client.exists(national_id):
+        pending_path = r2_client.download_pending(national_id, common.PATIENT_DOC_CACHE_DIR)
+        if pending_path:
+            result = (pending_path, "r2_pending", True)
+            doc_cache[national_id] = result
+            return result
 
     pdf_path, doc_source, newly_extracted = locate_patient_document_pdf(
         session, national_id,

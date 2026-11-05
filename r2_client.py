@@ -125,6 +125,23 @@ def download_if_exists(national_id: str, output_dir: str) -> Optional[str]:
         return None
 
 
+def download_pending(national_id: str, output_dir: str) -> Optional[str]:
+    """Downloads pending/<id>.pdf (the SMC extract, possibly with scans already merged on top by the
+    «ملف المريض» screen) so prepare REUSES it instead of re-extracting from SMC and overwriting it.
+    Returns the local path or None."""
+    if not _configured() or not pending_exists(national_id):
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    local_path = os.path.join(output_dir, "pending_" + _key_for(national_id))
+    try:
+        _get_client().download_file(R2_BUCKET_NAME, _pending_key_for(national_id), local_path)
+        log.info(f"  [R2 pending reuse] {national_id} -> {local_path}")
+        return local_path
+    except ClientError as e:
+        log.warning(f"R2 pending download failed for {national_id}: {e}")
+        return None
+
+
 def _pending_key_for(national_id: str) -> str:
     """Freshly-extracted-but-not-yet-labeled candidates live under pending/
     in the SAME bucket as the permanent, labeled archive — one storage
