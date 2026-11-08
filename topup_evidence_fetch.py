@@ -478,13 +478,40 @@ def _install_invoice_font() -> None:
         font_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "fonts")
         os.makedirs(font_dir, exist_ok=True)
         got = []
-        for obj in ("fonts/times.ttf", "fonts/timesbd.ttf", "fonts/timesi.ttf", "fonts/timesbi.ttf"):
+        bucket = (os.environ.get("DECREE_ASSETS_BUCKET") or "decree-assets").strip("/")
+        hdr = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
+        listed = {}                                   # lower-case file name -> exact object path in the bucket
+        for prefix in ("fonts", ""):
             try:
-                if supabase_storage.download(supabase_storage.ASSETS_BUCKET, obj,
-                                             os.path.join(font_dir, os.path.basename(obj))):
-                    got.append(obj)
+                lr = requests.post(f"{SUPABASE_URL}/storage/v1/object/list/{bucket}",
+                                   json={"prefix": prefix, "limit": 500}, headers=hdr, timeout=30)
+                names = [o.get("name") for o in (lr.json() if lr.ok else []) if o.get("name")]
             except Exception:
-                pass
+                names = []
+            for n in names:
+                listed.setdefault(n.lower(), f"{prefix}/{n}" if prefix else n)
+            if prefix == "fonts":
+                log.info(f"fonts folder in {bucket}: {names or 'EMPTY / not listable'}")
+        for want in ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"):
+            dest = os.path.join(font_dir, want)
+            if os.path.exists(dest) and os.path.getsize(dest) > 10_000:      # already on disk (cache / earlier call): no download
+                got.append(f"fonts/{want}")
+                continue
+            obj = listed.get(want) or listed.get(f"fonts/{want}")
+            if not obj:
+                log.warning(f"{want}: no object with this name (any letter case) under {bucket}/fonts - see the folder listing above")
+                continue
+            try:
+                from urllib.parse import quote
+                fr = requests.get(f"{SUPABASE_URL}/storage/v1/object/{bucket}/{quote(obj)}", headers=hdr, timeout=60)
+                if fr.ok and len(fr.content) > 10_000:
+                    with open(dest, "wb") as fh:
+                        fh.write(fr.content)
+                    got.append(f"fonts/{want}")
+                else:
+                    log.warning(f"{obj}: HTTP {fr.status_code}")
+            except Exception as e:
+                log.warning(f"{obj}: {type(e).__name__}: {str(e)[:100]}")
         _HAVE_TNR = "fonts/times.ttf" in got
         try:
             supabase_storage.fetch_mdt_form_font(font_dir)       # Tahoma (MDT form) - harmless extra

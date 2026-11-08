@@ -67,12 +67,18 @@ def _num(s):
 
 # --------------------------------------------------------------------------- parsers (tested on the HAR)
 def is_usable_status(text: str) -> bool:
-    """The site's «قرار منتهي ؟» column has THREE values, not two: مفتوح, مغلق and «معلّق». A «معلّق» decree is one that is still
-    being dispensed from (real cases: 2,930 left of 3,000 with approved invoices on it), so only a decree the site calls
-    «مغلق» is unusable. The old rule ("مفتوح" in text) marked every «معلّق» decree is_open=false, and the DB triage then
-    never counted its balance as 'enough value'. Expired / stopped decrees are still excluded separately by `flag` + expiry."""
+    """Is this decree's BALANCE allowed to count as 'enough value to dispense later'?
+    RULE (supportive plans): only the money left matters, NOT whether the site calls the decree مفتوح / معلّق / مغلق.
+    A closed decree accepts no new dispensing, but anything dispensed before it closed is on the closed-decrees page and
+    already read as the value left, so a closed decree with a real balance >= the dose limit is sufficient.
+    Expired (orange) / stopped (blue) decrees are still excluded elsewhere, by `flag` and the expiry date.
+    TOPUP_CLOSED_COUNTS=0 restores the old behaviour (مغلق / مقفل = unusable)."""
     t = re.sub(r"\s+", " ", ar2en(text or "")).strip()
-    return bool(t) and "مغلق" not in t and "مقفل" not in t
+    if not t:
+        return False
+    if (os.environ.get("TOPUP_CLOSED_COUNTS") or "1").strip().lower() not in ("0", "false", "off", "no"):
+        return True
+    return "مغلق" not in t and "مقفل" not in t
 
 
 def parse_decrees_list(html: str) -> list[dict]:
