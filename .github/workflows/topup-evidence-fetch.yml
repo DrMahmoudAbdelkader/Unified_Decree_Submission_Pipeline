@@ -144,7 +144,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
       - name: Install Python dependencies
-        run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt "pypdf>=5,<6" boto3 PyMuPDF reportlab pillow numpy playwright beautifulsoup4
 
       # Supabase Storage downloads count as egress. Signatures, the report template and the
       # fonts almost never change, so keep them in GitHub's private Actions cache and let

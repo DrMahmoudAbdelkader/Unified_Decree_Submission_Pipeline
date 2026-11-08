@@ -69,6 +69,6 @@ jobs:
             ${{ runner.os }}-pip-
       # no Playwright / Ghostscript: this job only reads SMC and Supabase
       - name: Install Python dependencies
-        run: pip install --disable-pip-version-check --quiet -r requirements.txt pypdf boto3 PyMuPDF beautifulsoup4
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt "pypdf>=5,<6" boto3 PyMuPDF beautifulsoup4
       - name: Run live checks
         run: python topup_live_checks.py
