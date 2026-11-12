@@ -173,6 +173,8 @@ import Unified_Decree_Submission_Pipeline as _pipeline_module
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
 import sharding   # SHARD_COUNT/SHARD_INDEX: parallel slices (no-op when unset)
+import atexit
+import supabase_bulk as bulk   # LOG/EGRESS FIX: batched REST helpers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("decree_status_and_letters_sync")
@@ -655,7 +657,7 @@ def load_open_attempts() -> List[dict]:
     while True:
         page = sb.select(
             ATTEMPTS_TABLE,
-            select="id,case_id,website_request_id,attempt_status,response_text,status_is_final,last_status_checked_at,smc_status_raw",
+            select="id,case_id,website_request_id,attempt_status,status_is_final,last_status_checked_at,smc_status_raw,smc_status_normalized",
             filters={
                 "website_request_id": "not.is.null",
                 "or": "(status_is_final.is.false,status_is_final.is.null)",
@@ -671,6 +673,57 @@ def load_open_attempts() -> List[dict]:
 
 
 _LAST_CHECKED_COLUMN_AVAILABLE = True
+
+# ---------------------------------------------------------------------------
+# LOG/EGRESS FIX - buffered writes. One PATCH/POST per attempt was ~2,200 stamps + ~1,600 events + ~2,500 case reads
+# a night, each one an API-gateway log line. Now:
+#   * an attempt whose status did NOT change only needs its "last checked" stamp  -> one bulk PATCH per 300 ids
+#   * events are inserted in bulk (100 per request)
+#   * every case status is read once up front instead of once per attempt
+# ---------------------------------------------------------------------------
+_EVENTS = bulk.EventQueue(EVENTS_TABLE, flush_at=100)
+_STAMPS = bulk.StampQueue(
+    ATTEMPTS_TABLE, lambda: {"last_status_checked_at": datetime.now().astimezone().isoformat()}, flush_at=300)
+_CASE_STATUS: Dict[object, Optional[str]] = {}
+
+
+def _flush_queues() -> None:
+    """Idempotent; also registered with atexit so sys.exit() paths cannot lose buffered rows."""
+    for q in (_STAMPS, _EVENTS):
+        try:
+            q.flush()
+        except Exception as exc:
+            log.error(f"flushing buffered writes failed: {type(exc).__name__}: {exc}")
+
+
+atexit.register(_flush_queues)
+
+
+def attach_letter_flags(attempts: List[dict]) -> None:
+    """response_text (the whole admin-letter text) is no longer downloaded for every open attempt every night.
+    The loop only asks 'does this attempt already have a letter text?', so fetch just the IDS that do
+    and mark the rest. Sets attempt['response_text'] to a truthy placeholder when a text is stored."""
+    ids = [a["id"] for a in attempts if a.get("id") is not None]
+    have = set()
+    try:
+        for r in bulk.get_in(ATTEMPTS_TABLE, "id", ids, select="id", extra={"response_text": "not.is.null"}):
+            have.add(r["id"])
+    except Exception as exc:
+        # cannot tell -> assume 'has text' so a letter is never re-fetched/overwritten blindly
+        log.warning(f"letter-presence lookup failed ({exc}) - treating every attempt as already having its letter")
+        have = set(ids)
+    for a in attempts:
+        a["response_text"] = "1" if a.get("id") in have else None
+
+
+def prefetch_case_statuses(attempts: List[dict]) -> None:
+    """One chunked read of the cases of this run's attempts instead of one GET per attempt."""
+    ids = sorted({a["case_id"] for a in attempts if a.get("case_id") is not None})
+    try:
+        for r in bulk.get_in(CASES_TABLE, "id", ids, select="id,case_status"):
+            _CASE_STATUS[r["id"]] = r.get("case_status")
+    except Exception as exc:
+        log.warning(f"case status prefetch failed ({exc}) - falling back to one read per attempt")
 
 
 def _mark_checked(attempt_id, extra_fields: Optional[Dict[str, object]] = None):
@@ -964,6 +1017,7 @@ def sync_decree_numbers(session_wrapper, status_map: Dict[str, dict]) -> Dict[st
         log.info(f"Decree numbers: hit the per-run cap ({MAX_DECREE_LOOKUPS}); the rest continues next run.")
 
     cache: Dict[str, Optional[tuple]] = {}   # one fetch per request number per run
+    stamp_only: Dict[str, list] = {}         # table -> row ids that only get decree_number_checked_at
     for table, row_id, request_number in targets:
         counters["checked"] += 1
         try:
@@ -981,10 +1035,19 @@ def sync_decree_numbers(session_wrapper, status_map: Dict[str, dict]) -> Dict[st
                 log.info(f"  {request_number}: approved but no decree number on the page yet")
             else:
                 counters["failed"] += 1
-            sb.update(table, row_id, fields)
+            if "decree_number" in fields:
+                sb.update(table, row_id, fields)
+            else:
+                stamp_only.setdefault(table, []).append(row_id)      # same stamp for all of them -> one bulk PATCH
         except Exception as exc:
             counters["crashed"] += 1
             log.error(f"  decree lookup for {request_number} raised {type(exc).__name__}: {exc}")
+
+    for table, ids in stamp_only.items():
+        try:
+            bulk.patch_in(table, "id", ids, {"decree_number_checked_at": datetime.now().astimezone().isoformat()})
+        except Exception as exc:
+            log.error(f"  bulk decree_number_checked_at stamp on {table} failed: {exc}")
 
     log.info(f"Decree numbers done. Checked {counters['checked']}, filled {counters['filled']}, "
              f"no decree yet {counters['no_decree']}, fetch failed {counters['failed']}, "
@@ -1035,7 +1098,10 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
         # checked (this WAS a real attempt, not a skip) but don't touch the
         # stored status.
         counters["not_found"] = 1
-        _mark_checked(attempt["id"])
+        if _LAST_CHECKED_COLUMN_AVAILABLE:
+            _STAMPS.add(attempt["id"])
+        else:
+            _mark_checked(attempt["id"])
         return counters
 
     status_raw = row["request_status"]
@@ -1058,11 +1124,18 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
             counters["letters_fetched"] = 1
 
     status_changed = (attempt.get("smc_status_raw") != status_raw)
-    _mark_checked(attempt["id"], update_fields)
+    unchanged = (not status_changed and not update_fields.get("response_text")
+                 and attempt.get("smc_status_normalized") == bucket_info["english_bucket"]
+                 and attempt.get("status_is_final") is not None
+                 and bool(attempt.get("status_is_final")) == bool(bucket_info["is_final"]))
+    if unchanged and _LAST_CHECKED_COLUMN_AVAILABLE:
+        _STAMPS.add(attempt["id"])                       # nothing new to store: only the "checked" stamp, in bulk
+    else:
+        _mark_checked(attempt["id"], update_fields)
     # Event only when something actually changed (status or captured letter text). A "checked, nothing new"
     # check is still recorded by last_status_checked_at, so staleness ordering is unaffected.
     if status_changed or update_fields.get("response_text"):
-      sb.insert(EVENTS_TABLE, {
+      _EVENTS.add({
         "case_id": attempt["case_id"],
         "attempt_id": attempt["id"],
         "event_type": "status_sync_checked",
@@ -1078,12 +1151,16 @@ def process_one_attempt(session, status_map: Dict[str, dict], attempt: dict,
     counters["updated"] = 1
 
     if bucket_info["english_bucket"] in BUCKET_TO_CASE_STATUS:
-        case_rows = sb.select(CASES_TABLE, select="case_status", filters={"id": f"eq.{attempt['case_id']}"})
-        current_case_status = case_rows[0]["case_status"] if case_rows else None
+        if attempt["case_id"] in _CASE_STATUS:
+            current_case_status = _CASE_STATUS[attempt["case_id"]]
+        else:
+            case_rows = sb.select(CASES_TABLE, select="case_status", filters={"id": f"eq.{attempt['case_id']}"})
+            current_case_status = case_rows[0]["case_status"] if case_rows else None
         if current_case_status in ("SUBMITTED", "PENDING", "ADMIN_LETTER", "RESUBMISSION"):
             new_case_status = BUCKET_TO_CASE_STATUS[bucket_info["english_bucket"]]
             sb.update(CASES_TABLE, attempt["case_id"], {"case_status": new_case_status})
-            sb.insert(EVENTS_TABLE, {
+            _CASE_STATUS[attempt["case_id"]] = new_case_status
+            _EVENTS.add({
                 "case_id": attempt["case_id"],
                 "attempt_id": attempt["id"],
                 "event_type": "case_status_advanced",
@@ -1134,6 +1211,8 @@ def main():
         _all = len(attempts)
         attempts = [a for a in attempts if sharding.in_shard(a["case_id"] if a.get("case_id") is not None else a.get("website_request_id"))]
         log.info(f"{sharding.describe()}: {len(attempts)} of {_all} open attempts belong to this shard.")
+    attach_letter_flags(attempts)
+    prefetch_case_statuses(attempts)
     log.info(f"{len(attempts)} open attempt(s) to check "
              f"(bulk window covers submissions {start_iso}..{today_iso}).")
 
@@ -1155,7 +1234,7 @@ def main():
             log.error(f"  attempt {attempt.get('id')} (request {attempt.get('website_request_id')}) "
                       f"raised {type(exc).__name__}: {exc}")
             try:
-                sb.insert(EVENTS_TABLE, {
+                _EVENTS.add({
                     "case_id": attempt.get("case_id"),
                     "attempt_id": attempt.get("id"),
                     "event_type": "status_sync_error",
@@ -1180,6 +1259,7 @@ def main():
         if result.get("unmapped_status"):
             unmapped_statuses.add(result["unmapped_status"])
 
+    _flush_queues()
     log.info(f"Done. Checked {checked} (bulk {used_bulk}, single-lookup {used_single}), "
              f"updated {updated}, reached a final status {reached_final}, letters fetched "
              f"{letters_fetched}, not found on site {not_found}, budget-exhausted "

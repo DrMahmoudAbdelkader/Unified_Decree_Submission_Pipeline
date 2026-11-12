@@ -33,6 +33,7 @@ from bs4 import BeautifulSoup
 
 import json
 import sharding   # SHARD_COUNT/SHARD_INDEX: parallel slices (no-op when unset)
+import supabase_bulk as bulk   # batched REST helpers (LOG/EGRESS FIX)
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 def env(name, default=""):
@@ -86,7 +87,7 @@ def now_iso():
 
 
 def sb_get_all(path):
-    """GET with pagination (PostgREST caps responses at 1000 rows)."""
+    """GET with pagination (PostgREST caps responses at 1000 rows). The path should carry an order= so paging is stable."""
     rows, offset, page = [], 0, 1000
     while True:
         sep = "&" if "?" in path else "?"
@@ -252,32 +253,27 @@ def main():
 
     # 1) pending orders + their value, grouped per decree number
     orders = sb_get_all(
-        "pending_decree_orders?select=id,decree_number,patient_id,patients(name,national_id)"
-        "&status=neq.completed&decree_number=not.is.null")
+        "pending_decree_orders?select=id,decree_number,patient_id,current_status,patients(name,national_id)"
+        "&status=neq.completed&decree_number=not.is.null&order=id.asc")
     pend = {}
     for o in orders:
         d = str(o["decree_number"]).strip()
         if ONLY_DECREE and d != ONLY_DECREE:
             continue
-        g = pend.setdefault(d, {"order_ids": [], "patient_id": o.get("patient_id"),
+        g = pend.setdefault(d, {"order_ids": [], "order_status": {}, "patient_id": o.get("patient_id"),
                                 "name": (o.get("patients") or {}).get("name"),
                                 "nid": (o.get("patients") or {}).get("national_id"),
                                 "value": 0.0})
         g["order_ids"].append(o["id"])
-
-    if pend:
-        all_ids = [i for g in pend.values() for i in g["order_ids"]]
-        owner = {i: d for d, g in pend.items() for i in g["order_ids"]}
-        for b in range(0, len(all_ids), 200):
-            ids = ",".join(map(str, all_ids[b:b + 200]))
-            for it in sb_get_all(f"pending_decree_items?select=order_id,total_value&order_id=in.({ids})"):
-                pend[owner[it["order_id"]]]["value"] += float(it.get("total_value") or 0)
+        g["order_status"][o["id"]] = o.get("current_status")
 
     log(f"Decrees with pending entries: {len(pend)}")
 
     # 2) live cycles
     cycles = {c["decree_number"]: c for c in
-              sb_get_all("decree_open_tracker?select=*&cleared_at=is.null")}
+              sb_get_all("decree_open_tracker?select=id,decree_number,smc_status,first_opened_at,flap_count,patient_name,"
+                         "national_id,patient_id,decree_value,value_left,approval_text,last_error"
+                         "&cleared_at=is.null&order=id.asc")}
 
     SHARDED = sharding.enabled()
     if os.environ.get("RUN_ID", "").strip():
@@ -319,6 +315,14 @@ def main():
             sb_patch(f"decree_check_runs?id=eq.{run_id}", {"finished_at": now_iso()})
         return
 
+    # LOG/EGRESS FIX: item values are needed only for THIS shard's decrees (before: every shard downloaded all of them)
+    all_ids = [i for g in pend.values() for i in g["order_ids"]]
+    owner = {i: d for d, g in pend.items() for i in g["order_ids"]}
+    for b in range(0, len(all_ids), 200):
+        ids = ",".join(map(str, all_ids[b:b + 200]))
+        for it in sb_get_all(f"pending_decree_items?select=order_id,total_value&order_id=in.({ids})&order=id.asc"):
+            pend[owner[it["order_id"]]]["value"] += float(it.get("total_value") or 0)
+
     if not login():
         if run_id:
             sb_patch(f"decree_check_runs?id=eq.{run_id}",
@@ -328,64 +332,125 @@ def main():
     stats = dict(open=0, closed=0, newly_opened=0, errors=0, overage=0)
     newly_opened_list, overage_list = [], []
 
-    for n, (d, g) in enumerate(pend.items(), 1):
-        info, err = check_decree(d)
-        c = cycles.get(d)
-        if c is None:                       # pending but trigger/backfill missed it
-            created = sb_post("decree_open_tracker",
-                              {"decree_number": d, "patient_id": g["patient_id"],
-                               "pending_since": now_iso(), "smc_status": "unchecked"},
-                              return_rep=True)
-            c = created[0] if created else {"id": None, "first_opened_at": None,
-                                            "smc_status": "unchecked", "flap_count": 0}
+    # ── LOG/EGRESS FIX: batched writes ─────────────────────────────────────────
+    # Before: 3 requests per decree (status-check insert + Enhanced-Monitor patch + tracker patch) = ~9,000 API
+    # log lines per run. Now: rows are collected and written in chunks; unchanged rows cost nothing but a stamp.
+    FLUSH_EVERY = 200
+    status_rows = []                                 # decree_status_checks rows (history; one per decree per run)
+    light_ids = {"open": [], "closed": []}           # trackers whose ONLY change is the "checked just now" stamp
+    order_ids_to_set = {"open": [], "closed": []}    # Enhanced-Monitor rows whose current_status really changes
 
-        upd = {"patient_name": g["name"], "national_id": g["nid"],
-               "patient_id": g["patient_id"], "updated_at": now_iso()}
+    def _same(a, b):
+        if a is None or b is None:
+            return a is None and b is None
+        if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+            try:
+                return abs(float(a) - float(b)) < 0.005
+            except (TypeError, ValueError):
+                return False
+        return str(a) == str(b)
 
-        if not info:
-            stats["errors"] += 1
-            upd.update({"last_error": err, "smc_status": "not_found" if "not found" in err else c["smc_status"]})
-            log(f"[{n}/{len(pend)}] {d}  ⚠ {err}")
-        else:
-            st = info["status"]
-            upd.update({
-                "smc_status": st, "decree_value": info["decree_value"],
-                "value_left": info["value_left"], "approval_text": info["approval_text"],
-                "last_checked_at": now_iso(), "last_error": None,
-            })
-            if st == "open":
-                stats["open"] += 1
-                if not c.get("first_opened_at"):
-                    upd["first_opened_at"] = now_iso()
-                    stats["newly_opened"] += 1
-                    newly_opened_list.append(d)
-            elif st == "closed":
-                stats["closed"] += 1
-                upd["last_closed_seen_at"] = now_iso()
-                if c.get("first_opened_at"):           # opened before, closed again
-                    upd["first_opened_at"] = None
-                    upd["flap_count"] = (c.get("flap_count") or 0) + 1
+    def tracker_unchanged(cyc, new):
+        """True when a full PATCH of this tracker row would store nothing new except the check timestamps."""
+        if not cyc.get("id"):
+            return False
+        for k in ("patient_name", "national_id", "patient_id", "smc_status", "decree_value", "value_left", "approval_text"):
+            if not _same(cyc.get(k), new.get(k)):
+                return False
+        if cyc.get("last_error"):
+            return False
+        return not any(k in new for k in ("first_opened_at", "flap_count"))
 
-            over = (info["value_left"] is not None and g["value"] > info["value_left"])
-            if over:
-                stats["overage"] += 1
-                overage_list.append((d, g["value"], info["value_left"]))
+    def flush():
+        if DRY_RUN:
+            status_rows.clear()
+            for lst in list(light_ids.values()) + list(order_ids_to_set.values()):
+                lst.clear()
+            return
+        if status_rows:
+            rows = list(status_rows)
+            status_rows.clear()
+            bulk.post_many("decree_status_checks", rows)
+        t = now_iso()
+        for st_, ids_ in light_ids.items():
+            if ids_:
+                payload = {"last_checked_at": t, "updated_at": t, "last_error": None}
+                if st_ == "closed":
+                    payload["last_closed_seen_at"] = t
+                bulk.patch_in("decree_open_tracker", "id", ids_, payload)
+                ids_.clear()
+        for st_, ids_ in order_ids_to_set.items():
+            if ids_:
+                bulk.patch_in("pending_decree_orders", "id", ids_, {"current_status": st_})
+                ids_.clear()
 
-            log(f"[{n}/{len(pend)}] {d}  {st.upper():6}  left={info['value_left']}  "
-                f"pending={g['value']:.2f}" + ("  ⛔ PENDING > VALUE LEFT" if over else ""))
+    try:
+        for n, (d, g) in enumerate(pend.items(), 1):
+            info, err = check_decree(d)
+            c = cycles.get(d)
+            if c is None:                       # pending but trigger/backfill missed it
+                created = sb_post("decree_open_tracker",
+                                  {"decree_number": d, "patient_id": g["patient_id"],
+                                   "pending_since": now_iso(), "smc_status": "unchecked"},
+                                  return_rep=True)
+                c = created[0] if created else {"id": None, "first_opened_at": None,
+                                                "smc_status": "unchecked", "flap_count": 0}
 
-            sb_post("decree_status_checks",
-                    {"decree_number": d, "smc_status": st, "decree_value": info["decree_value"],
-                     "value_left": info["value_left"], "pending_value": g["value"], "run_id": run_id})
+            upd = {"patient_name": g["name"], "national_id": g["nid"],
+                   "patient_id": g["patient_id"], "updated_at": now_iso()}
+            light_state = None                  # "open"/"closed" when only a stamp is needed
 
-            # reflect the state on the Enhanced Monitor rows
-            if st in ("open", "closed"):
-                ids = ",".join(map(str, g["order_ids"]))
-                sb_patch(f"pending_decree_orders?id=in.({ids})", {"current_status": st})
+            if not info:
+                stats["errors"] += 1
+                upd.update({"last_error": err, "smc_status": "not_found" if "not found" in err else c["smc_status"]})
+                log(f"[{n}/{len(pend)}] {d}  ⚠ {err}")
+            else:
+                st = info["status"]
+                upd.update({
+                    "smc_status": st, "decree_value": info["decree_value"],
+                    "value_left": info["value_left"], "approval_text": info["approval_text"],
+                    "last_checked_at": now_iso(), "last_error": None,
+                })
+                if st == "open":
+                    stats["open"] += 1
+                    if not c.get("first_opened_at"):
+                        upd["first_opened_at"] = now_iso()
+                        stats["newly_opened"] += 1
+                        newly_opened_list.append(d)
+                elif st == "closed":
+                    stats["closed"] += 1
+                    upd["last_closed_seen_at"] = now_iso()
+                    if c.get("first_opened_at"):           # opened before, closed again
+                        upd["first_opened_at"] = None
+                        upd["flap_count"] = (c.get("flap_count") or 0) + 1
 
-        if c.get("id"):
-            sb_patch(f"decree_open_tracker?id=eq.{c['id']}", upd)
-        time.sleep(DELAY)
+                over = (info["value_left"] is not None and g["value"] > info["value_left"])
+                if over:
+                    stats["overage"] += 1
+                    overage_list.append((d, g["value"], info["value_left"]))
+
+                log(f"[{n}/{len(pend)}] {d}  {st.upper():6}  left={info['value_left']}  "
+                    f"pending={g['value']:.2f}" + ("  ⛔ PENDING > VALUE LEFT" if over else ""))
+
+                status_rows.append({"decree_number": d, "smc_status": st, "decree_value": info["decree_value"],
+                                    "value_left": info["value_left"], "pending_value": g["value"], "run_id": run_id})
+
+                # reflect the state on the Enhanced Monitor rows - ONLY the rows whose state really changes
+                if st in ("open", "closed"):
+                    order_ids_to_set[st].extend(i for i in g["order_ids"] if g["order_status"].get(i) != st)
+                    if tracker_unchanged(c, upd):
+                        light_state = st
+
+            if c.get("id"):
+                if light_state:
+                    light_ids[light_state].append(c["id"])      # one bulk stamp instead of a PATCH per decree
+                elif not DRY_RUN:
+                    sb_patch(f"decree_open_tracker?id=eq.{c['id']}", upd)
+            if n % FLUSH_EVERY == 0:
+                flush()
+            time.sleep(DELAY)
+    finally:
+        flush()
 
     write_shard_stats(stats, newly_opened_list, overage_list)
     if run_id and not SHARDED:
