@@ -26,6 +26,9 @@ current invoice has. For EVERY invoice, whatever its status:
   3. verify: the rendered PDF really is this receipt, ink was added, the 4 label columns look sane
 Result row: signed_source='rendered_signed'; status OK when every check passes, otherwise REVIEW
 (file kept, message says which check failed); FAILED only if rendering/signing itself raised.
+v10: before any entry is processed, topup_family.guard() closes duplicates (older letter of the same patient + plan family)
+and families that were already served, so the runner never fetches invoices for a letter that needs no request; the
+previous decrees of the same plan FAMILY (dose count / "(شامل ...)" ignored) count as previous decrees (TOPUP_FAMILY_MATCH=0 = off).
 Nothing is uploaded to SMC EXCEPT one thing: topup_unbilled.py creates the bill (HospDecreeReceipts/Create, titled
 "<name> - <national id>") for items that were entered on a previous decree but never billed (switch: TOPUP_BILL_UNBILLED).
 """
@@ -39,6 +42,7 @@ from bs4 import BeautifulSoup
 import Unified_Decree_Submission_Pipeline as _p
 from Unified_Decree_Submission_Pipeline import SMCSession
 import supabase_client as sb
+import topup_family as fam
 import topup_overlap as ov
 import topup_unbilled as ub
 
@@ -213,6 +217,11 @@ def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
     except Exception as e:
         log.warning(f"  lookup rows not readable (migration 06?): {e}")
         return []
+    try:                                   # same plan FAMILY (4 vs 6 doses ...) = same plan
+        import topup_resolution as _tr
+        rows = list(rows or []) + _tr.family_extra_rows(c, None, {str(r.get("decree_number")) for r in rows or []})
+    except Exception as e:
+        log.debug(f"family decrees not added: {e}")
     cutoff = ""
     if (os.environ.get("TOPUP_INCLUDE_LATER_DECREES") or "1").strip().lower() in ("0", "false", "off", "no") \
             and c.get("source_case_id"):
@@ -984,6 +993,16 @@ def process(c: dict, smc: SMCSession, s3, bucket: str):
                      f"{end[0].get('evidence_message') or ''} - open the entry on the page to view the stored PDFs")
     except Exception:
         pass
+    # price of ONE dispensed dose (average of the stored invoices) - kinds without a dose count («القرار السابق شامل») and supportive
+    # plans rely on it; topup_resolution + the page use the same number. Then the "sufficient value" rule is applied once more,
+    # now that the invoices / price of this run are known (never raises).
+    try:
+        import topup_resolution as _tr
+        _tr.refresh_dose_price(cid)
+        if _tr.auto_resolve(c):
+            return
+    except Exception as e:
+        log.warning(f"  candidate {cid}: dose price / sufficiency re-check skipped ({type(e).__name__}: {str(e)[:120]})")
     # dose count over the WHOLE chain of previous decrees (never raises; TOPUP_DOSE_CALC=0 switches it off)
     if is_inclusive(c):
         return                              # «القرار السابق شامل»: no dose counts at all
@@ -1051,6 +1070,10 @@ def main():
     requeue_no_previous(only)
     limit = max(MAX_CANDIDATES, len(only)) if only else MAX_CANDIDATES      # an explicit selection is never cut short
     rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=limit)
+    n0 = len(rows)
+    rows = fam.guard(rows)                 # duplicates / already-served families are closed here and skipped (ONE bulk pass)
+    if len(rows) != n0:
+        log.info(f"{n0 - len(rows)} entr(ies) closed by the family rules (duplicate letter / plan already served) - not processed")
     log.info(f"{len(rows)} candidate(s) to fetch evidence for (time budget {TIME_BUDGET_MIN} min).")
     results = []
     deadline = time.time() + TIME_BUDGET_MIN * 60
