@@ -13,6 +13,18 @@
 # schedule in case that chain did not run. Each entry is re-checked at most every TOPUP_*_MAX_AGE_H (20 h) unless
 # candidate_ids is given (then it is always re-checked).
 #
+# 3) (v9) «قيمة كافية للصرف» for every TOPUP / PREV_INCLUSIVE entry that is still open OR already SUBMITTED (tracking after a
+#    resubmission): the patient's decrees are re-read from the SMC patient page when the stored lookup is older than 20 h - so a
+#    decree submitted directly on the SMC website is noticed too - and topup_resolution.py closes every entry that already has a
+#    decree issued after the letter whose left value covers one dose (supportive decrees: 500 EGP; otherwise the average price of
+#    a dispensed dose). Entries are closed as RESOLVED with the message «تم الحل تلقائياً…» and move to the page's
+#    «قيمة كافية للصرف بعد القرار» tab; the tracked request and its resubmission history stay visible on the card.
+#
+# (v10) ORDER INSIDE THE RUN (topup_live_checks.py main()): 0) topup_family.sweep - one letter per patient + plan family, already-served
+#    plans closed (DB only)  1) manual requests, ONE SMC read per patient  2) ID cards  3) decree re-reads, flagged entries first then the
+#    STALEST lookup first (the old id order refreshed the same entries every night), then the sufficient-value sweep; a closed entry
+#    closes its family. Database load: explicit columns, cached lookups, bulk stamps, no delete+insert of unchanged rows.
+#
 # Secrets used: SUPABASE_*, SMC_USERNAME_3/_2/SMC_USERNAME (+ passwords), R2_*.
 # ============================================================================
 name: Top-up Live Checks
@@ -55,6 +67,17 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
       LIVE_CHECK_BUDGET_MIN: "80"
+      # CHECK 3 knobs (repository variables; empty = script default)
+      TOPUP_SUPPORTIVE_DOSE_VALUE: ${{ vars.TOPUP_SUPPORTIVE_DOSE_VALUE }}
+      TOPUP_AUTO_RESOLVE_SUBMITTED: ${{ vars.TOPUP_AUTO_RESOLVE_SUBMITTED }}
+      TOPUP_REFRESH_LOOKUPS: ${{ vars.TOPUP_REFRESH_LOOKUPS }}
+      TOPUP_LOOKUP_MAX_AGE_H: ${{ vars.TOPUP_LOOKUP_MAX_AGE_H }}
+      TOPUP_REFRESH_MAX: ${{ vars.TOPUP_REFRESH_MAX }}
+      # (v10) families: one letter per patient + plan (empty = default; TOPUP_FAMILY=0 off, TOPUP_FAMILY_APPLY=0 dry run)
+      TOPUP_FAMILY: ${{ vars.TOPUP_FAMILY }}
+      TOPUP_FAMILY_APPLY: ${{ vars.TOPUP_FAMILY_APPLY }}
+      TOPUP_FAMILY_IGNORE_DOSE_COUNT: ${{ vars.TOPUP_FAMILY_IGNORE_DOSE_COUNT }}
+      TOPUP_FAMILY_MATCH: ${{ vars.TOPUP_FAMILY_MATCH }}
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4

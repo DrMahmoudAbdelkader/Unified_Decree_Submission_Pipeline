@@ -7,10 +7,21 @@
 #          groups of `chunk_size` (default 10), keeping one patient's entries
 #          together. With candidate_ids set (the page's buttons) it splits
 #          exactly those ids instead.
+#   (v10) BEFORE the plan is made, the plan job runs topup_family.py (DB only, ~10 s): letters of the same patient + plan family
+#          (dose count / "(شامل ...)" ignored) are reduced to the NEWEST one, older open ones are closed as duplicates and a family
+#          that was already served by a successful request / decree is closed completely. So no runner is ever planned for a
+#          duplicate. Each runner repeats the same check for its own patients (topup_evidence_fetch.py -> topup_family.guard).
+#          Repository VARIABLES (empty = default): TOPUP_FAMILY (0 = off), TOPUP_FAMILY_APPLY (0 = dry run, only logs),
+#          TOPUP_FAMILY_IGNORE_DOSE_COUNT (0 = 4 and 6 doses are different plans), TOPUP_FAMILY_MATCH (0 = decrees are matched by
+#          plan / protocol only, not by plan family).
 #   (new) every runner ALSO runs topup_live_checks.py for its own entries, right after the lookups:
 #            - manual requests filed on the SMC website outside the app (blocks sending, see topup_gate.py)
 #            - new ID card scanned into the patient file (ID_CARD entries)
 #          The nightly topup-live-checks.yml covers every open entry (incl. ID_CARD ones that never enter this plan).
+#   (v9) «قيمة كافية للصرف» is ONE rule for every status: topup_resolution.py (500 EGP for supportive decrees, otherwise the average
+#          dose price) is applied by the lookup step, by the invoice step (after the stored dose price is refreshed) and by the
+#          live-checks step (CHECK 3, also for entries already SUBMITTED = tracking after a resubmission). The knobs below
+#          are repository VARIABLES (Settings > Variables); empty = the default written in the scripts.
 #   fetch  matrix job: one runner PER GROUP, all started together, never more
 #          than 15 at once (max-parallel). Each runner runs the SAME three
 #          scripts as before, in the same order, with CANDIDATE_IDS = its own
@@ -89,6 +100,17 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install --disable-pip-version-check --quiet requests
+      # (v10) one letter per patient + plan family BEFORE planning. Never fails the run: the planner works without it too.
+      - name: Close duplicate letters / already-served plans
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CANDIDATE_IDS: ${{ github.event.inputs.candidate_ids }}
+          TOPUP_FAMILY: ${{ vars.TOPUP_FAMILY }}
+          TOPUP_FAMILY_APPLY: ${{ vars.TOPUP_FAMILY_APPLY }}
+          TOPUP_FAMILY_IGNORE_DOSE_COUNT: ${{ vars.TOPUP_FAMILY_IGNORE_DOSE_COUNT }}
+        run: python topup_family.py
       - name: Plan shards
         id: plan
         env:
@@ -132,6 +154,15 @@ jobs:
       # ALWAYS this runner's own group (blank only in the planner's one-runner fallback).
       CANDIDATE_IDS: ${{ matrix.shard.ids }}
       EVIDENCE_MODE: ${{ github.event.inputs.mode }}
+      # «قيمة كافية للصرف» (same defaults as the scripts: 500 / on / on)
+      TOPUP_SUPPORTIVE_DOSE_VALUE: ${{ vars.TOPUP_SUPPORTIVE_DOSE_VALUE }}
+      TOPUP_AUTO_RESOLVE_SUBMITTED: ${{ vars.TOPUP_AUTO_RESOLVE_SUBMITTED }}
+      TOPUP_REFRESH_LOOKUPS: ${{ vars.TOPUP_REFRESH_LOOKUPS }}
+      # (v10) one letter per patient + plan family (same knobs as the plan job)
+      TOPUP_FAMILY: ${{ vars.TOPUP_FAMILY }}
+      TOPUP_FAMILY_APPLY: ${{ vars.TOPUP_FAMILY_APPLY }}
+      TOPUP_FAMILY_IGNORE_DOSE_COUNT: ${{ vars.TOPUP_FAMILY_IGNORE_DOSE_COUNT }}
+      TOPUP_FAMILY_MATCH: ${{ vars.TOPUP_FAMILY_MATCH }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
