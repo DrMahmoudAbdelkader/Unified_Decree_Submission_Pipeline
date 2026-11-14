@@ -121,6 +121,36 @@ def is_inclusive(c: dict) -> bool:
             and (os.environ.get("TOPUP_INCLUSIVE_PLAIN") or "1").strip().lower() not in ("0", "false", "off", "no"))
 
 
+def _inclusive_protocol_on() -> bool:
+    return (os.environ.get("TOPUP_INCLUSIVE_PROTOCOL") or "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _inclusive_protocol(c: dict) -> str:
+    """«القرار السابق شامل» entries carry no protocol_key of their own, so the TOPUP matching (plans / decrees of the SAME
+    PROTOCOL) never applied to them. Here the protocol is read from the entry's own treatment plan
+    (source case -> decree_treatment_plans.topup_protocol) so both tabs recognise 'the previous decree of the same plan'
+    the same way. '' = the plan has no protocol (then only the exact-plan match is used, as before).
+    TOPUP_INCLUSIVE_PROTOCOL=0 switches this off."""
+    if not _inclusive_protocol_on():
+        return ""
+    if c.get("protocol_key"):
+        return str(c["protocol_key"]).strip().lower()
+    if "_incl_proto" in c:
+        return c["_incl_proto"]
+    proto = ""
+    try:
+        cs = sb.select("decree_request_cases", select="treatment_plan_id",
+                       filters={"id": f"eq.{c['source_case_id']}"}, limit=1) if c.get("source_case_id") else []
+        pid = cs[0].get("treatment_plan_id") if cs else None
+        if pid:
+            pl = sb.select("decree_treatment_plans", select="topup_protocol", filters={"id": f"eq.{pid}"}, limit=1)
+            proto = str((pl[0].get("topup_protocol") if pl else "") or "").strip().lower()
+    except Exception as e:
+        log.warning(f"  candidate {c.get('id')}: plan protocol not readable ({type(e).__name__}: {str(e)[:100]})")
+    c["_incl_proto"] = proto
+    return proto
+
+
 def _db_decrees(c: dict) -> list[str]:
     """Decrees stored by THIS app: attempts of the patient's earlier cases whose plan carries the
     same top-up protocol (excluding the declined request itself). Oldest first.
@@ -138,6 +168,12 @@ def _db_decrees(c: dict) -> list[str]:
         if not own:
             return []
         ok_plans = {own}
+        proto = _inclusive_protocol(c)
+        if proto:                                   # same rule as TOPUP: every plan of the patient with the same protocol
+            plans = sb.select("decree_treatment_plans", select="id",
+                              filters={"topup_protocol": f"eq.{proto}",
+                                       "id": "in.(" + ",".join(map(str, plan_ids)) + ")"}, limit=1000)
+            ok_plans |= {p["id"] for p in plans}
     else:
         protos = sorted(ov.compatible_protocols(c["protocol_key"]) | {str(c["protocol_key"])})
         plans = sb.select("decree_treatment_plans", select="id",
@@ -211,9 +247,15 @@ def _lookup_decrees(c: dict) -> list[tuple[str, str]]:
     when such a decree exists and still covers a dose the entry is auto-resolved before we get here (topup_resolution.py);
     when it is used up, it is the newest decree and its bills are the ones to attach."""
     try:
-        rows = ov.matching_rows(c, only_plan=True) if is_inclusive(c) else ov.matching_rows(c)
-        if is_inclusive(c):                # same PLAN only (the DB view's 'PLAN' match): never the hormonal/Zoladex overlap family
-            rows = [r for r in rows if r.get("_kind") == "PLAN"]
+        if is_inclusive(c):
+            # SAME matching as TOPUP: the view's PLAN **and** PROTOCOL rows (the view already derives the protocol from the entry's
+            # own plan: COALESCE(candidate.protocol_key, plan.topup_protocol)). Never the hormonal/Zoladex overlap family.
+            # TOPUP_INCLUSIVE_PROTOCOL=0 restores the old exact-plan-only rule.
+            rows = ov.matching_rows(c) if _inclusive_protocol_on() else ov.matching_rows(c, only_plan=True)
+            rows = [r for r in rows if r.get("_kind") in ("PLAN", "PROTOCOL")] if _inclusive_protocol_on() \
+                else [r for r in rows if r.get("_kind") == "PLAN"]
+        else:
+            rows = ov.matching_rows(c)
     except Exception as e:
         log.warning(f"  lookup rows not readable (migration 06?): {e}")
         return []
