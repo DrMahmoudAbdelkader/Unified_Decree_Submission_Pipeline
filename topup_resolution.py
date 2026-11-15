@@ -58,6 +58,7 @@ import topup_family as fam
 import topup_overlap as ov
 
 log = logging.getLogger("topup_resolution")
+import topup_plantext as _pt
 CAND = "decree_topup_candidates"
 AUTO_PREFIX = "تم الحل تلقائياً"            # also used by topup_gate.py (duplicated there on purpose)
 TOPUP_LIKE = (None, "", "TOPUP", "PREV_INCLUSIVE")
@@ -367,7 +368,7 @@ def auto_resolve(c: dict, ctx: Optional[Ctx] = None, trust: bool = False) -> Opt
         if trust:
             fresh = c
         else:
-            fresh = sb.select(CAND, select="*", filters={"id": f"eq.{c['id']}"}, limit=1)
+            fresh = _pt.fill(sb.select(CAND, select="*", filters={"id": f"eq.{c['id']}"}, limit=1) or [])
             fresh = fresh[0] if fresh else c
         if fresh.get("status") in _done_statuses():
             return None
@@ -389,7 +390,7 @@ def auto_resolve(c: dict, ctx: Optional[Ctx] = None, trust: bool = False) -> Opt
 
 
 def auto_resolve_by_id(cid: int) -> Optional[dict]:
-    rows = sb.select(CAND, select="*", filters={"id": f"eq.{cid}"}, limit=1)
+    rows = _pt.fill(sb.select(CAND, select="*", filters={"id": f"eq.{cid}"}, limit=1) or [])
     return auto_resolve(rows[0]) if rows else None
 
 
@@ -460,7 +461,7 @@ def sweep(limit: int = 3000, ids=None, family_first: bool = True) -> int:
             rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=1000) or []
         else:
             rows = fam._select_all(CAND, "*", flt)           # keyset pages: a response never exceeds the server's row cap
-        rows = [c for c in rows if c.get("kind") in TOPUP_LIKE]
+        rows = _pt.fill([c for c in rows if c.get("kind") in TOPUP_LIKE])
         ctx = Ctx.load(rows) if rows else None
         n_ok = 0
         for c in rows:

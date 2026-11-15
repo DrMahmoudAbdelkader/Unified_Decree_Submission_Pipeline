@@ -1111,7 +1111,8 @@ def main():
         flt["evidence_status"] = "eq.PENDING"
     requeue_no_previous(only)
     limit = max(MAX_CANDIDATES, len(only)) if only else MAX_CANDIDATES      # an explicit selection is never cut short
-    rows = sb.select(CAND, select="*", filters=flt, order="id.asc", limit=limit)
+    import topup_plantext
+    rows = topup_plantext.fill(sb.select(CAND, select="*", filters=flt, order="id.asc", limit=limit) or [])
     n0 = len(rows)
     rows = fam.guard(rows)                 # duplicates / already-served families are closed here and skipped (ONE bulk pass)
     if len(rows) != n0:

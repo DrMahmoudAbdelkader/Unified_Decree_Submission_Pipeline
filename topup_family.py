@@ -53,6 +53,7 @@ import supabase_client as sb
 
 log = logging.getLogger("topup_family")
 
+import topup_plantext as pt
 CAND = "decree_topup_candidates"
 LOCK = "decree_topup_dedupe_lock"
 OPEN_STATUSES = ("DETECTED", "NEEDS_COUNTS", "READY")
@@ -60,7 +61,7 @@ FAMILY_KINDS = (None, "", "TOPUP", "PREV_INCLUSIVE", "PREV_REPORT")
 AUTO_PREFIX = "تم الحل تلقائياً"                               # topup_resolution.AUTO_PREFIX (duplicated on purpose: no import cycle)
 DUP_PREFIX = "مكرر — خطاب أحدث لنفس المريض والخطة"
 FAMILY_OK_PREFIX = "مُغلق تلقائياً — حُلّ بقرار/طلب آخر لنفس الخطة"
-_COLS = "id,patient_id,source_case_id,kind,status,plan_text,detected_at,evidence_message"
+_COLS = "id,patient_id,source_case_id,kind,status,detected_at,evidence_message"   # plan_text is NOT a table column: topup_plantext.fill()
 
 
 def _flag(name: str, default: str = "1") -> bool:
@@ -161,21 +162,21 @@ def _load_members(patient_ids: Optional[Iterable] = None, ids: Optional[Iterable
     flt = {"status": "in.(" + ",".join(OPEN_STATUSES) + ")"}
     if ids:
         flt["id"] = "in.(" + ",".join(str(int(i)) for i in ids) + ")"
-        open_rows = sb.select(CAND, select=_COLS + ",kind", filters=flt, limit=1000) or []
+        open_rows = pt.fill(sb.select(CAND, select=_COLS + ",kind", filters=flt, limit=1000) or [])
     elif patient_ids:
         pids = [int(p) for p in patient_ids if p is not None]
         open_rows = []
         for ch in _chunks(pids, 100):
-            open_rows += sb.select(CAND, select=_COLS + ",kind",
-                                   filters={**flt, "patient_id": "in.(" + ",".join(map(str, ch)) + ")"}, limit=1000) or []
+            open_rows += pt.fill(sb.select(CAND, select=_COLS + ",kind",
+                                   filters={**flt, "patient_id": "in.(" + ",".join(map(str, ch)) + ")"}, limit=1000) or [])
     else:
-        open_rows = _select_all(CAND, _COLS + ",kind", flt)
+        open_rows = pt.fill(_select_all(CAND, _COLS + ",kind", flt))
     open_rows = [c for c in open_rows if _kind_ok(c) and c.get("patient_id") is not None]
     pids = sorted({int(c["patient_id"]) for c in open_rows})
     members: Dict[int, List[dict]] = {}
     for ch in _chunks(pids, 100):
-        rows = sb.select(CAND, select=_COLS + ",kind",
-                         filters={"patient_id": "in.(" + ",".join(map(str, ch)) + ")"}, limit=1000) or []
+        rows = pt.fill(sb.select(CAND, select=_COLS + ",kind",
+                         filters={"patient_id": "in.(" + ",".join(map(str, ch)) + ")"}, limit=1000) or [])
         for c in rows:
             if _kind_ok(c):
                 members.setdefault(int(c["patient_id"]), []).append(c)
@@ -391,7 +392,7 @@ def propagate(c: dict) -> int:
             return 0
         if int(c["id"]) in _load_locks():
             return 0
-        rows = sb.select(CAND, select=_COLS + ",kind", filters={"patient_id": f"eq.{int(c['patient_id'])}"}, limit=1000) or []
+        rows = pt.fill(sb.select(CAND, select=_COLS + ",kind", filters={"patient_id": f"eq.{int(c['patient_id'])}"}, limit=1000) or [])
         locks = _load_locks()
         done = 0
         msg = (f"{FAMILY_OK_PREFIX}: الإدخال #{c['id']} لنفس المريض والخطة حُلّ بقرار صدر بعد الطلب"

@@ -157,7 +157,7 @@ def _bulk_set(ids, **body):
               headers={"Prefer": "return=minimal"})
 
 
-_CAND_COLS = ("id,patient_id,kind,status,source_case_id,detected_at,plan_text,protocol_key,manual_check_at,manual_ignored_numbers,"
+_CAND_COLS = ("id,patient_id,kind,status,source_case_id,detected_at,protocol_key,manual_check_at,manual_ignored_numbers,"
               "idcard_check_at,idcard_state,idcard_rejected_ids,id_fixed_at")
 
 
@@ -174,6 +174,8 @@ def _candidates():
         except RuntimeError:
             prm["select"] = "*"
             rows = _rest("GET", CAND, params=prm) or []
+        import topup_plantext
+        topup_plantext.fill(rows)
         out.extend(rows)
         if ONLY_IDS or len(rows) < 1000:
             return out
@@ -428,11 +430,13 @@ def refresh_tracked_lookups(smc, deadline: float, priority_ids=()) -> int:
     prio = {int(i) for i in priority_ids}
     rows, last = [], 0
     while True:
-        prm = {"select": "id,patient_id,kind,status,lookup_status,lookup_finished_at,plan_text", "status": TRACKED_STATUSES,
+        prm = {"select": "id,patient_id,kind,status,lookup_status,lookup_finished_at", "status": TRACKED_STATUSES,
                "order": "id.asc", "limit": 1000, "id": f"gt.{last}"}
         if ONLY_IDS:
             prm["id"] = "in.(" + ",".join(map(str, ONLY_IDS)) + ")"
         page = _rest("GET", CAND, params=prm) or []
+        import topup_plantext
+        topup_plantext.fill(page)
         rows.extend(page)
         if ONLY_IDS or len(page) < 1000:
             break
