@@ -1434,6 +1434,11 @@ class SMCSession:
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
         })
         self.logged_in = False
+        # SMC (Nov 2026) added a per-MDT `hash` query param to the Print / Details / Edit /
+        # Requests-Create links. It is only exposed in the GetPreRequests row links, so it is
+        # scraped there and cached per pre_request_id (see hash_for()).
+        self._prid_hash: Dict[str, str] = {}
+        self._prid_nid: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Login
@@ -1462,6 +1467,7 @@ class SMCSession:
             if ("logout" in resp.text.lower() or "dashboard" in resp.text.lower()
                     or "مرحبا" in resp.text or "تسجيل الخروج" in resp.text):
                 self.logged_in = True
+                self._prid_hash.clear()   # hashes may be session-bound; re-scraped lazily by hash_for()
                 log.info("Login successful.")
                 return True
             log.error("Login failed — check username/password.")
@@ -1719,8 +1725,30 @@ class SMCSession:
                 log.error("    Response looks like a login page — session was likely rejected.")
         return (m.group(1) if m else None), r.text
 
-    def print_prerequest_url(self, pre_request_id: str) -> str:
-        return f"{BASE_URL}/smc/PreRequest/PrintPreRequest?preRequestId={pre_request_id}"
+    def hash_for(self, pre_request_id: str, national_id: str = "") -> str:
+        """The `hash` SMC attaches to this MDT's Print/Details/Edit/Create links. Cached from
+        GetPreRequests; re-fetched (using the remembered national id) when the cache is empty,
+        e.g. after a re-login. Returns "" if SMC didn't provide one."""
+        prid = str(pre_request_id)
+        if national_id:
+            self._prid_nid[prid] = national_id
+        if not self._prid_hash.get(prid):
+            self.get_pre_requests(prid, national_id=national_id or self._prid_nid.get(prid, ""))
+        return self._prid_hash.get(prid, "")
+
+    def print_prerequest_url(self, pre_request_id: str, national_id: str = "") -> str:
+        h = self.hash_for(pre_request_id, national_id)
+        return (f"{BASE_URL}/smc/PreRequest/PrintPreRequest?preRequestId={pre_request_id}"
+                + (f"&hash={h}" if h else ""))
+
+    def requests_create_url(self, pre_request_id: str) -> str:
+        h = self.hash_for(pre_request_id)
+        return (f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
+                + (f"&hash={h}" if h else ""))
+
+    def prerequest_edit_url(self, pre_request_id: str) -> str:
+        h = self.hash_for(pre_request_id)
+        return f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}" + (f"?hash={h}" if h else "")
 
     def cookie_list(self) -> List[Tuple[str, str]]:
         return [(c.name, c.value) for c in self.s.cookies]
@@ -1813,7 +1841,7 @@ class SMCSession:
         return fields
 
     def get_edit_page_context(self, pre_request_id: str) -> Tuple[List[Tuple[str, str]], str]:
-        url = f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}"
+        url = self.prerequest_edit_url(pre_request_id)
         r = self._get(url)
         if r is None:
             raise RuntimeError(f"Could not load PreRequest/Edit/{pre_request_id} page.")
@@ -1885,7 +1913,7 @@ class SMCSession:
             if name not in overridden_names:
                 new_fields.append((name, value))
         fields = new_fields
-        edit_post_url = f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}"
+        edit_post_url = self.prerequest_edit_url(pre_request_id)
 
         EDIT_NATIVE_SUCCESS_REDIRECTS = (302, 307, 308)
         headers = {
@@ -2018,10 +2046,17 @@ class SMCSession:
         if r is None:
             return None
         rows = parse_pre_requests_table(r.text)
-        return rows[0] if rows else None
+        row = rows[0] if rows else None
+        if row:
+            if national_id:
+                self._prid_nid[str(pre_request_id)] = national_id
+            if row.get("hash"):
+                self._prid_hash[str(row["pre_request_id"])] = row["hash"]
+                self._prid_hash[str(pre_request_id)] = row["hash"]
+        return row
 
     def get_requests_create_context(self, pre_request_id: str) -> Dict[str, str]:
-        url = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
+        url = self.requests_create_url(pre_request_id)
         r = self._get(url)
         if r is None:
             # _get() already ruled out a login-redirect (_session_expired())
@@ -2158,7 +2193,7 @@ class SMCSession:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={referer_prid}",
+            "Referer": self.requests_create_url(referer_prid),
         }
 
         try:
@@ -2237,14 +2272,23 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
         )
 
     html = resp.text
-    looks_like_login_page = ("اسم المستخدم" in html and "كلمة السر" in html)
-    looks_like_print_form = ("طلب علاج" in html or "تقرير اللجنة الثلاثية" in html
-                              or str(pre_request_id) in html)
-    if looks_like_login_page or not looks_like_print_form:
+    looks_like_print_form = ("طلب علاج" in html or "تقرير اللجنة الثلاثية" in html)
+    if session._session_expired(resp):
+        # Genuine logout: a fresh login can fix this, so keep the retry path.
         raise OSError(
-            f"Fetched MDT print page for pre_request_id={pre_request_id} looks like the "
-            f"logged-out SMC landing/login page, not the actual print form — session was not "
-            f"authenticated for this request. Will re-login and retry."
+            f"Fetched MDT print page for pre_request_id={pre_request_id} is the logged-out SMC "
+            f"page (session expired). Will re-login and retry."
+        )
+    if not looks_like_print_form:
+        # NOT a connectivity/session problem (a re-login never fixes it - this is what burned
+        # 5 pointless re-logins per case when the URL lacked SMC's `hash` param). Log what came
+        # back and fail fast; run_finalize_stages replaces the MDT as for a 404.
+        log.error(f"    Unexpected print page for pre_request_id={pre_request_id}: url={resp.url} "
+                  f"status={resp.status_code} len={len(html)} has_hash_param={'hash=' in url} "
+                  f"head={html[:400]!r}")
+        raise MDTPrintPageNotFoundError(
+            f"MDT print page for pre_request_id={pre_request_id} did not contain the print form "
+            f"(url had hash param: {'hash=' in url})."
         )
 
     cookie_domain = urlparse(BASE_URL).hostname
@@ -3102,7 +3146,9 @@ def parse_pre_requests_table(html: str) -> List[Dict]:
         if not pre_request_id:
             continue
         actions_html = str(tds[7])
+        _hm = re.search(r"hash=([0-9A-Fa-f]{32,128})", str(tds[0]) + actions_html)
         rows.append({
+            "hash": _hm.group(1) if _hm else "",
             "pre_request_id": pre_request_id,
             "national_id": tds[1].get_text(strip=True),
             "registration_date": tds[2].get_text(strip=True),
@@ -3399,6 +3445,17 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
             f"Raw response + payload dumped to {DEBUG_DIR}\\{patient_id}_* for inspection."
         )
 
+    # SMC now needs the per-MDT `hash` for print / create-request / edit links; fetch it
+    # right away so later stages (and call_with_reconnect retries) can build correct URLs.
+    try:
+        session.get_pre_requests(pre_request_id, national_id=patient_id)
+        if not session._prid_hash.get(str(pre_request_id)):
+            warnings.append(f"No hash found for new MDT #{pre_request_id} in GetPreRequests.")
+    except NETWORK_EXCEPTIONS:
+        raise
+    except Exception as exc:  # noqa: BLE001 - hash_for() will retry lazily later
+        log.warning(f"    Could not pre-fetch hash for new MDT #{pre_request_id}: {exc}")
+
     return {"pre_request_id": pre_request_id, "full_name": full_name, "warnings": warnings}
 
 
@@ -3512,7 +3569,7 @@ def stage_upload_merged_pdf(session: SMCSession, patient_id: str, pre_request_id
         # couldn't be scraped from it) gets wrapped here.
         raise RowProcessingError(str(exc)) from exc
 
-    create_page_referer = f"{BASE_URL}/smc/Requests/Create?action=HopitalCreateNewRequest&prid={pre_request_id}"
+    create_page_referer = session.requests_create_url(pre_request_id)
 
     ssn_resp = session.search_ssn_requests(patient_id, pre_request_id)
     if not isinstance(ssn_resp, dict) or not ssn_resp.get("patient"):
