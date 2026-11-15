@@ -190,7 +190,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 import fitz  # PyMuPDF
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 # NOTE: no docx2pdf / win32com / Word dependency at all anymore. Medical
 # report generation is handled by medical_report_overlay.py, imported
@@ -1439,6 +1439,10 @@ class SMCSession:
         # scraped there and cached per pre_request_id (see hash_for()).
         self._prid_hash: Dict[str, str] = {}
         self._prid_nid: Dict[str, str] = {}
+        # Per-MDT info scraped from the Requests/Create form (its real POST action + any hidden
+        # hash-like inputs), filled by get_requests_create_context(), used by submit_request_with_pdf().
+        self._create_post_url: Dict[str, str] = {}
+        self._create_hash_fields: Dict[str, Dict[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Login
@@ -2080,6 +2084,26 @@ class SMCSession:
             tag = soup.find(attrs={"name": name}) or soup.find(attrs={"id": name})
             return (tag.get("value") or "").strip() if tag else ""
 
+        # SMC (Nov 2026) hash-protects the create-request route: scrape the form's real POST
+        # action and any hidden hash-like input so the final POST carries exactly what the
+        # browser's form would send (a bare POST /smc/Requests/Create now returns the login page).
+        try:
+            anchor = soup.find("input", {"name": "CITIZENSSN"}) or soup.find("input", {"name": "medicalReportImg"})
+            form_el = anchor.find_parent("form") if anchor else None
+            action = (form_el.get("action") or "").strip() if form_el else ""
+            hash_fields: Dict[str, str] = {}
+            for inp in (form_el.find_all("input") if form_el else []):
+                nm = inp.get("name") or ""
+                if "hash" in nm.lower():
+                    hash_fields[nm] = inp.get("value") or ""
+            post_url = urljoin(url, action) if action else ""
+            self._create_post_url[str(pre_request_id)] = post_url
+            self._create_hash_fields[str(pre_request_id)] = hash_fields
+            log.info(f"    Requests/Create form: action={action!r} hash_inputs={list(hash_fields)} "
+                     f"(url had hash={'hash=' in url})")
+        except Exception as exc:  # noqa: BLE001 - diagnostics only, never fatal
+            log.warning(f"    Could not inspect Requests/Create form: {exc}")
+
         ctx = {
             "token": field_val("__RequestVerificationToken"),
             "user_id": field_val("UserId"),
@@ -2173,7 +2197,24 @@ class SMCSession:
         """POST /smc/Requests/Create as a real multipart browser form,
         carrying the merged PDF in 'medicalReportImg'. Returns
         (new_request_number, raw_html)."""
-        url = f"{BASE_URL}/smc/Requests/Create"
+        # CONFIRMED FROM A MANUAL-SUBMISSION HAR (Nov 2026): the browser POSTs to the bare
+        # /smc/Requests/Create (form action, no query string); the hash travels as the form's own
+        # hidden input  <input type="hidden" id="hash" name="hash">  (declared right after
+        # PREREQUESTIDFK). Without it SMC answers the POST with the logged-out landing page.
+        url = self._create_post_url.get(str(referer_prid)) or f"{BASE_URL}/smc/Requests/Create"
+        form_fields = dict(form_fields)
+        scraped = self._create_hash_fields.get(str(referer_prid)) or {}
+        for k, v in scraped.items():
+            if v:
+                form_fields[k] = v
+        mdt_hash = form_fields.get("hash") or self.hash_for(referer_prid)
+        if mdt_hash:
+            form_fields["hash"] = mdt_hash
+        else:
+            log.warning(f"    No hash known for MDT #{referer_prid} - the Requests/Create POST will "
+                        f"probably be answered with the login page.")
+        log.info(f"    Requests/Create POST target: {url.replace(BASE_URL, '')} "
+                 f"(hash form field sent: {bool(mdt_hash)})")
         empty_file = ("", b"", "application/octet-stream")
         pdf_filename = os.path.basename(pdf_path)
 
@@ -2198,7 +2239,8 @@ class SMCSession:
 
         try:
             r = self.s.post(url, data=form_fields, files=files, headers=headers, timeout=120, allow_redirects=True)
-            log.info(f"    POST(multipart) Requests/Create -> {r.status_code}  ({len(r.text)} chars)")
+            log.info(f"    POST(multipart) Requests/Create -> {r.status_code}  ({len(r.text)} chars)  "
+                     f"final_url={r.url.replace(BASE_URL, '')} redirects={[h.status_code for h in r.history]}")
             if self._session_expired(r):
                 log.warning("Session expired on final submit — cannot auto-retry the upload transparently.")
                 return None, r.text
