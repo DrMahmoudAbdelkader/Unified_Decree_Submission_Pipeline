@@ -1917,7 +1917,14 @@ class SMCSession:
             if name not in overridden_names:
                 new_fields.append((name, value))
         fields = new_fields
-        edit_post_url = self.prerequest_edit_url(pre_request_id)
+        # CONFIRMED FROM A MANUAL HAR (Nov 2026): the browser GETs the Edit page WITH ?hash=, but POSTs
+        # to the BARE /smc/PreRequest/Edit/<id> - the hash travels as the hidden form field `hash`
+        # (scraped with the rest of the form above). Mirror that exactly; only fall back to the
+        # hash-in-URL form if, for some reason, the page gave us no hash field.
+        if any(name == "hash" and value for name, value in fields):
+            edit_post_url = f"{BASE_URL}/smc/PreRequest/Edit/{pre_request_id}"
+        else:
+            edit_post_url = self.prerequest_edit_url(pre_request_id)
 
         EDIT_NATIVE_SUCCESS_REDIRECTS = (302, 307, 308)
         headers = {
@@ -2266,7 +2273,28 @@ class SMCSession:
 # HTML -> PDF  (Chromium via Playwright)
 # =====================================================================
 
-def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
+def _norm_hamza(text: str) -> str:
+    return re.sub("[\u0623\u0625\u0622]", "\u0627", text or "")
+
+
+def print_page_is_uhi_notice(html: str) -> bool:
+    """True when SMC's print page is the FAULTY paper it gives for a national id that belongs to the
+    Comprehensive Health Insurance (UHI) system: the real MDT form is replaced by an administrative
+    notice ("خطاب إداري: هذا الرقم القومي يتبع منظومة التأمين الصحي الشامل ...") and the committee
+    report ("تقرير اللجنة الثلاثية") is missing. CONFIRMED from a manual HAR (Nov 2026): the print right
+    after PreRequest/Create is this notice; after the Edit (HASINSURANCE=N, UHIEXCLUDED=Y) the re-print is
+    the real form (contains "تقرير اللجنة الثلاثية" and the "الإقرار" declaration)."""
+    h = _norm_hamza(html)
+    return ("يتبع منظومة التامين الصحي الشامل" in h) and ("تقرير اللجنة الثلاثية" not in h)
+
+
+# What the website does for these patients, and so what we now do BEFORE printing: Edit the pre-request with
+# UHIEXCLUDED=Y first, then print. Set PROACTIVE_UHI_EDIT=0 to go back to the old reactive-only behaviour
+# (print the notice, fail at upload, then fix).
+PROACTIVE_UHI_EDIT = (os.environ.get("PROACTIVE_UHI_EDIT") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def render_print_page_to_pdf(session: SMCSession, pre_request_id: str, auto_uhi_fix: bool = False) -> bytes:
     """Render the authenticated MDT print page to PDF.
 
     REPLACED wkhtmltopdf WITH A REAL CHROMIUM BROWSER (Playwright).
@@ -2315,6 +2343,30 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
 
     html = resp.text
     looks_like_print_form = ("طلب علاج" in html or "تقرير اللجنة الثلاثية" in html)
+    if (auto_uhi_fix and PROACTIVE_UHI_EDIT and not session._session_expired(resp)
+            and print_page_is_uhi_notice(html)):
+        # Same sequence as the website (HAR): faulty notice print -> Edit (UHIEXCLUDED=Y) -> re-print.
+        log.warning(f"    MDT #{pre_request_id}: print page is the UHI administrative notice, not the MDT form - "
+                    f"applying HASINSURANCE=N / UHIEXCLUDED=Y on the pre-request and re-printing "
+                    f"(what the website does) instead of signing the notice.")
+        ok, detail = session.edit_prerequest(pre_request_id, {"HASINSURANCE": "N", "UHIEXCLUDED": "Y"})
+        if not ok:
+            raise RowProcessingError("PreRequest/Edit UHI-exclusion (before printing) failed: "
+                                     + (str(detail)[:300] or "no detail"))
+        url = session.print_prerequest_url(pre_request_id)
+        resp = session.s.get(url, timeout=30)
+        if resp.status_code == 404:
+            raise MDTPrintPageNotFoundError(
+                f"Could not fetch MDT print page for pre_request_id={pre_request_id} (HTTP 404) after the "
+                f"UHI edit - this MDT has no printable form on SMC.")
+        if resp.status_code != 200:
+            raise OSError(f"Could not fetch MDT print page for pre_request_id={pre_request_id} after the UHI "
+                          f"edit (HTTP {resp.status_code}). Will re-login and retry.")
+        html = resp.text
+        looks_like_print_form = ("طلب علاج" in html or "تقرير اللجنة الثلاثية" in html)
+        if print_page_is_uhi_notice(html):
+            log.error(f"    MDT #{pre_request_id}: print page is STILL the UHI notice after the edit; continuing - "
+                      f"the upload-time UHI fallback remains as the safety net.")
     if session._session_expired(resp):
         # Genuine logout: a fresh login can fix this, so keep the retry path.
         raise OSError(
@@ -2378,7 +2430,19 @@ def render_print_page_to_pdf(session: SMCSession, pre_request_id: str) -> bytes:
                 pass  # fine -- "load" already fired, this was only a bonus
 
             rendered_html = page.content()
-            if ("اسم المستخدم" in rendered_html and "كلمة السر" in rendered_html):
+            # SMC (Nov 2026): the login <form> text ("اسم المستخدم" / "كلمة السر") now ALSO appears
+            # on logged-in pages (see SMCSession._session_expired), so matching on it flagged a
+            # perfectly good print page as "logged out" - 5 re-logins, then give up, even though
+            # the requests-level fetch above had just returned the real form. Only the
+            # "mcit-logged-out" header marker is reliable, and a rendered print form is positive
+            # proof that the session is fine whatever else is on the page.
+            _rendered_has_form = ("طلب علاج" in rendered_html or "تقرير اللجنة الثلاثية" in rendered_html)
+            _rendered_logged_out = ("mcit-logged-out" in rendered_html) and not _rendered_has_form
+            if not _rendered_has_form:
+                log.error(f"    Chromium page for pre_request_id={pre_request_id} lacks the print form: "
+                          f"final_url={page.url} logged_out_marker={'mcit-logged-out' in rendered_html} "
+                          f"len={len(rendered_html)} head={rendered_html[:300]!r}")
+            if _rendered_logged_out:
                 raise OSError(
                     f"Chromium landed on the logged-out SMC page for "
                     f"pre_request_id={pre_request_id} — session expired "
@@ -3506,7 +3570,7 @@ def stage_create_mdt(session: SMCSession, patient_id: str, description: str, tum
 # =====================================================================
 
 def stage_render_and_sign(session: SMCSession, pre_request_id: str) -> bytes:
-    mdt_pdf_bytes = render_print_page_to_pdf(session, pre_request_id)
+    mdt_pdf_bytes = render_print_page_to_pdf(session, pre_request_id, auto_uhi_fix=True)
     return apply_signatures_and_stamp(mdt_pdf_bytes)
 
 
