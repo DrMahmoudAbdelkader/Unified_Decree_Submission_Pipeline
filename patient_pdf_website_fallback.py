@@ -239,6 +239,11 @@ def _get_request_details(sess, base_url: str, request_id: str,
             try:
                 resp = sess.get(url, timeout=REQUEST_TIMEOUT, headers={"Referer": f"{base_url}/smc/Requests"})
                 if resp.status_code == 200:
+                    if "mcit-logged-out" in resp.text:
+                        # Dead session, NOT "no file on SMC" - fail loudly so the caller never
+                        # records a false NOT_FOUND.
+                        raise RuntimeError(f"SMC session is logged out while reading request {request_id} "
+                                           f"(Details page returned the logged-out page).")
                     details = _parse_details_page(resp.text, request_id, base_url)
                     details["details_url"] = url
                     if details.get("pdf_url"):
@@ -249,6 +254,8 @@ def _get_request_details(sess, base_url: str, request_id: str,
                     break      # page was served; a different URL won't add a link - next candidate only if it was hash-less
                 log.warning(f"  Details page returned {resp.status_code} for request {request_id} "
                             f"(hash_in_url={'hash=' in url}, attempt {attempt + 1})")
+            except RuntimeError:
+                raise
             except Exception as e:
                 log.error(f"  Error fetching details for request {request_id}: {e}")
             time.sleep(1)
