@@ -36,7 +36,7 @@ import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -109,7 +109,21 @@ def _parse_requests_table(html: str):
             sending_site = tds[4].get_text(strip=True)
             treatment_site = tds[5].get_text(strip=True)
 
+            # SMC (Nov 2026) hash-protects the Details route: every link in this table is
+            # /smc/Requests/Details/<id>?hash=<64 hex>. Without that hash the details page is
+            # not served, so no PDF link is found and the patient is wrongly reported as
+            # "no file on SMC". Keep the exact href SMC gave us.
+            details_href, details_hash = "", ""
+            for a in tr.find_all("a", href=True):
+                if "/Requests/Details/" in a["href"]:
+                    details_href = a["href"].strip()
+                    hm = re.search(r"hash=([0-9A-Fa-f]{16,128})", details_href)
+                    details_hash = hm.group(1) if hm else ""
+                    break
+
             rows_data.append({
+                "details_href": details_href,
+                "details_hash": details_hash,
                 "request_id": request_id,
                 "sending_site": sending_site,
                 "treatment_site": treatment_site,
@@ -183,7 +197,7 @@ def _filter_gustave_rows(rows: List[Dict]) -> List[Dict]:
     return _filter_rows_by_facility(rows, FACILITY_KEYWORD)
 
 
-def _parse_details_page(html: str, request_id: str) -> Dict:
+def _parse_details_page(html: str, request_id: str, base_url: str = "") -> Dict:
     soup = BeautifulSoup(html, "html.parser")
 
     pdf_url = None
@@ -202,31 +216,47 @@ def _parse_details_page(html: str, request_id: str) -> Dict:
             pdf_url = (
                 "{base}/smc/Requests/GetFiles"
                 "?SSN={ssn}&ReqID={reqid}&fn={fn}&ReqDate={rd}&ReqContentName=REQUESTCONTENTNAME"
-            ).format(base="{base}", ssn=ssn_m, reqid=reqid_m, fn=fname_m, rd=quote(reqdate_m))
+            ).format(base=base_url, ssn=ssn_m, reqid=reqid_m, fn=fname_m, rd=quote(reqdate_m, safe="/:"))
             break
 
     return {"request_id": request_id, "pdf_url": pdf_url, "pdf_filename": pdf_filename}
 
 
-def _get_request_details(sess, base_url: str, request_id: str) -> Optional[Dict]:
-    url = f"{base_url}/smc/Requests/Details/{request_id}"
-    for attempt in range(RETRIES):
-        try:
-            resp = sess.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                details = _parse_details_page(resp.text, request_id)
-                if details.get("pdf_url"):
-                    details["pdf_url"] = details["pdf_url"].format(base=base_url)
-                return details
-            log.warning(f"  Details page returned {resp.status_code} for request {request_id} "
-                        f"(attempt {attempt + 1})")
-        except Exception as e:
-            log.error(f"  Error fetching details for request {request_id}: {e}")
-        time.sleep(1)
+def _get_request_details(sess, base_url: str, request_id: str,
+                         details_href: str = "", details_hash: str = "") -> Optional[Dict]:
+    """Opens the request's Details page the way the browser does: with the hash-bearing href
+    from the list table. Candidates, in order: the href SMC gave us, the plain URL + the hash,
+    and finally the old hash-less URL (kept only as a last resort in case SMC drops the rule)."""
+    candidates = []
+    if details_href:
+        candidates.append(urljoin(base_url + "/", details_href))
+    if details_hash:
+        candidates.append(f"{base_url}/smc/Requests/Details/{request_id}?hash={details_hash}")
+    candidates.append(f"{base_url}/smc/Requests/Details/{request_id}")
+    seen = set()
+    for url in [u for u in candidates if not (u in seen or seen.add(u))]:
+        for attempt in range(RETRIES):
+            try:
+                resp = sess.get(url, timeout=REQUEST_TIMEOUT, headers={"Referer": f"{base_url}/smc/Requests"})
+                if resp.status_code == 200:
+                    details = _parse_details_page(resp.text, request_id, base_url)
+                    details["details_url"] = url
+                    if details.get("pdf_url"):
+                        return details
+                    log.info(f"  [website fallback] request {request_id}: Details page OK "
+                             f"(len={len(resp.text)}, hash_in_url={'hash=' in url}) but no "
+                             f"REQUESTCONTENTNAME file link on it.")
+                    break      # page was served; a different URL won't add a link - next candidate only if it was hash-less
+                log.warning(f"  Details page returned {resp.status_code} for request {request_id} "
+                            f"(hash_in_url={'hash=' in url}, attempt {attempt + 1})")
+            except Exception as e:
+                log.error(f"  Error fetching details for request {request_id}: {e}")
+            time.sleep(1)
     return None
 
 
-def _download_pdf(sess, pdf_url: str, national_id: str, request_id: str, output_dir: str) -> Optional[str]:
+def _download_pdf(sess, pdf_url: str, national_id: str, request_id: str, output_dir: str,
+                  referer: str = "") -> Optional[str]:
     if not pdf_url:
         return None
 
@@ -236,8 +266,12 @@ def _download_pdf(sess, pdf_url: str, national_id: str, request_id: str, output_
 
     for attempt in range(RETRIES):
         try:
-            resp = sess.get(pdf_url, timeout=60)
-            if resp.status_code == 200 and resp.content:
+            resp = sess.get(pdf_url, timeout=60, headers={"Referer": referer} if referer else None)
+            if resp.status_code == 200 and resp.content and not resp.content.lstrip()[:5].startswith(b"%PDF"):
+                log.warning(f"  GetFiles for request {request_id} returned 200 but not a PDF "
+                            f"(content-type={resp.headers.get('Content-Type')}, {len(resp.content)} bytes) - "
+                            f"probably a login/error page.")
+            elif resp.status_code == 200 and resp.content:
                 with open(path, "wb") as f:
                     f.write(resp.content)
                 return path
@@ -255,7 +289,8 @@ def _try_download_from_rows(pipeline_session, base_url: str, national_id: str,
     both the Gustave path and the fallback-facility path below."""
     for row in rows:
         request_id = row["request_id"]
-        details = _get_request_details(pipeline_session.s, base_url, request_id)
+        details = _get_request_details(pipeline_session.s, base_url, request_id,
+                                       row.get("details_href", ""), row.get("details_hash", ""))
         if not details:
             continue
         if not details.get("pdf_url"):
@@ -263,7 +298,7 @@ def _try_download_from_rows(pipeline_session, base_url: str, national_id: str,
         log.info(f"  [website fallback] Found PDF link in request {request_id} "
                  f"({facility_label}), downloading …")
         saved_path = _download_pdf(pipeline_session.s, details["pdf_url"], national_id,
-                                    request_id, output_dir)
+                                    request_id, output_dir, details.get("details_url", ""))
         if saved_path:
             log.info(f"  [website fallback] ✅ Downloaded to {saved_path}")
             return saved_path
