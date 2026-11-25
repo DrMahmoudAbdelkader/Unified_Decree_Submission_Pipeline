@@ -1,0 +1,90 @@
+# .github/workflows/smc-dashboard-snapshot.yml
+# ============================================================================
+# Daily snapshot of the SMC state-fund dashboard (Decrees/Dashboard) into
+# audit_smc_snapshots — the evidence the "Claims <-> Revenue Audit" module
+# reconciles against revenue. Replaces the manual bookmarklet / HAR upload.
+#
+# WHEN
+#   Every day at 19:30 UTC (21:30 Cairo in winter, 22:30 in summer time) — late
+#   enough to capture the day's work, early enough that the stored date is still
+#   "today" in Cairo, so a month-end run is the real month-end snapshot. It does
+#   not overlap the 23:00 UTC status sync (decree-status-sync.yml) and its
+#   follow-ups, so the SMC account is not logged in twice at once.
+#   Manually: Actions -> "SMC Dashboard Snapshot (daily)" -> Run workflow.
+#
+# REQUIRED REPOSITORY SECRETS (already in the repo)
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   SMC_USERNAME_3 / SMC_PASSWORD_3 (falls back to _2 / the default account)
+#
+# SAFE TO RE-RUN: one row per (snapshot_date, hospital) is upserted. A snapshot
+# whose total drops >10 % below the previous one is NOT stored (the job fails
+# red) unless you run it manually with force = true.
+# ============================================================================
+
+name: SMC Dashboard Snapshot (daily)
+
+concurrency:
+  group: smc-dashboard-snapshot
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+    inputs:
+      snapshot_date:
+        description: "Store under this date (YYYY-MM-DD). Blank = today (Cairo)."
+        required: false
+        default: ""
+      date_from:
+        description: "Search start (YYYY-MM-DD). Blank = audit window start from the module settings."
+        required: false
+        default: ""
+      dry_run:
+        description: "true = read and print only, write nothing"
+        required: false
+        default: "false"
+      force:
+        description: "true = store even if the total dropped more than 10 % (check the log first)"
+        required: false
+        default: "false"
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: pip install --disable-pip-version-check --quiet -r requirements.txt
+
+      - name: Snapshot the SMC dashboard
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
+          SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
+          SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
+          SMC_PASSWORD_2: ${{ secrets.SMC_PASSWORD_2 }}
+          SMC_USERNAME: ${{ secrets.SMC_USERNAME }}
+          SMC_PASSWORD: ${{ secrets.SMC_PASSWORD }}
+          SNAPSHOT_DATE: ${{ github.event.inputs.snapshot_date }}
+          DATE_FROM: ${{ github.event.inputs.date_from }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
+          FORCE: ${{ github.event.inputs.force == 'true' && '1' || '' }}
+        run: python smc_dashboard_snapshot.py
