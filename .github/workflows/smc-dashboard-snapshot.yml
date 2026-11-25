@@ -15,6 +15,10 @@
 # REQUIRED REPOSITORY SECRETS (already in the repo)
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 #   SMC_USERNAME_3 / SMC_PASSWORD_3 (falls back to _2 / the default account)
+# OPTIONAL (recommended)
+#   SMC_DASHBOARD_USERNAME / SMC_DASHBOARD_PASSWORD - a dedicated SMC login for this job. SMC drops the
+#   session of an account that logs in somewhere else, so do NOT run this manually while the nightly
+#   chain (status sync -> value sync -> top-up evidence, from 23:00 UTC) is running on SMC_USERNAME_3.
 #
 # SAFE TO RE-RUN: one row per (snapshot_date, hospital) is upserted. A snapshot
 # whose total drops >10 % below the previous one is NOT stored (the job fails
@@ -77,6 +81,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_DASHBOARD_USERNAME: ${{ secrets.SMC_DASHBOARD_USERNAME }}
+          SMC_DASHBOARD_PASSWORD: ${{ secrets.SMC_DASHBOARD_PASSWORD }}
           SMC_USERNAME_3: ${{ secrets.SMC_USERNAME_3 }}
           SMC_PASSWORD_3: ${{ secrets.SMC_PASSWORD_3 }}
           SMC_USERNAME_2: ${{ secrets.SMC_USERNAME_2 }}
@@ -88,3 +94,12 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
           FORCE: ${{ github.event.inputs.force == 'true' && '1' || '' }}
         run: python smc_dashboard_snapshot.py
+
+      - name: Keep the raw SMC pages of a failed run (3 days)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smc-snapshot-debug
+          path: debug_smc/
+          retention-days: 3
+          if-no-files-found: ignore
