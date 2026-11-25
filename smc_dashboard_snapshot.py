@@ -28,6 +28,8 @@ SAFETY (nothing wrong is ever written)
 
 ENVIRONMENT
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+    SMC_DASHBOARD_USERNAME / SMC_DASHBOARD_PASSWORD   OPTIONAL dedicated account (recommended: SMC logs an account out when it
+                       is logged in somewhere else, so sharing SMC_USERNAME_3 with the nightly value-sync can break both)
     SMC_USERNAME_3 / SMC_PASSWORD_3   (falls back to _2, then the default account — same chain as decree_value_sync.py)
     SMC_SENDING_SITE   hospital id, default 102233 (same variable decree_status_and_letters_sync.py uses)
     SNAPSHOT_DATE      optional YYYY-MM-DD override of the stored date (default: today, Cairo)
@@ -184,39 +186,75 @@ def row_total(row: dict) -> float:
 # network
 # ----------------------------------------------------------------------------
 def _get_smc_credentials():
-    for u_key, p_key in (("SMC_USERNAME_3", "SMC_PASSWORD_3"),
+    for u_key, p_key in (("SMC_DASHBOARD_USERNAME", "SMC_DASHBOARD_PASSWORD"),
+                         ("SMC_USERNAME_3", "SMC_PASSWORD_3"),
                          ("SMC_USERNAME_2", "SMC_PASSWORD_2"),
                          ("SMC_USERNAME", "SMC_PASSWORD")):
         u, p = os.environ.get(u_key), os.environ.get(p_key)
         if u and p:
-            if u_key != "SMC_USERNAME_3":
+            if u_key == "SMC_USERNAME_3":
+                log.info("Using SMC_USERNAME_3 (shared with the nightly value sync — do not run this job while that chain is running).")
+            elif u_key != "SMC_DASHBOARD_USERNAME":
                 log.warning(f"SMC_USERNAME_3/SMC_PASSWORD_3 not set — using {u_key} instead.")
             return u, p
     return None, None
 
 
-def _relogin_needed(r) -> bool:
-    return r.status_code == 200 and "Home/Index" in r.url and "username" in r.text.lower()
+class SessionLost(Exception):
+    """The site served the logged-out page in the middle of a capture."""
 
 
-def _request(session_wrapper, method: str, url: str, **kw):
-    """GET/POST with retries and one transparent re-login if the session expired."""
+DEBUG_DIR = os.environ.get("DEBUG_DIR", "debug_smc")
+_LOGIN_PATHS = {"/smc", "/smc/home/index"}
+
+
+def _path(u: str) -> str:
+    return urlparse(u).path.rstrip("/").lower()
+
+
+def _snippet(r) -> str:
+    soup = BeautifulSoup(r.text or "", "html.parser")
+    title = (soup.title.get_text(strip=True) if soup.title else "")
+    return f"HTTP {r.status_code} url={r.url} history={[h.status_code for h in r.history]} title={title!r} body={_clean(r.text)[:200]!r}"
+
+
+def _dump(name: str, text: str):
+    """Keep the raw page of a failed step; the workflow uploads debug_smc/ as an artifact when the job fails."""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(DEBUG_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", name) + ".html"), "w", encoding="utf-8") as f:
+            f.write(text or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _lost(session_wrapper, r, requested_url: str) -> bool:
+    if session_wrapper._session_expired(r):          # the pipeline's own test: 302 or the "mcit-logged-out" marker
+        return True
+    # redirected to the login page from some other page
+    return _path(r.url) in _LOGIN_PATHS and _path(requested_url) not in _LOGIN_PATHS
+
+
+def _request(session_wrapper, method: str, url: str, timeout: int = 60, **kw):
+    """One request with retries for transient errors. A logged-out answer raises SessionLost (the caller restarts the whole
+    capture with a fresh login — re-sending a single request would use a stale anti-forgery token / lost search state)."""
     last = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            r = session_wrapper.s.request(method, url, timeout=60, **kw)
-            if _relogin_needed(r):
-                log.warning("  session expired — re-logging in …")
-                if not session_wrapper.login():
-                    raise RuntimeError("re-login failed")
-                r = session_wrapper.s.request(method, url, timeout=60, **kw)
-            if r.status_code == 200:
-                return r
-            last = f"HTTP {r.status_code}"
+            r = session_wrapper.s.request(method, url, timeout=timeout, allow_redirects=True, **kw)
         except Exception as e:  # noqa: BLE001
             last = str(e)
-        log.warning(f"  {method} {url[-60:]}: attempt {attempt}/{MAX_ATTEMPTS} — {last}")
-        time.sleep(REQUEST_DELAY * attempt * 3)
+            log.warning(f"  {method} {url[-70:]}: attempt {attempt}/{MAX_ATTEMPTS} — {last}")
+            time.sleep(3 * attempt)
+            continue
+        if _lost(session_wrapper, r, url):
+            _dump(f"lost_{method}_{_path(url).split('/')[-1]}", r.text)
+            raise SessionLost(_snippet(r))
+        if r.status_code == 200:
+            return r
+        last = _snippet(r)
+        log.warning(f"  {method} {url[-70:]}: attempt {attempt}/{MAX_ATTEMPTS} — {last}")
+        time.sleep(3 * attempt)
     raise RuntimeError(f"{method} {url} failed: {last}")
 
 
@@ -248,11 +286,15 @@ def capture(session_wrapper, date_from: str, date_to: str) -> tuple:
         "HospitalName": form["hospital_name"],
         "HospitalID": hospital_id,
     }
-    res = _request(session_wrapper, "POST", DASH_URL, data=payload,
-                   headers={"Origin": BASE_URL, "Referer": DASH_URL})
+    t0 = time.time()
+    res = _request(session_wrapper, "POST", DASH_URL, timeout=180, data=payload,
+                   headers={"Origin": BASE_URL, "Referer": DASH_URL})     # the search itself takes ~20-30 s on the site
     dash = parse_dashboard(res.text)
+    log.info(f"Search answered in {time.time() - t0:.0f}s: cards={ {k: v['card_count'] for k, v in dash['links'].items()} }, "
+             f"total={dash['total_invoices']}, paid={dash['paid_value']}")
     if not dash["links"]:
-        raise RuntimeError("search result has no drill-down links (no cards) — nothing to snapshot")
+        _dump("search_result", res.text)
+        raise RuntimeError("search result has no drill-down links (no cards) — " + _snippet(res))
 
     stages: Dict[str, dict] = {}
     for flag, info in dash["links"].items():
@@ -260,7 +302,8 @@ def capture(session_wrapper, date_from: str, date_to: str) -> tuple:
         r = _request(session_wrapper, "GET", href, headers={"Referer": DASH_URL})
         s = parse_sum_page(r.text)
         if s is None:
-            log.warning(f"  stage {flag}: no summary row in the drill-down page — skipped")
+            _dump(f"drill_{flag}", r.text)
+            log.warning(f"  stage {flag}: no summary row in the drill-down page — skipped. {_snippet(r)}")
             continue
         stages[flag] = s
         if info["card_count"] is not None and int(info["card_count"]) != s["count"]:
@@ -292,12 +335,24 @@ def main():
     date_to = today.isoformat()
     log.info(f"Snapshot {snapshot_date}: search {date_from} -> {date_to}, hospital {HOSPITAL_ID}")
 
-    session_wrapper = SMCSession()
-    if not session_wrapper.login():
-        log.error("SMC login failed — aborting.")
-        sys.exit(1)
-
-    dash, stages, hospital_id = capture(session_wrapper, date_from, date_to)
+    dash = stages = hospital_id = None
+    for attempt in range(1, 4):
+        session_wrapper = SMCSession()
+        if not session_wrapper.login():
+            log.error("SMC login failed — aborting.")
+            sys.exit(1)
+        try:
+            dash, stages, hospital_id = capture(session_wrapper, date_from, date_to)
+            break
+        except SessionLost as e:
+            log.warning(f"SMC logged the session out in the middle of the capture (attempt {attempt}/3): {e}\n"
+                        "  -> usually the SAME SMC account is logged in somewhere else at the same time "
+                        "(nightly status/value sync, another person, a browser). Waiting, then starting over with a fresh login.")
+            if attempt == 3:
+                log.error("Session lost 3 times — not storing anything. Use a dedicated account (secrets SMC_DASHBOARD_USERNAME/"
+                          "SMC_DASHBOARD_PASSWORD) or re-run when nothing else uses the account.")
+                sys.exit(1)
+            time.sleep(45 * attempt)
 
     problems = []
     if not stages:
