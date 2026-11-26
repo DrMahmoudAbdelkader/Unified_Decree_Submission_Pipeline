@@ -613,7 +613,9 @@ def finish(a, ctx, store, reg, smc, t0, n_decrees):
                  'by_month': ctx.by_month,
                  'note': (a.note + ' | ' if a.note else '') + 'receipts: ' + ', '.join(f'{k} {v}' for k, v in sorted(c.items())) + (f' | errors {len(ctx.errors)}' if ctx.errors else '')}
         store.write_log(entry)
-        if ctx.n_new or ctx.n_changed or ctx.n_removed: store.refresh_daily()
+        if ctx.n_new or ctx.n_changed or ctx.n_removed:
+            try: store.refresh_daily()
+            except Exception as e: ctx.log(f'WARNING: refresh_sf_service_daily failed ({str(e)[:120]}); run  select refresh_sf_service_daily();  in the SQL editor')
         update_meta(store, {'built_at': dt.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'), 'mode': 'receipts',
                             'last_run': {k: entry[k] for k in ('run_id', 'lines_new', 'lines_changed', 'lines_removed', 'value_new')}})
         store.commit()
