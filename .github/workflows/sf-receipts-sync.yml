@@ -1,0 +1,83 @@
+name: SF receipts sync (dashboard -> ledger, daily)
+
+# Reads the pending (P) and returned (R01) cards of the SMC dashboard, finds receipts that are NEW or whose TOTAL changed since the
+# last look, reads only those receipts' item rows, and updates audit_sf_service_lines (line level) + the receipt registry.
+# Needs: claims-audit-migration-v4.sql applied once; sf_receipt_sync.py + sf_ledger_incremental.py + sf_service_ledger.py in the repo ROOT.
+# Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (same as the other workflows) and SMC_RECEIPTS_USERNAME / SMC_RECEIPTS_PASSWORD
+#          (falls back to SMC_USERNAME_3 / SMC_PASSWORD_3 if those are the names your repo uses).
+#          Prefer a DEDICATED SMC account: if the site allows one session per user, a shared account will log the other job out.
+
+on:
+  schedule:
+    - cron: '0 20 * * *'          # 20:00 UTC (~22:00/23:00 Cairo). After the 19:30 SMC snapshot, before the 23:00 nightly chain.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Read everything, show what would change, write nothing'
+        type: boolean
+        default: true
+      plan_only:
+        description: 'Only list which decrees / receipts would be read (no receipt pages fetched)'
+        type: boolean
+        default: false
+      deep:
+        description: 'Check every decree even if its card row did not change'
+        type: boolean
+        default: false
+      cards:
+        description: 'Dashboard cards to follow (comma separated flags)'
+        default: 'P,R01'
+      limit_decrees:
+        description: 'Testing only: first N decrees (0 = all)'
+        default: '0'
+      note:
+        description: 'Free text saved in the ingest log'
+        default: ''
+
+# shared with sf-ledger-daily.yml so the two never write the ledger at the same time
+concurrency:
+  group: sf-ledger
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl pyxlsb requests beautifulsoup4
+
+      - name: Sync receipts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMC_RECEIPTS_USERNAME: ${{ secrets.SMC_RECEIPTS_USERNAME || secrets.SMC_USERNAME_3 }}
+          SMC_RECEIPTS_PASSWORD: ${{ secrets.SMC_RECEIPTS_PASSWORD || secrets.SMC_PASSWORD_3 }}
+          CARDS: ${{ github.event.inputs.cards || 'P,R01' }}
+          LIMIT: ${{ github.event.inputs.limit_decrees || '0' }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
+          PLAN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.plan_only == 'true' }}
+          DEEP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deep == 'true' }}
+          NOTE: ${{ github.event.inputs.note || '' }}
+        run: |
+          ARGS="--cards $CARDS --limit-decrees $LIMIT --report receipt_actions.csv"
+          [ "$DRY"  = "true" ] && ARGS="$ARGS --dry-run"
+          [ "$PLAN" = "true" ] && ARGS="$ARGS --plan-only"
+          [ "$DEEP" = "true" ] && ARGS="$ARGS --deep"
+          python sf_receipt_sync.py $ARGS --note "$NOTE"
+
+      - name: Keep the per-receipt decisions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-actions
+          path: receipt_actions.csv
+          if-no-files-found: ignore
+          retention-days: 14
